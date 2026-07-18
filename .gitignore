@@ -1,0 +1,9 @@
+# Runtime and generated files
+server/page-trace.jsonl
+server/__pycache__/
+*.pyc
+.DS_Store
+.ext_id
+
+# Generated extension package
+phantom-relay.zip

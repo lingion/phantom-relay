@@ -1,0 +1,241 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      width: 360px;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      background: #0d1117;
+      color: #c9d1d9;
+      font-size: 13px;
+    }
+
+    /* Header */
+    .header {
+      background: linear-gradient(135deg, #1a1a2e 0%, #16213e 50%, #0f3460 100%);
+      padding: 14px 16px;
+      border-bottom: 1px solid #21262d;
+    }
+    .header h1 { font-size: 16px; font-weight: 700; color: #58a6ff; letter-spacing: 0.5px; }
+    .header h1 .ghost { opacity: 0.5; }
+    .header p { font-size: 10px; color: #8b949e; margin-top: 3px; }
+
+    /* Main */
+    .main { padding: 12px; }
+
+    /* Step cards */
+    .step-card {
+      background: #161b22;
+      border: 1px solid #21262d;
+      border-radius: 8px;
+      padding: 10px 12px;
+      margin-bottom: 8px;
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      transition: border-color 0.2s;
+    }
+    .step-card.done { border-color: #238636; background: #161b22; }
+    .step-card.active { border-color: #d2991d; background: #1a120b; }
+    .step-card.waiting { opacity: 0.5; }
+
+    .step-num {
+      width: 28px; height: 28px;
+      border-radius: 50%;
+      display: flex; align-items: center; justify-content: center;
+      font-size: 13px; font-weight: 700;
+      flex-shrink: 0;
+    }
+    .step-num.pending { background: #21262d; color: #8b949e; }
+    .step-num.done { background: #238636; color: #fff; }
+    .step-num.active { background: #d2991d; color: #000; animation: pulse 1.5s infinite; }
+
+    @keyframes pulse {
+      0%, 100% { box-shadow: 0 0 0 0 rgba(210, 153, 29, 0.4); }
+      50% { box-shadow: 0 0 0 6px rgba(210, 153, 29, 0); }
+    }
+
+    .step-info { flex: 1; min-width: 0; }
+    .step-label { font-size: 12px; font-weight: 600; }
+    .step-desc { font-size: 10px; color: #8b949e; margin-top: 2px; }
+    .step-selector {
+      font-size: 9px; font-family: "SF Mono", "Fira Code", monospace;
+      color: #58a6ff; margin-top: 3px;
+      white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+    }
+
+    .step-btn {
+      padding: 6px 12px;
+      border-radius: 6px;
+      border: none;
+      font-size: 11px;
+      font-weight: 600;
+      cursor: pointer;
+      flex-shrink: 0;
+      transition: all 0.15s;
+    }
+    .step-btn:active { transform: scale(0.95); }
+    .btn-record { background: #d2991d; color: #000; }
+    .btn-record:hover { background: #e3a82b; }
+    .btn-record:disabled { opacity: 0.4; cursor: not-allowed; }
+    .btn-done { background: #21262d; color: #8b949e; cursor: default; }
+    .btn-redo { background: #21262d; color: #8b949e; }
+    .btn-redo:hover { background: #30363d; color: #c9d1d9; }
+
+    /* Section */
+    .section { margin-top: 10px; }
+    .section-title {
+      font-size: 10px; text-transform: uppercase; letter-spacing: 1px;
+      color: #8b949e; margin-bottom: 6px;
+    }
+
+    /* Conversations */
+    .conv-list { max-height: 180px; overflow-y: auto; }
+    .conv-item {
+      padding: 8px; margin-bottom: 4px;
+      background: #161b22; border-radius: 6px;
+      border-left: 2px solid #30363d;
+      font-size: 11px;
+    }
+    .conv-user { color: #f0883e; font-weight: 600; }
+    .conv-assistant { color: #7ee787; font-weight: 600; margin-top: 4px; }
+    .conv-text {
+      color: #8b949e; margin: 2px 0;
+      max-height: 32px; overflow: hidden;
+      line-height: 1.4;
+    }
+    .conv-meta { font-size: 9px; color: #484f58; }
+
+    /* Action row */
+    .action-row { display: flex; gap: 8px; margin-top: 10px; }
+    .btn-action {
+      flex: 1; padding: 8px; border-radius: 6px; border: none;
+      font-size: 11px; font-weight: 600; cursor: pointer;
+    }
+    .btn-export { background: #238636; color: #fff; }
+    .btn-export:hover { background: #2ea043; }
+    .btn-export:disabled { opacity: 0.4; cursor: not-allowed; }
+    .btn-reset { background: #21262d; color: #f85149; }
+    .btn-reset:hover { background: #30363d; }
+    .btn-clear { background: #21262d; color: #8b949e; }
+    .btn-clear:hover { background: #30363d; }
+
+    /* Status bar */
+    .status-bar {
+      text-align: center; padding: 6px; border-radius: 6px;
+      font-size: 10px; margin-bottom: 10px;
+    }
+    .status-idle { background: #161b22; color: #484f58; }
+    .status-recording { background: #1a120b; color: #d2991d; }
+    .status-ready { background: #0d1f16; color: #3fb950; }
+
+    .empty { text-align: center; padding: 16px; color: #484f58; font-size: 11px; }
+
+    .debug-actions { display: flex; gap: 6px; margin-bottom: 6px; }
+    .mini-btn { border: 1px solid #30363d; background: #21262d; color: #8b949e; border-radius: 4px; padding: 3px 7px; font-size: 10px; cursor: pointer; }
+    .mini-btn:hover { background: #30363d; color: #c9d1d9; }
+    .debug-log { max-height: 180px; overflow: auto; white-space: pre-wrap; word-break: break-word; background: #010409; border: 1px solid #21262d; border-radius: 5px; padding: 7px; color: #8b949e; font: 9px/1.35 ui-monospace, SFMono-Regular, Menlo, monospace; }
+
+    .footer {
+      text-align: center; padding: 8px; font-size: 9px; color: #30363d;
+      border-top: 1px solid #21262d;
+    }
+  </style>
+</head>
+<body>
+  <div class="header">
+    <h1>👻 <span class="ghost">Phantom</span> Relay</h1>
+    <p>单步录制 · 全球 AI 对话搬运</p>
+  </div>
+
+  <div class="main">
+    <!-- Status -->
+    <div id="statusBar" class="status-bar status-idle">等待录制</div>
+
+    <!-- Step 1: Input -->
+    <div id="stepInput" class="step-card">
+      <div id="step1Num" class="step-num pending">1</div>
+      <div class="step-info">
+        <div class="step-label">输入框</div>
+        <div class="step-desc">点击页面上的输入框</div>
+        <div id="selInput" class="step-selector"></div>
+      </div>
+      <button id="btnInput" class="step-btn btn-record" data-role="input">⏺ 录制</button>
+    </div>
+
+    <!-- Step 2: Send -->
+    <div id="stepSend" class="step-card waiting">
+      <div id="step2Num" class="step-num pending">2</div>
+      <div class="step-info">
+        <div class="step-label">发送按钮</div>
+        <div class="step-desc">点击发送/提交按钮</div>
+        <div id="selSend" class="step-selector"></div>
+      </div>
+      <button id="btnSend" class="step-btn btn-record" data-role="send" disabled>⏺ 录制</button>
+    </div>
+
+    <!-- Step 3: Copy -->
+    <div id="stepCopy" class="step-card waiting">
+      <div id="step3Num" class="step-num pending">3</div>
+      <div class="step-info">
+        <div class="step-label">复制按钮</div>
+        <div class="step-desc">等待 AI 回复完成后点击复制</div>
+        <div id="selCopy" class="step-selector"></div>
+      </div>
+      <button id="btnCopy" class="step-btn btn-record" data-role="copy" disabled>⏺ 录制</button>
+    </div>
+
+    <!-- Auto Capture -->
+    <div id="captureSection" class="section" style="display:none">
+      <div class="section-title">🤖 自动抓取</div>
+      <div class="input-row">
+        <input id="msgInput" class="text-input" placeholder="输入要发送的消息..." />
+        <button id="btnCapture" class="step-btn btn-record" style="flex:none;padding:8px 14px">▶ 抓取</button>
+      </div>
+      <div id="captureStatus" style="font-size:10px;color:#8b949e;margin-top:4px"></div>
+    </div>
+
+    <!-- Debug Log -->
+    <div id="debugSection" class="section">
+      <div class="section-title">🧪 实时诊断日志</div>
+      <div class="debug-actions">
+        <button id="btnCopyLog" class="mini-btn">复制日志</button>
+        <button id="btnClearLog" class="mini-btn">清空</button>
+      </div>
+      <pre id="debugLog" class="debug-log">等待自动抓取...</pre>
+    </div>
+
+    <!-- Raw Page Trace -->
+    <div id="pageTraceSection" class="section">
+      <div class="section-title">🧬 原始页面变化（DOM Trace）</div>
+      <div class="debug-actions">
+        <button id="btnCopyPageTrace" class="mini-btn">复制页面日志</button>
+        <button id="btnClearPageTrace" class="mini-btn">清空</button>
+      </div>
+      <pre id="pageTraceLog" class="debug-log">等待页面变化...</pre>
+    </div>
+
+    <!-- Conversations -->
+    <div class="section" id="convSection" style="display:none">
+      <div class="section-title">💬 对话记录 (<span id="convCount">0</span>)</div>
+      <div id="convList" class="conv-list"></div>
+    </div>
+
+    <!-- Actions -->
+    <div class="action-row">
+      <button id="btnExport" class="btn-action btn-export" disabled>📦 导出 JSON</button>
+      <button id="btnSendServer" class="btn-action btn-export" disabled>📡 发送到 API</button>
+    </div>
+    <div class="action-row">
+      <button id="btnReset" class="btn-action btn-reset">🔄 重置录制</button>
+      <button id="btnClear" class="btn-action btn-clear">🗑 清除对话</button>
+    </div>
+  </div>
+
+  <div class="footer">v2.0 · Phantom Relay</div>
+
+  <script src="popup.js"></script>
+</body>
+</html>

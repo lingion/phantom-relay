@@ -1,0 +1,59 @@
+{
+  "manifest_version": 3,
+  "name": "Phantom Relay",
+  "version": "2.0.0",
+  "description": "单步录制 · 全球 AI 对话搬运工 — 录制 DOM 交互 → 自动抓取 → 导出 OpenAI API",
+  "permissions": [
+    "activeTab",
+    "storage",
+    "scripting",
+    "clipboardRead",
+    "downloads"
+  ],
+  "host_permissions": [
+    "*://*.doubao.com/*",
+    "*://doubao.com/*",
+    "*://*.deepseek.com/*",
+    "*://deepseek.com/*",
+    "*://chat.openai.com/*",
+    "*://chatgpt.com/*",
+    "*://kimi.moonshot.cn/*",
+    "*://tongyi.aliyun.com/*",
+    "*://yiyan.baidu.com/*",
+    "*://claude.ai/*",
+    "*://gemini.google.com/*",
+    "*://copilot.microsoft.com/*",
+    "*://poe.com/*",
+    "*://perplexity.ai/*",
+    "*://*.perplexity.ai/*",
+    "*://chat.mistral.ai/*",
+    "*://huggingface.co/chat/*",
+    "*://*.zhipuai.cn/*",
+    "*://*.xinghuo.xfyun.cn/*",
+    "*://*.minimax.chat/*"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "<all_urls>"
+      ],
+      "js": [
+        "content.js"
+      ],
+      "run_at": "document_idle"
+    }
+  ],
+  "action": {
+    "default_popup": "popup.html",
+    "default_title": "Phantom Relay"
+  },
+  "icons": {
+    "16": "icons/icon16.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  },
+  "key": "cGhhbnRvbS1yZWxheS1jaHJvbWUtZXh0ZW5zaW9uLWtleS12Mg=="
+}
