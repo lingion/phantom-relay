@@ -346,6 +346,6 @@ git diff --check
 - 增加认证、访问控制和更安全的生产默认配置；
 - 在目标网站能够稳定暴露这些能力时，探索统一的工具调用、视觉、文件、structured output 和 provider 原生会话支持。
 
-## License
+## 许可证
 
-项目当前尚未声明许可证。
+Phantom Relay 采用 [GNU 通用公共许可证 v3.0（GPL-3.0）](LICENSE) 发布。

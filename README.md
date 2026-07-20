@@ -341,4 +341,4 @@ The automated tests cover bridge primitives, message normalization, response tra
 
 ## License
 
-No license has been declared yet.
+Phantom Relay is licensed under the [GNU General Public License v3.0](LICENSE).
