@@ -67,17 +67,50 @@ Other websites may be connected through the same recording workflow, but compati
 
 ## Requirements
 
-- macOS or another system capable of running the project components.
-- Google Chrome Canary.
-- Python 3.
-- A user account already logged in to the target AI website.
-- A client that can send OpenAI-compatible HTTP requests.
+### Browser-only installation
 
-The browser extension is currently developed and tested against Google Chrome Canary. Do not assume compatibility with ordinary Chrome without testing the extension in that browser.
+The Phantom Relay extension itself is a Manifest V3 browser extension. It can be installed in any Chromium-based browser that supports unpacked Manifest V3 extensions, including:
+
+- Google Chrome;
+- Google Chrome Canary;
+- Microsoft Edge;
+- Brave;
+- Chromium and other compatible Chromium-based browsers.
+
+To use the browser extension, users need:
+
+- an AI website open in the browser;
+- an account already logged in to that website;
+- permission to load an unpacked extension;
+- a client capable of sending OpenAI-compatible HTTP requests if they want to use the local API.
+
+### Optional local API server
+
+The local Python API is required only for the OpenAI-compatible proxy workflow. It requires Python 3 and a machine capable of running the server. The browser extension and the local API are separate components; users who only need the extension's recording and browser-side features do not need to treat macOS or Chrome Canary as hard requirements.
+
+The project is developed and tested on macOS with Chrome Canary, but those are development environments, not product requirements. Browser-specific behavior may vary between Chromium-based browsers and should be verified in the target browser.
 
 ## Installation
 
-### 1. Start the local API
+### 1. Install the extension in your browser
+
+Phantom Relay can be installed as an unpacked Manifest V3 extension in a compatible Chromium-based browser. The exact menu names may vary slightly by browser.
+
+1. Open the browser's extensions page:
+   - Chrome / Chromium: `chrome://extensions/`
+   - Edge: `edge://extensions/`
+   - Brave: `brave://extensions/`
+2. Enable **Developer mode**.
+3. Click **Load unpacked**.
+4. Select the repository's `extension/` directory.
+5. Open the AI website you want to connect.
+6. Open the Phantom Relay extension popup.
+
+The optional `launch.sh` helper is only a development convenience for Chrome Canary on macOS. It is not required for installation and is not the project's browser requirement.
+
+### 2. Start the local API (optional)
+
+The local API is needed when you want to access the browser agent through `/v1/chat/completions`.
 
 ```bash
 cd phantom-relay
@@ -97,18 +130,6 @@ Alternatively:
 ```
 
 The launcher reuses an already healthy API process instead of starting a duplicate listener.
-
-### 2. Load the extension
-
-1. Open Google Chrome Canary.
-2. Visit `chrome://extensions/`.
-3. Enable **Developer mode**.
-4. Click **Load unpacked**.
-5. Select the repository's `extension/` directory.
-6. Open the AI website you want to connect.
-7. Open the Phantom Relay popup.
-
-The optional `launch.sh` helper can start Chrome Canary with the unpacked extension. It may close an existing Chrome Canary process first, so use it only when that behavior is acceptable.
 
 ## First-Time Site Setup
 
