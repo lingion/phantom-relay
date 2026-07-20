@@ -4,6 +4,8 @@
 
 Chrome 扩展，三步录制 → 自动抓取 → 导出 OpenAI 兼容 API。
 
+> 当前版本是浏览器桥接实验版。已完成的能力与尚未完成的边界见下方“当前状态”。`stream:true` 当前转发的是页面 assistant DOM 快照增量，不冒充上游 token 级流式。
+
 ```
 ┌─────────────────────────────────────────────────────┐
 │  Phantom Relay Chrome Extension (Manifest V3)       │
@@ -111,6 +113,42 @@ phantom-relay/
 └── server/
     └── api_server.py      # 零依赖 OpenAI 兼容 API
 ```
+
+## 当前状态
+
+### 已完成
+
+- 三步录制：输入、发送策略、回复锚点，按 hostname 隔离模板。
+- DeepSeek/Doubao 风格虚拟列表的逻辑消息归并：`data-observe-row`、`data-virtual-list-item-key`、`data-message-id`。
+- reasoning/status 与回答分离：整行的“正在思考”“正在阅读”“正在搜索”“搜索几篇文章”等 UI 状态不会写入 assistant 内容；只有同一快照中的实质回答保留。
+- 长 DOM 快照 overlap 归并，避免页面反复返回完整前缀造成重复文本。
+- 浏览器快照增量通道：页面候选变化 → MV3 background → `/browser/delta` → OpenAI SSE。
+- `stream:true` 输出合法 OpenAI SSE：role chunk、增量 content、heartbeat 注释、`finish_reason: stop`、`[DONE]`。
+- `Idempotency-Key`、请求指纹、任务复用、完成结果回放。
+- 启动前端口健康检查、launchd 实例重载、健康/客户端/trace 检查。
+- DeepSeek Two API 的通用可复用原则已抽象：状态路径/推理内容不进文本、完整快照按身份与类型归并、流终止与内容分离。
+
+### 尚未完成
+
+- 尚未完成任意新站点的无录制通用适配；录制模板仍是执行权威。
+- 浏览器页面的真实 L5 端到端自动化回归尚未在本机完成。当前 API、扩展客户端和目标 tab 都能被验证，但 `computer_use` 对 Canary 返回 0×0，无法把桌面端结果冒充成通过。
+- 浏览器 DOM 快照流不是上游网络 token 流；页面自身只暴露快照时，无法恢复真实 token 边界。
+- reasoning 内容目前按“传输状态/进度 UI”抑制；若站点把真正推理与最终答案混在同一文本节点且没有 DOM 语义边界，只能依赖录制的回复锚点和保守行级过滤，不能保证恢复隐藏 reasoning。
+- 账户池、OAuth refresh、provider-specific HTTP/SSE adapter 尚未作为独立运行时接入；当前主路径仍是本地 Chrome + MV3。
+- 工具调用、多模态和跨站会话尚未完成通用化。
+
+## 运行时验证
+
+```bash
+node --check extension/universal_bridge.js
+node --check extension/content.js
+node --check extension/background.js
+node tests/test_universal_bridge.js
+python3 -m py_compile server/api_server.py
+python3 tests/test_api_idempotency.py
+```
+
+API 流式回归使用临时本地 job 验证页面快照：`正在思考` 被丢弃，后续 `答`、`案完成` 作为两个 SSE content chunk 输出，最后输出 `stop` 与 `[DONE]`。
 
 ## Roadmap
 

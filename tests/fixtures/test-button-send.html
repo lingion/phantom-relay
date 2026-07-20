@@ -1,0 +1,38 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><title>Generic Button Send Fixture</title></head>
+<body>
+  <main id="conversation" data-chat-root>
+    <div class="message" data-message-id="seed-a" data-role="assistant">Previous answer</div>
+  </main>
+  <section class="composer">
+    <textarea id="prompt" aria-label="Message"></textarea>
+    <button id="submit" type="button" aria-label="Send message">Send</button>
+  </section>
+  <script>
+    const input = document.querySelector('#prompt');
+    const send = document.querySelector('#submit');
+    const conversation = document.querySelector('#conversation');
+    let seq = 0;
+    send.addEventListener('click', () => {
+      const value = input.value.trim();
+      if (!value) return;
+      seq += 1;
+      const user = document.createElement('div');
+      user.className = 'message user';
+      user.dataset.messageId = `u-${seq}`;
+      user.dataset.role = 'user';
+      user.textContent = value;
+      conversation.appendChild(user);
+      input.value = '';
+      const answer = document.createElement('div');
+      answer.className = 'message assistant';
+      answer.dataset.messageId = `a-${seq}`;
+      answer.dataset.role = 'assistant';
+      answer.dataset.streaming = 'true';
+      answer.textContent = 'partial';
+      conversation.appendChild(answer);
+      setTimeout(() => { answer.textContent = 'complete response'; }, 25);
+      setTimeout(() => { answer.dataset.streaming = 'false'; }, 60);
+    });
+  </script>
+</body></html>

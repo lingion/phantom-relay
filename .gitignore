@@ -1,5 +1,10 @@
 # Runtime and generated files
 server/page-trace.jsonl
+server/conversations.json
+server/model_routes.json
+server/selector_templates.json
+server/launchd.out.log
+server/launchd.err.log
 server/__pycache__/
 *.pyc
 .DS_Store

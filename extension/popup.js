@@ -3,9 +3,10 @@ const $ = id => document.getElementById(id);
 
 let appState = {
   domain: '',
+  pageUrl: '',
   current: 'idle',
-  selectors: { input: null, send: null, copy: null },
-  conversations: [],
+  selectors: { input: null, send: null, response: null },
+  sendKind: 'enter',
   conversationCount: 0,
   hasTemplate: false,
 };
@@ -66,13 +67,70 @@ async function ensureContentScript() {
   }
 }
 
+// ── Model ──────────────────────────────────────────────────
+let currentModel = '';
+let knownModels = [];
+
+function loadModel() {
+  chrome.storage.local.get({ phantomModel: '' }, (r) => {
+    // 1. 从当前域名反查绑定的模型名
+    if (r.phantomModel && appState.domain) {
+      chrome.runtime.sendMessage({ from: 'popup', action: 'model_name_for_domain', domain: appState.domain }, (resp) => {
+        const inferred = resp?.model || '';
+        currentModel = inferred;
+        modelName.value = inferred;
+      });
+    } else if (!r.phantomModel && appState.domain) {
+      chrome.runtime.sendMessage({ from: 'popup', action: 'model_name_for_domain', domain: appState.domain }, (resp) => {
+        const inferred = resp?.model || appState.domain.replace(/^www\./, '');
+        currentModel = inferred;
+        modelName.value = currentModel;
+        if (inferred) setModel(inferred);
+      });
+    } else {
+      currentModel = r.phantomModel || (appState.domain ? appState.domain.replace(/^www\./, '') : '');
+      modelName.value = currentModel;
+    }
+    loadKnownModels();
+  });
+}
+
+function loadKnownModels() {
+  chrome.runtime.sendMessage({ from:'popup', action:'list_model_routes' }, (resp) => {
+    if (resp?.models) {
+      knownModels = resp.models;
+      renderModelDatalist();
+    }
+  });
+}
+
+function setModel(name) {
+  if (!name || !name.trim()) return;
+  const normalized = name.trim().toLowerCase();
+  currentModel = normalized;
+  chrome.storage.local.set({ phantomModel: normalized });
+  if (!knownModels.includes(normalized)) knownModels.push(normalized);
+  renderModelDatalist();
+}
+
+function renderModelDatalist() {
+  modelDatalist.innerHTML = knownModels.map(m => `<option value="${m}">`).join('');
+  modelName.value = currentModel;
+}
+
+modelName.addEventListener('change', () => setModel(modelName.value.trim()));
+modelName.addEventListener('blur', () => setModel(modelName.value.trim()));
+
 // ── Init ──────────────────────────────────────────────────
 async function init() {
   const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
   currentTabId = tab?.id;
   const domain = extractDomain(tab?.url || '');
+  appState.domain = domain;
+  appState.pageUrl = tab?.url || '';
+  loadModel();
 
-  // 先从 background 按域名加载持久模板。
+  // 2. 从 background 按域名加载持久模板。
   const state = await new Promise(resolve => {
     chrome.runtime.sendMessage({ from: 'popup', action: 'get_state', domain }, resolve);
   });
@@ -121,8 +179,8 @@ function render() {
   const s3ready = !!s.send;
   stepCopy.className = s3ready ? 'step-card' : 'step-card waiting';
   if (s3ready) {
-    renderStep('copy', 3, s.copy, stepCopy, step3Num, btnCopy, selCopy,
-      appState.current === 'recording_copy');
+    renderStep('response', 3, s.response, stepCopy, step3Num, btnCopy, selCopy,
+      appState.current === 'recording_response');
   } else {
     btnCopy.disabled = false; btnCopy.textContent = '⏺ 录制'; btnCopy.className = 'step-btn btn-record';
     step3Num.className = 'step-num pending'; step3Num.textContent = '3'; selCopy.textContent = '';
@@ -131,8 +189,13 @@ function render() {
   updateStatusBar();
   renderConversations();
 
-  const allDone = s.input && s.send && s.copy;
+  const allDone = s.input && s.send;
   captureSection.style.display = allDone ? 'block' : 'none';
+
+  // send-kind tab state
+  tabShortcut.className = 'send-tab' + (appState.sendKind === 'shortcut' ? ' active' : '');
+  tabEnter.className = 'send-tab' + ((appState.sendKind || 'enter') === 'enter' ? ' active' : '');
+  tabButton.className = 'send-tab' + (appState.sendKind === 'button' ? ' active' : '');
 
   const hasConv = appState.conversationCount > 0;
   btnExport.disabled = !hasConv;
@@ -144,7 +207,9 @@ function renderStep(role, num, sel, card, numEl, btn, selEl, rec) {
     card.className = 'step-card done';
     numEl.className = 'step-num done'; numEl.textContent = '✓';
     btn.textContent = '重录'; btn.className = 'step-btn btn-redo'; btn.disabled = false;
-    selEl.textContent = `${sel.selector?.css || '?'} (${sel.selector?.method || '?'})`;
+    const css = typeof sel.selector === 'string' ? sel.selector : (sel.selector?.css || sel.css || '?');
+    const method = typeof sel.selector === 'object' ? (sel.selector?.method || '?') : (sel.method || '?');
+    selEl.textContent = `${css} (${method})`;
   } else if (rec) {
     card.className = 'step-card active';
     numEl.className = 'step-num active'; numEl.textContent = num;
@@ -165,10 +230,10 @@ function setStatus(type, msg) {
 
 function updateStatusBar() {
   const s = appState.selectors;
-  const allDone = s.input && s.send && s.copy;
+  const allDone = s.input && s.send;
   if (appState.current.startsWith('recording_')) {
-    const names = { input: '输入框', send: '发送按钮', copy: '复制按钮' };
-    setStatus('recording', `🔴 请点击页面上的${names[appState.current.replace('recording_','')]}`);
+    const names = { input: '输入框', send_strategy: '发送方式', response: '回复区域' };
+    setStatus('recording', `🔴 请点击页面上的${names[appState.current.replace('recording_','')] || '元素'}`);
   } else if (allDone) setStatus('ready', '✅ 全部就绪！');
   else if (s.input) setStatus('recording', '👉 继续录制下一步');
   else if (appState.domain && !appState.hasTemplate) setStatus('idle', `🆕 新站点 ${appState.domain} — 点击 ① 开始录制`);
@@ -194,6 +259,40 @@ function fmtTime(ts) { if(!ts) return ''; return new Date(ts).toLocaleString('zh
 // ── 录制 ──────────────────────────────────────────────────
 async function handleRecord(role) {
   if (!currentTabId) { setStatus('error', '❌ 无法获取当前标签页'); return; }
+
+  // send_strategy may use enter/shortcut (no page click) or button (page click)
+  if (role === 'send_strategy') {
+    const kind = appState.sendKind || 'enter';
+    if (kind === 'enter') {
+      // default: save Enter as the send strategy without recording
+      appState.selectors.send = { kind: 'enter', key: 'Enter', modifiers: [] };
+      appState.current = 'send_strategy_done';
+      chrome.runtime.sendMessage({ from:'popup', action:'update_state', state:{current:appState.current, domain:appState.domain, selectors: appState.selectors, sendKind: kind} });
+      bindCurrentModelRoute();
+      render();
+      return;
+    }
+    if (kind === 'shortcut') {
+      // record a keyboard shortcut — send to content script for key capture
+      if (appState.current === 'recording_send_strategy') {
+        try { await chrome.tabs.sendMessage(currentTabId, { action: 'cancel_record' }); } catch(e) {}
+        appState.current = 'idle';
+        chrome.runtime.sendMessage({ from:'popup', action:'update_state', state:{current:'idle',domain:appState.domain} });
+        render(); return;
+      }
+      setStatus('recording', '🔴 请在输入框内按下你的快捷键组合...');
+      render();
+      if (!await ensureContentScript()) { setStatus('error', '❌ 无法注入脚本'); return; }
+      try {
+        const resp = await chrome.tabs.sendMessage(currentTabId, { action: 'record_shortcut' });
+        handleRecordResponse(resp, 'send_strategy');
+      } catch (e) { setStatus('error', '❌ 通信失败'); }
+      return;
+    }
+    // kind === 'button' — fall through to page click recording
+    role = 'send_button';
+  }
+
   if (appState.current === `recording_${role}`) {
     try { await chrome.tabs.sendMessage(currentTabId, { action: 'cancel_record' }); } catch(e) {}
     appState.current = 'idle';
@@ -223,9 +322,20 @@ function handleRecordResponse(resp, role) {
   if (resp.error) { setStatus('error', `❌ ${resp.error}`); return; }
   if (resp.status === 'listening') {
     appState.current = `recording_${role}`;
-    chrome.runtime.sendMessage({ from:'popup', action:'update_state', state:{current:appState.current,domain:appState.domain} });
+    const kind = role === 'send_strategy' ? appState.sendKind : undefined;
+    chrome.runtime.sendMessage({ from:'popup', action:'update_state', state:{current:appState.current, domain:appState.domain, sendKind:kind} });
     render(); startPolling(role);
   }
+  // 录制完成立即绑定；不能等待后续步骤的 popup 状态刷新。
+  if (role === 'response' || role === 'send_strategy'
+      || appState.selectors.input && appState.selectors.send) bindCurrentModelRoute();
+}
+function bindCurrentModelRoute() {
+  const model = String(currentModel || '').trim().toLowerCase();
+  if (!model || !appState.domain || !appState.selectors.input || !appState.selectors.send) return;
+  chrome.runtime.sendMessage({
+    from: 'popup', action: 'bind_model_route', model, domain: appState.domain
+  }, r => addDebug(`模型绑定: ${model} → ${appState.domain} ${r?.ok ? '✅' : '⚠️'}`));
 }
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
@@ -240,10 +350,17 @@ function startPolling(role) {
         appState.current = `${role}_done`;
         chrome.runtime.sendMessage({ from:'popup', action:'update_state', state:{current:appState.current,domain:appState.domain} });
         clearInterval(pollTimer); pollTimer=null; render();
+        // 录制完成发生在轮询回调里；此时 selectors 已经包含最新一步。
+        if (role === 'response') bindCurrentModelRoute();
       }
     } catch(e) { clearInterval(pollTimer); pollTimer=null; }
   }, 500);
 }
+
+// ── Send-kind tab clicks ──────────────────────────────────
+tabShortcut.addEventListener('click', () => { appState.sendKind = 'shortcut'; render(); });
+tabEnter.addEventListener('click', () => { appState.sendKind = 'enter'; render(); });
+tabButton.addEventListener('click', () => { appState.sendKind = 'button'; render(); });
 
 // ── Auto Capture ──────────────────────────────────────────
 btnCapture.addEventListener('click', async () => {
@@ -262,31 +379,30 @@ btnCapture.addEventListener('click', async () => {
   btnCapture.disabled = true; btnCapture.textContent = '⏳...';
   captureStatus.textContent = `🔄 正在输入...`;
   try {
-  const resp = await chrome.tabs.sendMessage(currentTabId, { action: 'auto_capture', message: msg });
-  if (resp?.error) {
-    const detail = resp.detail ? `：${resp.detail}` : '';
-    captureStatus.textContent = `❌ ${resp.error}${detail}`;
-    addDebug(`自动抓取失败：${resp.error}${detail}`, resp.debug || null);
+    const currentDomain = appState.domain;
+    const result = await new Promise(resolve => chrome.runtime.sendMessage({
+      from: 'popup', action: 'browser_submit', message: msg, domain: currentDomain, tab_id: currentTabId, model: currentModel
+    }, resolve));
+    if (result?.error) throw new Error(result.error);
+    captureStatus.textContent = `⏳ 后端已排队：${result.id}`;
+    addDebug(`后端任务已提交：${result.id}`);
+  } catch (e) {
+    captureStatus.textContent = `❌ 后端提交失败: ${e.message}`;
+    addDebug(`后端提交失败：${e.message}`);
   }
-  else if (resp?.success) {
-      captureStatus.textContent = '✅ 抓取成功！'; msgInput.value = '';
-      chrome.runtime.sendMessage({ from:'popup', action:'save_conversation', user:resp.user, assistant:resp.assistant, source:appState.domain });
-      setTimeout(() => { chrome.runtime.sendMessage({ from:'popup', action:'get_state', domain:appState.domain }, r => { if(r){appState=r;render();} }); }, 500);
-    }
-  } catch (e) { captureStatus.textContent = `❌ 失败: ${e.message}`; }
   btnCapture.disabled = false; btnCapture.textContent = '▶ 抓取';
 });
 
 // ── Bindings ──────────────────────────────────────────────
 btnInput.addEventListener('click', ()=>handleRecord('input'));
 btnSend.addEventListener('click', ()=>handleRecord('send'));
-btnCopy.addEventListener('click', ()=>handleRecord('copy'));
+btnCopy.addEventListener('click', ()=>handleRecord('response'));
 btnExport.addEventListener('click', ()=>{ chrome.runtime.sendMessage({from:'popup',action:'export_json'},()=>window.close()); });
 btnSendServer.addEventListener('click', ()=>{ chrome.runtime.sendMessage({from:'popup',action:'export_to_server'}, r=>{ alert(r?.error?`⚠️ ${r.error}\n\n启动: python3 server/api_server.py`:`✅ 已导入 ${r?.imported||0} 条`); }); });
 btnReset.addEventListener('click', async ()=>{
   if(currentTabId){ try{await chrome.tabs.sendMessage(currentTabId,{action:'clear_selectors'});}catch(e){} try{await chrome.tabs.sendMessage(currentTabId,{action:'cancel_record'});}catch(e){} }
   chrome.runtime.sendMessage({from:'popup',action:'reset',domain:appState.domain});
-  appState.current='idle'; appState.selectors={input:null,send:null,copy:null}; appState.hasTemplate=false; render();
+  appState.current='idle'; appState.selectors={input:null,send:null,response:null}; appState.hasTemplate=false; render();
 });
 btnClear.addEventListener('click', ()=>{ if(!confirm('清除所有对话？'))return; chrome.runtime.sendMessage({from:'popup',action:'clear_conversations'}); appState.conversations=[]; appState.conversationCount=0; render(); });
 btnCopyLog.addEventListener('click', async ()=>{
@@ -307,6 +423,6 @@ btnClearPageTrace.addEventListener('click', ()=>{
   pageTraceLog.textContent = '已清空';
 });
 
-setInterval(()=>{ chrome.runtime.sendMessage({from:'popup',action:'get_state',domain:appState.domain}, r=>{ if(r&&JSON.stringify({c:appState.current,s:appState.selectors,h:appState.hasTemplate})!==JSON.stringify({c:r.current,s:r.selectors,h:r.hasTemplate})){ appState=r; render(); }}); }, 2000);
+setInterval(()=>{ chrome.runtime.sendMessage({from:'popup',action:'get_state',domain:appState.domain}, r=>{ if(r&&JSON.stringify({c:appState.current,s:appState.selectors,h:appState.hasTemplate})!==JSON.stringify({c:r.current,s:r.selectors,h:r.hasTemplate})){ appState=r;render(); }}); }, 2000);
 window.addEventListener('unload',()=>{ if(pollTimer)clearInterval(pollTimer); });
 init();

@@ -14,9 +14,12 @@
   // 扩展重载后 isolated-world 全局会重置，但 DOM 属性还在；此时清掉
   // 陈旧标记，允许新实例启动，避免必须刷新页面。
   if (root?.hasAttribute(INSTANCE_MARKER)) {
-    // DOM marker is shared by isolated worlds. Do not remove it here: removing it
-    // lets a second executeScript fallback instance start and duplicate sends.
-    return;
+    // A page can survive an extension reload while the old isolated world is
+    // gone. In that case the DOM marker is stale and must not block the new
+    // content-script instance. Within the same isolated world, the generation
+    // guard still prevents duplicate executeScript injections.
+    if (window.__phantomRelayGeneration) return;
+    root.removeAttribute(INSTANCE_MARKER);
   }
   root?.setAttribute(INSTANCE_MARKER, String(Date.now()));
 
@@ -28,7 +31,7 @@
   // ── 状态锁 ──────────────────────────────────────────────
   let lock = {
     active: false,        // 是否正在等待一次点击
-    targetRole: null,     // 'input' | 'send' | 'copy' | 'response'
+    targetRole: null,     // 'input' | 'send' | 'response'
     captured: false,      // 本次是否已捕获
     callback: null,       // 捕获后回调
   };
@@ -36,15 +39,18 @@
   let selectors = {
     input: null,
     send: null,
-    copy: null,
     response: null,
   };
 
-  let highlightEl = null;
+// 默认使用 Enter 发送；录制后会被具体策略覆盖。
+  let sendStrategy = { kind: 'enter', key: 'Enter', modifiers: [] };
+  let shortcutListening = false;
   let captureDebug = [];
   let pageTraceObserver = null;
   let pageTraceSeq = 0;
   let autoCaptureInFlight = false;
+  let currentCaptureJobId = '';
+  const Universal = window.PhantomRelayUniversal || null;
 
   function pageNodeInfo(node) {
     const el = node?.nodeType === 1 ? node : node?.parentElement;
@@ -173,6 +179,7 @@
     }
 
     // 4. 唯一 tag + class 组合
+    // 重要：class 经常在 AI 网站中被复用；只有录制时是唯一且刷新后仍可定位才使用。
     const validClasses = Array.from(el.classList).filter(c => /^[a-zA-Z_-][\w-]*$/.test(c));
     if (validClasses.length > 0) {
       for (let depth = validClasses.length; depth >= 1; depth--) {
@@ -263,20 +270,30 @@
   }
 
   function isNearInput(el) {
-    // 检查元素是否在输入框附近（同一个容器或相邻容器）
-    const inputEl = document.querySelector('textarea, [contenteditable="true"], input[type="text"], input:not([type]), [role="textbox"], div[contenteditable="true"]');
-    if (!inputEl) return false;
+    const inputs = Array.from(document.querySelectorAll(
+      'textarea, [contenteditable="true"], input[type="text"], input:not([type]), [role="textbox"]'
+    )).filter(inp => inp.getClientRects().length && getComputedStyle(inp).visibility !== 'hidden');
+    if (!inputs.length) return false;
+    const inputEl = inputs.reduce((a, b) => {
+      const ra = a.getBoundingClientRect();
+      const rb = b.getBoundingClientRect();
+      return (ra.width * ra.height) > (rb.width * rb.height) ? a : b;
+    });
+    const ir = inputEl.getBoundingClientRect();
+    const er = el.getBoundingClientRect();
+    const dx = Math.abs(er.left + er.width/2 - ir.left - ir.width/2);
+    const dy = Math.abs(er.top + er.height/2 - ir.top - ir.height/2);
+    if (dx > 500 || dy > 500) return false;
     
-    // 向上查 8 层，看是否共享祖先
+    // DOM 树距离检查
     let p = el;
-    for (let i = 0; i < 8 && p && p !== document.body; i++) {
+    for (let i = 0; i < 15 && p && p !== document.documentElement; i++) {
       if (p.contains(inputEl)) return true;
       p = p.parentElement;
     }
     
-    // 也查 inputEl 的祖先
     let ip = inputEl.parentElement;
-    for (let i = 0; i < 8 && ip && ip !== document.body; i++) {
+    for (let i = 0; i < 15 && ip && ip !== document.documentElement; i++) {
       if (ip.contains(el)) return true;
       ip = ip.parentElement;
     }
@@ -302,23 +319,26 @@
     clickCapture = function (e) {
       if (!lock.active || lock.captured) return;
 
-      // 找到最合适的可交互元素
+      // 回复区域不是按钮：保留用户点击的消息行/正文节点；输入和发送才提升到可交互祖先。
       let target = e.target;
-      // 向上查找可交互元素
-      for (let depth = 0; depth < 5 && target; depth++) {
-        if (target.tagName === 'BODY' || target.tagName === 'HTML') break;
-        const tag = target.tagName.toLowerCase();
-        if (['button', 'textarea', 'input', 'a', 'svg'].includes(tag) ||
-            target.getAttribute('role') === 'button' ||
-            target.getAttribute('role') === 'textbox' ||
-            target.getAttribute('contenteditable') === 'true' ||
-            target.closest('[contenteditable="true"]')) {
-          break;
+      if (targetRole === 'response') {
+        target = e.target.closest?.('[data-observe-row], [data-message-id], [data-virtual-list-item-key]') || e.target;
+        if (target === document.documentElement || target === document.body) return;
+      } else {
+        // 找到最合适的可交互元素
+        for (let depth = 0; depth < 5 && target; depth++) {
+          if (target.tagName === 'BODY' || target.tagName === 'HTML') break;
+          const tag = target.tagName.toLowerCase();
+          if (['button', 'textarea', 'input', 'a', 'svg'].includes(tag) ||
+              target.getAttribute('role') === 'button' ||
+              target.getAttribute('role') === 'textbox' ||
+              target.getAttribute('contenteditable') === 'true' ||
+              target.closest('[contenteditable="true"]')) {
+            break;
+          }
+          target = target.parentElement;
         }
-        target = target.parentElement;
       }
-
-      if (!target || target.tagName === 'BODY' || target.tagName === 'HTML') return;
 
       // 分类
       const result = classifyElement(target);
@@ -332,6 +352,10 @@
       }
 
       // 验证是否匹配目标角色
+      if (targetRole === 'response' && actualTarget.textContent.trim().length >= 2) {
+        result.role = 'response';
+        result.confidence = 'manual';
+      }
       if (result.role !== targetRole) {
         // ── 宽松模式：send 和 copy 按钮往往是纯图标，分类器容易漏 ──
         const isInteractive = (
@@ -344,7 +368,7 @@
           getComputedStyle(actualTarget.closest('*[style*="cursor:pointer"]') || actualTarget).cursor === 'pointer'
         );
         
-        if ((targetRole === 'send' || targetRole === 'copy') && isInteractive) {
+        if (targetRole === 'send' && isInteractive) {
           // 用户录制时实际点击的元素就是权威，不根据按钮文字猜测其功能。
           // 某些站点的复制按钮可能显示业务文案或无语义文本，必须允许录入。
           result.role = targetRole;
@@ -411,105 +435,537 @@
       document.removeEventListener('click', clickCapture, true);
       clickCapture = null;
     }
+    if (shortcutCaptureHandler) {
+      document.removeEventListener('keydown', shortcutCaptureHandler, true);
+      shortcutCaptureHandler = null;
+    }
+    shortcutListening = false;
     clearHighlight();
   }
 
+  // ── 快捷键录制 ──────────────────────────────────────────
+  let shortcutCaptureHandler = null;
+  function startShortcutRecording() {
+    if (shortcutCaptureHandler) document.removeEventListener('keydown', shortcutCaptureHandler, true);
+    shortcutCaptureHandler = function (e) {
+      const ignoredKeys = new Set(['Shift','Control','Alt','Meta','CapsLock','Tab','Escape','ArrowUp','ArrowDown','ArrowLeft','ArrowRight']);
+      if (ignoredKeys.has(e.key)) return;
+      if (!e.isTrusted) return;
+      e.preventDefault(); e.stopPropagation();
+      const modifiers = [];
+      if (e.metaKey) modifiers.push('Meta');
+      if (e.ctrlKey) modifiers.push('Control');
+      if (e.altKey) modifiers.push('Alt');
+      if (e.shiftKey) modifiers.push('Shift');
+      const key = e.key === 'Enter' ? 'Enter' : (e.code?.replace(/^Key/,'') || e.key);
+      const strategy = { kind: 'shortcut', key, modifiers, code: e.code };
+      sendStrategy = strategy;
+      selectors.send = strategy;
+      document.removeEventListener('keydown', shortcutCaptureHandler, true);
+      shortcutCaptureHandler = null;
+      shortcutListening = false;
+      const domain = window.location.hostname;
+      chrome.runtime.sendMessage({ type: 'selector_captured', role: 'send', selector: JSON.stringify(strategy), confidence: 'manual', elementTag: 'keyboard', domain });
+    };
+    document.addEventListener('keydown', shortcutCaptureHandler, true);
+  }
+
   // ── 自动回放 ────────────────────────────────────────────
-  async function autoCapture(userMessage) {
+  function discoverReplaySelectors() {
+    const input = Array.from(document.querySelectorAll('textarea, input[type="text"], input:not([type]), [contenteditable="true"], [role="textbox"]'))
+      .find(el => el.getClientRects().length && getComputedStyle(el).visibility !== 'hidden' && getComputedStyle(el).display !== 'none');
+    if (!input) return { error: 'input_not_found' };
+    const inputTarget = input.closest('[contenteditable="true"]') || input;
+    const buttons = Array.from(document.querySelectorAll('button, [role="button"], [onclick]'));
+    const send = buttons.find(el => {
+      if (!el.getClientRects().length || el.disabled || el.getAttribute('aria-disabled') === 'true') return false;
+      if (el.getAttribute('aria-haspopup') === 'menu' || el.getAttribute('data-slot') === 'dropdown-menu-trigger') return false;
+      return isNearInput(el) && classifyElement(el).role === 'send';
+    }) || buttons.find(el => {
+      if (!el.getClientRects().length || el.disabled) return false;
+      if (el.getAttribute('aria-haspopup') === 'menu' || el.getAttribute('data-slot') === 'dropdown-menu-trigger') return false;
+      return isNearInput(el);
+    });
+    if (!send) return { error: 'send_not_found' };
+    return {
+      selectors: {
+        input: { selector: generateSelector(inputTarget), elementTag: inputTarget.tagName.toLowerCase(), confidence: 'discovered' },
+        send: { selector: generateSelector(send), elementTag: send.tagName.toLowerCase(), confidence: 'discovered' },
+        response: null
+      }
+    };
+  }
+
+  function setDiscoveredSelectors(discovered) {
+    if (!discovered?.selectors) return false;
+    selectors = {
+      ...selectors,
+      input: normalizeRecordedSelector(discovered.selectors.input),
+      send: normalizeRecordedSelector(discovered.selectors.send),
+      response: null
+    };
+    return !!selectors.input && !!selectors.send;
+  }
+  // 这里不再依赖 copy 按钮。回复的唯一边界是：发送前快照 → 新用户消息 →
+  // 其后的逻辑消息节点。对 Doubao，data-message-id 和 data-observe-row
+  // 是同一条消息的两个 DOM 表示，先合并再判断顺序。
+  async function autoCapture(userMessage, jobId = '') {
     if (!isCurrentGeneration()) return { error: 'stale_content_script' };
     if (autoCaptureInFlight) return { error: 'capture_in_flight', detail: '已有自动抓取正在运行，请等待结束' };
-    if (!selectors.input?.selector || !selectors.send?.selector) {
-      return { error: 'missing_selectors', detail: '请先录制 input 和 send' };
+    if (!selectorText(selectors.input) || !selectors.send) {
+      const discovered = discoverReplaySelectors();
+      if (discovered.error || !setDiscoveredSelectors(discovered)) {
+        return { error: 'recorded_selectors_missing', detail: `当前站点没有完整模板，通用发现失败: ${discovered.error || 'incomplete'}` };
+      }
+      reportPageEvent('universal_selectors_discovered', {
+        input: selectorText(selectors.input),
+        send: selectorText(selectors.send),
+        evidence: 'unique_visible_input_and_nearby_send_control'
+      });
+    }
+    // Resolve send strategy from selectors or local variable
+    const strategy = (selectors.send && typeof selectors.send === 'object' && selectors.send.kind)
+      ? selectors.send
+      : (selectorText(selectors.send)
+        ? { kind: 'button', selector: selectorText(selectors.send) }
+        : sendStrategy);
+    if (!strategy || !strategy.kind) {
+      return { error: 'send_strategy_missing', detail: '没有录制发送策略' };
+    }
+    const inputSelector = selectorText(selectors.input);
+    if (!inputSelector) {
+      return { error: 'input_not_found', detail: '当前页面没有发现可用输入框' };
     }
     const captureLock = 'data-phantom-relay-capture-lock';
-    // tabs.sendMessage 可能会把消息投递给同一页面上的多个实例；共享 DOM
-    // 锁保证只有一个实例真正执行输入和发送。
     if (document.documentElement.hasAttribute(captureLock)) {
       return { error: 'capture_in_flight', detail: '页面已有抓取实例正在运行' };
     }
     document.documentElement.setAttribute(captureLock, String(generation));
-
     autoCaptureInFlight = true;
+    currentCaptureJobId = jobId || '';
     try {
-      startPageTrace('auto_capture_before_input');
-      reportCaptureProgress(`恢复模板：input=${selectors.input.selector.css}`);
-      // 1. 填入输入框
-      const inputEl = await waitForElement(selectors.input.selector, 10000, 'input');
-      if (!inputEl) {
-        emitPageTrace('selector_not_found', {
-          role: 'input',
-          selector: selectors.input.selector.css,
-          alternatives: selectors.input.selector.alternatives || [],
-          matchingCount: selectorMatchCount(selectors.input.selector),
-          bodyTextLength: document.body?.innerText?.length || 0
-        });
-        stopPageTrace();
-        return { error: 'input_not_found', selector: selectors.input.selector.css };
-      }
-      reportCaptureProgress(`已找到 input：${inputEl.tagName.toLowerCase()}`);
+      const inputEl = await waitForElement({ css: selectorText(selectors.input), alternatives: [] }, 120000, 'input');
+      if (!inputEl) return { error: 'input_not_ready_timeout', detail: '等待输入框 120 秒后仍未就绪' };
+      setInputValue(inputEl, userMessage);
+      await sleep(250);
 
-      if (inputEl.getAttribute('contenteditable') === 'true' || inputEl.closest('[contenteditable="true"]')) {
-        const editable = inputEl.getAttribute('contenteditable') === 'true' ? inputEl : inputEl.closest('[contenteditable="true"]');
-        editable.focus();
-        editable.textContent = userMessage;
-        editable.dispatchEvent(new InputEvent('input', { bubbles: true, composed: true }));
-        editable.dispatchEvent(new Event('change', { bubbles: true }));
-      } else {
-        inputEl.focus();
-        const setter = Object.getOwnPropertyDescriptor(
-          inputEl.tagName === 'TEXTAREA' ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype,
-          'value'
-        )?.set;
-        if (setter) {
-          setter.call(inputEl, userMessage);
-        } else {
-          inputEl.value = userMessage;
+      const currentStrategy = (selectors.send && typeof selectors.send === 'object' && selectors.send.kind)
+        ? selectors.send
+        : (selectorText(selectors.send)
+          ? { kind: 'button', selector: selectorText(selectors.send) }
+          : sendStrategy);
+      if (!currentStrategy || !currentStrategy.kind) {
+        return { error: 'send_strategy_missing', detail: '没有录制发送策略' };
+      }
+      if (Universal) {
+        const plan = Universal.buildSendPlan({ send: currentStrategy }, {
+          keyboardFallback: currentStrategy.allowEnterFallback === true,
+          allowMultipleSubmissions: currentStrategy.allowEnterFallback === true
+        });
+        const decision = Universal.nextSendAction(plan, { actionIndex: 0, submissionCount: 0 });
+        if (!decision.action) return { error: decision.terminal || 'send_strategy_missing' };
+      }
+      const responseAnchorBefore = selectorText(selectors.response) ? (() => {
+        const el = findElement(normalizeRecordedSelector(selectors.response), 'response');
+        return el ? { key: messageIdentity(el) || el.closest?.('[data-observe-row], [data-virtual-list-item-key]')?.getAttribute('data-observe-row') || '', text: extractMessageText(el) } : null;
+      })() : null;
+      const before = logicalMessageSnapshot();
+      const beforeKeys = new Set(before.map(n => n.key));
+      reportCaptureProgress(`发送前逻辑消息 ${before.length} 条`);
+      reportPageEvent('capture_boundary', { phase: 'before_send', userMessage, sendStrategy: strategy, nodes: before.map(debugNode) });
+      // Resolve send plan from recorded strategy
+      let sendKind = strategy?.kind || 'enter';
+      let sendKey = strategy?.key || 'Enter';
+      let sendModifiers = strategy?.modifiers || [];
+
+      reportPageEvent('send_target', { strategy: { kind: sendKind, key: sendKey, modifiers: sendModifiers } });
+
+      let sendEvidence = false;
+      const sendWaitStarted = Date.now();
+
+      if (sendKind === 'enter' || sendKind === 'shortcut') {
+        // Keyboard dispatch: focus input, dispatch keydown+keypress+keyup
+        const inputEl = document.querySelector(inputSelector);
+        if (inputEl) {
+          inputEl.focus();
+          const modState = {};
+          for (const m of sendModifiers) {
+            if (m === 'Meta') modState.metaKey = true;
+            if (m === 'Control') modState.ctrlKey = true;
+            if (m === 'Alt') modState.altKey = true;
+            if (m === 'Shift') modState.shiftKey = true;
+          }
+          const keyOpts = { key: sendKey, code: strategy?.code || sendKey, keyCode: 13, which: 13, bubbles: true, cancelable: true, ...modState };
+          // One logical keyboard submission: dispatch keydown only.
+          // DeepSeek handles Enter during keydown; emitting keypress/keyup can submit twice.
+          inputEl.dispatchEvent(new KeyboardEvent('keydown', keyOpts));
         }
-        inputEl.dispatchEvent(new Event('input', { bubbles: true, composed: true }));
-        inputEl.dispatchEvent(new Event('change', { bubbles: true }));
+        reportPageEvent('send_keyboard', { kind: sendKind, key: sendKey, modifiers: sendModifiers });
+        while (Date.now() - sendWaitStarted < 8000) {
+          sendEvidence = !!findFreshUserMessage(userMessage, beforeKeys);
+          if (sendEvidence) break;
+          await sleep(150);
+        }
+        if (!sendEvidence && sendKind === 'shortcut' && currentStrategy.allowEnterFallback === true) {
+          // A second keyboard action is opt-in and is legal only because the
+          // recorded template explicitly declared this fallback.
+          reportPageEvent('shortcut_no_effect', { waitedMs: Date.now() - sendWaitStarted });
+          const inputEl2 = document.querySelector(inputSelector);
+          if (inputEl2) {
+            inputEl2.focus();
+            inputEl2.dispatchEvent(new KeyboardEvent('keydown', { key:'Enter', code:'Enter', keyCode:13, which:13, bubbles:true, cancelable:true }));
+            reportPageEvent('enter_fallback', {});
+            while (Date.now() - sendWaitStarted < 12000) {
+              sendEvidence = !!findFreshUserMessage(userMessage, beforeKeys);
+              if (sendEvidence) break;
+              await sleep(150);
+            }
+          }
+        }
+      } else if (sendKind === 'button') {
+        // Button click: find send element, wait enabled, click once only
+        const selector = strategy?.selector || selectorText(selectors.send);
+        const sendStarted = Date.now();
+        let sendEl = null;
+        while (Date.now() - sendStarted < 120000) {
+          sendEl = await waitForElement({ css: selector, alternatives: [] }, 1000, 'send');
+          if (sendEl && sendEl.getClientRects().length) break;
+          await sleep(250);
+        }
+        if (!sendEl) return { error: 'send_not_ready_timeout', detail: '等待发送按钮 120 秒后仍未就绪', selector };
+        const sendControl = sendEl.closest('button, [role="button"], [data-testid*="send" i], [id*="send" i]') || sendEl;
+        const sendReadyStarted = Date.now();
+        while (Date.now() - sendReadyStarted < 120000) {
+          const disabled = sendControl.disabled || sendControl.getAttribute('disabled') !== null ||
+            sendControl.getAttribute('aria-disabled') === 'true' || /disable/i.test(sendEl.getAttribute('class') || '');
+          if (!disabled) break;
+          await sleep(250);
+        }
+        const sendDisabled = sendControl.disabled || sendControl.getAttribute('disabled') !== null ||
+          sendControl.getAttribute('aria-disabled') === 'true' || /disable/i.test(sendEl.getAttribute('class') || '');
+        if (sendDisabled) {
+          return { error: 'send_not_ready_timeout', detail: '发送按钮持续禁用，等待 120 秒后仍未就绪', selector };
+        }
+        reportPageEvent('send_button_ready', { selector, waitedMs: Date.now() - sendReadyStarted });
+        const clicked = safeClick(sendControl, false);
+        if (!clicked) return { error: 'send_click_failed', detail: '发送按钮点击未执行', selector };
+        const evidenceStarted = Date.now();
+        while (Date.now() - evidenceStarted < 120000) {
+          sendEvidence = !!findFreshUserMessage(userMessage, beforeKeys);
+          if (sendEvidence) break;
+          await sleep(150);
+        }
+        if (!sendEvidence) {
+          // A recorded button is a complete site-specific send contract.  Never
+          // synthesize a second Enter submission after a button click: the page
+          // may have accepted the click while its message DOM is still settling.
+          // A generic fallback would turn a slow/virtualized page into a real
+          // duplicate send (Doubao is especially sensitive to this).
+          reportPageEvent('button_no_effect', {
+            waitedMs: Date.now() - sendWaitStarted,
+            fallback: 'disabled_by_default'
+          });
+        }
       }
 
-      await sleep(400);
-
-      // 2. 点击发送
-      const sendEl = await waitForElement(selectors.send.selector, 10000, 'send');
-      if (!sendEl) return { error: 'send_not_found', selector: selectors.send.selector.css };
-      
-      // 发送前记录 copy 按钮及其消息内容
-      const oldCopyButtons = getCopyButtons();
-      startPageTrace('auto_capture_before_send');
-      const oldCopySet = new Set(oldCopyButtons);
-      const oldCopySnapshot = new Map();
-      for (const btn of oldCopyButtons) {
-        const container = getMessageContainer(btn);
-        oldCopySnapshot.set(btn, {
-          container,
-          messageId: container?.getAttribute?.('data-message-id') || null,
-          text: container ? container.textContent.trim() : '',
-          html: btn.outerHTML,
-          fingerprint: copyButtonFingerprint(btn),
-          buttonState: getButtonState(btn)
+      if (!sendEvidence) {
+        reportPageEvent('send_no_effect', { kind: sendKind, waitedMs: Date.now() - sendWaitStarted });
+        return { error: 'send_no_effect', detail: `发送策略 ${sendKind} 执行后 ${Date.now() - sendWaitStarted}ms 内没有产生新的用户消息`, debug: captureDebug };
+      }
+      // Do not equate DOM representation count with send count.  Virtualized
+      // chat pages commonly expose one logical message through multiple
+      // containers/IDs (for example a row plus an inner message node).  The
+      // send action itself is already guarded and executed once; duplicate
+      // candidates are diagnostic only and must not block extraction.
+      await sleep(350);
+      const freshUserMessages = logicalMessageSnapshot().filter(n =>
+        !beforeKeys.has(n.key) && sameUserMessage(n.text, userMessage)
+      );
+      if (freshUserMessages.length > 1) {
+        reportPageEvent('duplicate_send_detected', {
+          expected: 1,
+          actual: freshUserMessages.length,
+          keys: freshUserMessages.map(n => n.key),
+          action: 'diagnostic_only',
+          reason: 'multiple_dom_representations_are_not_proof_of_multiple_submissions'
         });
       }
-      reportCaptureProgress(`已记录 ${oldCopyButtons.length} 个旧 copy，准备发送`);
+      reportCaptureProgress('已发送，等待后继模型消息');
 
-      // 必须在发送前安装监听，避免极快响应漏事件
-      const oldMessageIds = new Set(getMessageNodes().map(el => messageNodeKey(el)).filter(Boolean));
-      reportCaptureProgress(`发送前消息节点 ${oldMessageIds.size} 个`);
-      const responsePromise = waitForNewCopyButton(oldCopySet, oldCopySnapshot, 30000, document.body.innerText, userMessage, oldMessageIds);
-      reportCaptureProgress('监听已启动，正在点击发送');
-      safeClick(sendEl);
-
-      // 3. 新 copy 按钮/复用按钮发生变化时立即触发
-      const response = await responsePromise;
-      if (!response) return { error: 'copy_timeout', detail: '30 秒内未检测到新的 copy 按钮', debug: captureDebug };
-      return { success: true, user: userMessage, assistant: response };
+      const response = await waitForDirectResponse(userMessage, beforeKeys, 120000, responseAnchorBefore);
+      if (!response?.text) {
+        return { error: 'response_timeout', completion_reason: 'no_content_timeout', detail: '120 秒内未检测到模型回复', debug: captureDebug };
+      }
+      const wasStreaming = response.streaming ? '（流式超时，已返回已累积文本）' : '';
+      reportCaptureProgress(`已提取回复，文本 ${response.text.length} 字${wasStreaming}`);
+      return { success: true, user: userMessage, assistant: response.text, key: response.key };
     } catch (err) {
-      return { error: err.message };
+      return { error: err?.message || String(err), debug: captureDebug };
     } finally {
       autoCaptureInFlight = false;
+      currentCaptureJobId = '';
       document.documentElement.removeAttribute(captureLock);
     }
+  }
+
+  function normalizeRecordedSelector(value) {
+    if (!value) return null;
+    if (typeof value === 'string') return { css: value, alternatives: [] };
+    if (typeof value.css === 'string') return value;
+    if (typeof value.selector === 'string') return { css: value.selector, alternatives: value.alternatives || [] };
+    if (value.selector?.css) return { ...value.selector, alternatives: value.selector.alternatives || [] };
+    return null;
+  }
+
+  function selectorText(value) {
+    if (!value) return '';
+    if (typeof value === 'string') return value;
+    if (typeof value.selector === 'string') return value.selector;
+    if (typeof value.css === 'string') return value.css;
+    if (value.selector && typeof value.selector.css === 'string') return value.selector.css;
+    return '';
+  }
+
+  function sendClickFallback(inputEl) {
+    const container = inputEl.closest('form, [class*="footer"], [class*="input"], [class*="composer"], [class*="chat"]') || inputEl.parentElement?.parentElement;
+    const candidates = Array.from((container || document).querySelectorAll('button, [role="button"], [onclick]'))
+      .filter(el => el.getClientRects().length && !el.disabled && el !== inputEl);
+    return candidates.find(el => {
+      const text = `${el.getAttribute('aria-label') || ''} ${el.getAttribute('data-testid') || ''} ${el.textContent || ''}`.toLowerCase();
+      return /send|submit|发送|提交|enter|arrow-up|paper-plane/.test(text);
+    }) || candidates[candidates.length - 1] || null;
+  }
+
+  function setInputValue(el, value) {
+    const editable = el.matches?.('[contenteditable="true"]') ? el : el.closest?.('[contenteditable="true"]');
+    if (editable) {
+      editable.focus();
+      editable.textContent = value;
+      editable.dispatchEvent(new InputEvent('input', { bubbles: true, composed: true, inputType: 'insertText', data: value }));
+      editable.dispatchEvent(new Event('change', { bubbles: true }));
+      return;
+    }
+    el.focus();
+    const proto = el instanceof HTMLTextAreaElement ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
+    const setter = Object.getOwnPropertyDescriptor(proto, 'value')?.set;
+    if (setter) setter.call(el, value); else el.value = value;
+    el.dispatchEvent(new Event('input', { bubbles: true, composed: true }));
+    el.dispatchEvent(new Event('change', { bubbles: true }));
+  }
+
+  function reportPageEvent(kind, data = {}) {
+    emitPageTrace(kind, data);
+  }
+
+  function normalizeMessageKey(el) {
+    const id = el.getAttribute('data-message-id');
+    const row = el.getAttribute('data-observe-row');
+    const virtual = el.getAttribute('data-virtual-list-item-key');
+    return id || row || virtual || '';
+  }
+
+  function messageIdentity(el) {
+    const id = el.getAttribute('data-message-id');
+    const row = el.getAttribute('data-observe-row');
+    const virtual = el.getAttribute('data-virtual-list-item-key');
+    const raw = id || row || virtual || '';
+    return raw.replace(/^block_/, '');
+  }
+
+  function messageRole(el) {
+    const attrs = [
+      el.getAttribute('data-role'), el.getAttribute('role'), el.getAttribute('data-message-role'),
+      el.getAttribute('data-render-engine'), el.getAttribute('data-plugin-identifier'), el.className
+    ].filter(Boolean).join(' ').toLowerCase();
+    if (/assistant|answer|response|reply|bot|model/.test(attrs)) return 'assistant';
+    if (/user|human|question|prompt/.test(attrs)) return 'user';
+    return 'unknown';
+  }
+
+  function messageIsStreaming(el) {
+    return !!el.matches?.('[data-streaming="true"], [aria-busy="true"]') ||
+      !!el.querySelector?.('[data-streaming="true"], [aria-busy="true"], .dot-flashing, [class*="loading"]');
+  }
+
+  function domToMarkdown(root) {
+    const render = (node, ctx = {}) => {
+      if (node.nodeType === Node.TEXT_NODE) return node.nodeValue || '';
+      if (node.nodeType !== Node.ELEMENT_NODE) return '';
+      const tag = node.tagName.toLowerCase();
+      if (['button', 'svg', 'script', 'style', 'noscript'].includes(tag)) return '';
+      if (node.matches?.('[aria-hidden="true"], [data-testid*="copy" i], [class*="copy" i], .loading-container-AGJEWI, .dot-flashing-mIsXoz')) return '';
+      const inner = Array.from(node.childNodes).map(child => render(child, { tag })).join('');
+      if (!inner.trim() && !['br','hr'].includes(tag)) return '';
+      if (/^h[1-6]$/.test(tag)) return `\n\n${'#'.repeat(Number(tag[1]))} ${inner.trim()}\n\n`;
+      if (tag === 'strong' || tag === 'b') return `**${inner.trim()}**`;
+      if (tag === 'em' || tag === 'i') return `*${inner.trim()}*`;
+      if (tag === 'del' || tag === 's') return `~~${inner.trim()}~~`;
+      if (tag === 'code' && node.parentElement?.tagName.toLowerCase() !== 'pre') return `\`${inner.trim()}\``;
+      if (tag === 'pre') return `\n\n\`\`\`\n${(node.innerText || node.textContent || '').replace(/\n+$/,'')}\n\`\`\`\n\n`;
+      if (tag === 'a') return `[${inner.trim()}](${node.getAttribute('href') || ''})`;
+      if (tag === 'br') return '\n';
+      if (tag === 'hr') return '\n\n---\n\n';
+      if (tag === 'li') return `${ctx.listType === 'ol' ? `${ctx.index}. ` : '- '}${inner.trim()}\n`;
+      if (tag === 'ul' || tag === 'ol') {
+        let index = 0;
+        const items = Array.from(node.children).map(child => {
+          index += 1;
+          return render(child, { listType: tag, index });
+        }).join('');
+        return `\n${items}\n`;
+      }
+      if (tag === 'p' || tag === 'div' || tag === 'section' || tag === 'article' || tag === 'blockquote' || tag === 'tr') return `\n${inner.trim()}\n`;
+      if (tag === 'th' || tag === 'td') return ` ${inner.trim()} |`;
+      return inner;
+    };
+    return render(root).replace(/[ \t]+\n/g, '\n').replace(/\n{3,}/g, '\n\n').trim();
+  }
+
+  function extractMessageText(el) {
+    if (!el) return '';
+    const clone = el.cloneNode(true);
+    clone.querySelectorAll('button, [role="button"], svg, [aria-label], [data-testid*="copy" i], [class*="copy" i], .loading-container-AGJEWI, .dot-flashing-mIsXoz').forEach(n => n.remove());
+    return domToMarkdown(clone);
+  }
+
+  function logicalMessageSnapshot() {
+    const candidates = Array.from(document.querySelectorAll(
+      '[data-observe-row], [data-message-id], [data-virtual-list-item-key]'
+    ));
+    const byLogicalIdentity = new Map();
+    for (const el of candidates) {
+      const rawText = extractMessageText(el);
+      const text = Universal?.responseText ? Universal.responseText(rawText) : rawText;
+      if (!text) continue;
+
+      // A virtualized chat UI may expose one logical message as an outer row
+      // plus an inner message node. Their IDs are often different (Doubao),
+      // so grouping by data-message-id alone falsely reports duplicates.
+      const row = el.closest?.('[data-observe-row]');
+      const rowKey = row?.getAttribute('data-observe-row') ||
+        row?.getAttribute('data-virtual-list-item-key') || '';
+      const ownKey = messageIdentity(el);
+      const logicalKey = rowKey ? `row:${rowKey}` : `msg:${ownKey}`;
+      if (!ownKey && !rowKey) continue;
+
+      const existing = byLogicalIdentity.get(logicalKey);
+      // Prefer the outer row because it is the logical message boundary and
+      // contains the full rendered text/actions. If no row exists, retain the
+      // first keyed message node and replace it only with a longer rendering.
+      if (!existing ||
+          (row && !existing.element.closest?.('[data-observe-row]')) ||
+          text.length > existing.text.length) {
+        byLogicalIdentity.set(logicalKey, { element: el, text });
+      }
+    }
+    return Array.from(byLogicalIdentity.values()).map(({ element, text }, index) => ({
+      key: messageIdentity(element) ||
+        element.closest?.('[data-observe-row]')?.getAttribute('data-observe-row') || `logical:${index}`,
+      element,
+      index,
+      text,
+      role: messageRole(element),
+      streaming: messageIsStreaming(element),
+    }));
+  }
+
+  function debugNode(n) {
+    return { key: n.key, role: n.role, streaming: n.streaming, text: n.text.slice(0, 1000), textLength: n.text.length };
+  }
+
+  function normalizeComparableText(value) {
+    return String(value || '')
+      .replace(/[\u00a0\u200b]/g, ' ')
+      .replace(/[“”]/g, '"')
+      .replace(/[‘’]/g, "'")
+      // DeepSeek may append a UI pagination marker such as "2 / 2" to a row.
+      .replace(/\s+\d+\s*\/\s*\d+\s*$/g, '')
+      // 页面可能自动在中文标点、引号、数字之间插入空白；比较用户消息时忽略所有空白。
+      .replace(/\s+/g, '')
+      .trim();
+  }
+
+  function sameUserMessage(actual, expected) {
+    return Universal ? Universal.sameText(actual, expected) : normalizeComparableText(actual) === normalizeComparableText(expected);
+  }
+
+  function findFreshUserMessage(userMessage, beforeKeys) {
+    return logicalMessageSnapshot().find(n => !beforeKeys.has(n.key) && sameUserMessage(n.text, userMessage));
+  }
+
+  function findDirectCandidate(userMessage, beforeKeys, responseAnchorBefore = null) {
+    const anchor = selectorText(selectors.response) ? findElement(normalizeRecordedSelector(selectors.response), 'response') : null;
+    const currentAnchorKey = anchor ? (messageIdentity(anchor) || anchor.closest?.('[data-observe-row], [data-virtual-list-item-key]')?.getAttribute('data-observe-row') || '') : '';
+    const anchorKey = responseAnchorBefore?.key || currentAnchorKey;
+    const nodes = logicalMessageSnapshot();
+    const fresh = nodes.filter(n => {
+      if (!beforeKeys.has(n.key)) return true;
+      if (!anchorKey || n.key !== anchorKey || !responseAnchorBefore) return false;
+      return !sameUserMessage(n.text, responseAnchorBefore.text || '');
+    });
+    const pool = anchorKey
+      ? fresh.sort((a, b) => (a.key === anchorKey ? 1 : 0) - (b.key === anchorKey ? 1 : 0))
+      : fresh;
+    const user = userMessage.trim();
+    const assistantFresh = pool.map(n => ({ ...n, text: Universal?.responseText ? Universal.responseText(n.text) : n.text }))
+      .filter(n => n.text && !sameUserMessage(n.text, user) && n.role !== 'user');
+    if (assistantFresh.length) return assistantFresh[assistantFresh.length - 1];
+    const userIndex = pool.findIndex(n => sameUserMessage(n.text, user));
+    if (userIndex >= 0) {
+      const after = pool.slice(userIndex + 1).map(n => ({ ...n, text: Universal?.responseText ? Universal.responseText(n.text) : n.text }))
+        .filter(n => n.text && !sameUserMessage(n.text, user));
+      if (after.length) return after[after.length - 1];
+    }
+    return null;
+  }
+
+  async function waitForDirectResponse(userMessage, beforeKeys, timeout, responseAnchorBefore = null) {
+    const started = Date.now();
+    let lastKey = '';
+    let lastText = '';
+    let stable = 0;
+    let lastDebug = 0;
+    let bestResult = null; // 流式过程中最长文本
+    let universalTracker = Universal ? Universal.createResponseTracker() : null;
+    while (Date.now() - started < timeout) {
+      let candidate = findDirectCandidate(userMessage, beforeKeys, responseAnchorBefore);
+      if (candidate) {
+        const cleanedCandidateText = Universal?.responseText ? Universal.responseText(candidate.text) : candidate.text;
+        if (!cleanedCandidateText) {
+          await sleep(150);
+          continue;
+        }
+        candidate = { ...candidate, text: cleanedCandidateText };
+        if (candidate.key === lastKey && candidate.text === lastText) stable++;
+        else { lastKey = candidate.key; lastText = candidate.text; stable = 1; }
+        if (Universal) {
+          universalTracker.userText = userMessage;
+          universalTracker = Universal.observeResponse(universalTracker, candidate);
+        }
+        if (Date.now() - lastDebug > 250) {
+          reportPageEvent('response_candidate', { ...debugNode(candidate), stable, streaming: candidate.streaming });
+          if (currentCaptureJobId) {
+            chrome.runtime.sendMessage({ type: 'capture_delta', job_id: currentCaptureJobId, key: candidate.key, text: candidate.text, streaming: !!candidate.streaming, completion_reason: candidate.completion_reason || '' }).catch(() => {});
+          }
+          lastDebug = Date.now();
+        }
+        // 始终记录最长候选文本，供流式超时时返回
+        if (candidate.text && candidate.text.length > (bestResult?.text?.length || 0)) {
+          bestResult = { key: candidate.key, text: candidate.text, streaming: candidate.streaming };
+        }
+        // 文本不再增长且流式已停止 → 稳定结束
+        if (stable >= 3 && !candidate.streaming && !sameUserMessage(candidate.text, userMessage)) {
+          return { key: candidate.key, text: candidate.text, completion_reason: 'stable_snapshot' };
+        }
+      }
+      await sleep(150);
+    }
+    // 超时了但可能有流式结果 → 返回最长的非用户消息
+    if (bestResult && !sameUserMessage(bestResult.text, userMessage)) {
+      reportPageEvent('response_streaming_timeout', { text: bestResult.text.substring(0, 200), length: bestResult.text.length });
+      return { ...bestResult, completion_reason: 'idle_timeout' };
+    }
+    return null;
   }
 
   function findElement(sel, role = null) {
@@ -593,37 +1049,21 @@
     return findElement(sel, role);
   }
 
-  function safeClick(el) {
-    if (!el) return;
-    // 爬到真正的可点元素 (button / [role=button])
-    const target = el.closest('button, [role="button"], div[role="button"], span[role="button"]') || el;
-    const rect = target.getBoundingClientRect();
-    const cx = rect.left + rect.width / 2;
-    const cy = rect.top + rect.height / 2;
-
-    // 完整鼠标事件序列 — React/Vue 都认这套
-    const opts = { bubbles: true, cancelable: true, view: window, clientX: cx, clientY: cy, button: 0, buttons: 1 };
-    target.dispatchEvent(new PointerEvent('pointerdown', opts));
-    target.dispatchEvent(new MouseEvent('mousedown', opts));
-    target.dispatchEvent(new PointerEvent('pointerup', opts));
-    target.dispatchEvent(new MouseEvent('mouseup', opts));
-    target.dispatchEvent(new MouseEvent('click', opts));
-
-    // 兜底: 原生 click
-    try { if (typeof target.click === 'function') target.click(); } catch(e) {}
-
-    // React fiber 兜底: 直接调 onClick prop
+  function safeClick(el, force = false) {
+    if (!el) return false;
+    // One logical click only. Do not combine pointer/mouse events, native click,
+    // and React fiber onClick: chat UIs may submit once per path.
+    const target = el.matches('button, [role="button"], div[role="button"], span[role="button"]')
+      ? el
+      : el.closest('button, [role="button"], div[role="button"], span[role="button"]');
+    if (!target) return false;
+    if (!force && (target.disabled || target.getAttribute('disabled') !== null || target.getAttribute('aria-disabled') === 'true')) return false;
     try {
-      const fiberKey = Object.keys(target).find(k => k.startsWith('__reactFiber') || k.startsWith('__reactInternalInstance'));
-      if (fiberKey) {
-        let fiber = target[fiberKey];
-        while (fiber) {
-          if (fiber.memoizedProps?.onClick) { fiber.memoizedProps.onClick({ nativeEvent: {}, stopPropagation: ()=>{}, preventDefault: ()=>{} }); break; }
-          if (fiber.memoizedProps?.onPointerDown) { fiber.memoizedProps.onPointerDown({ nativeEvent: {} }); break; }
-          fiber = fiber.return;
-        }
-      }
-    } catch(e) {}
+      target.click();
+      return true;
+    } catch (_) {
+      return false;
+    }
   }
 
   function getCopyButtons() {
@@ -1069,18 +1509,26 @@
     switch (msg.action) {
       case 'record_input':
         cancelCapture();
-        enableCopyMonitor();
         sendResponse(startSingleCapture('input'));
         break;
 
       case 'record_send':
+      case 'record_send_button':
+      case 'record_send_strategy':
         cancelCapture();
         sendResponse(startSingleCapture('send'));
         break;
 
-      case 'record_copy':
+      case 'record_shortcut':
         cancelCapture();
-        sendResponse(startSingleCapture('copy'));
+        shortcutListening = true;
+        startShortcutRecording();
+        sendResponse({ status: 'listening', role: 'shortcut' });
+        break;
+
+      case 'record_response':
+        cancelCapture();
+        sendResponse(startSingleCapture('response'));
         break;
 
       case 'cancel_record':
@@ -1093,13 +1541,21 @@
         break;
 
       case 'set_selectors':
-        // content script 每次刷新页面都会重新创建；从 background 恢复持久模板。
         for (const role of ['input', 'send', 'copy', 'response']) {
           const value = msg.selectors?.[role];
-          if (!value) selectors[role] = null;
-          else if (value.selector?.css) selectors[role] = value;
-          else if (value.css) selectors[role] = { selector: value };
+          if (role === 'send' && value && typeof value === 'object' && value.kind) {
+            sendStrategy = value;
+            selectors.send = value;
+          } else {
+            selectors[role] = value ? normalizeRecordedSelector(value) : null;
+          }
         }
+        reportPageEvent('recorded_selectors_loaded', {
+          input: selectorText(selectors.input),
+          send: selectorText(selectors.send),
+          sendTag: selectors.send?.elementTag || '',
+          sendHTML: selectors.send?.elementHTML || ''
+        });
         sendResponse({ ok: true, selectors });
         break;
 
@@ -1111,8 +1567,44 @@
         sendResponse({ pong: true });
         break;
 
+      case 'discover_selectors':
+        sendResponse(discoverReplaySelectors());
+        break;
+
+      case 'wait_until_ready': {
+        const timeout = Math.min(120000, Math.max(1000, Number(msg.timeout) || 30000));
+        (async () => {
+          const started = Date.now();
+          let inputEl = null;
+          let sendReady = false;
+          while (Date.now() - started < timeout) {
+            inputEl = await waitForElement({ css: selectorText(selectors.input), alternatives: [] }, 250, 'input');
+            // Strategy-based send (enter/shortcut) is ready when input exists
+            // Only when selectors.send IS actually a strategy object (has .kind)
+            const isStrategySend = selectors.send && typeof selectors.send === 'object' && selectors.send.kind;
+            sendReady = isStrategySend && (selectors.send.kind === 'enter' || selectors.send.kind === 'shortcut');
+            if (!sendReady) {
+              const sendEl = await waitForElement({ css: selectorText(selectors.send), alternatives: [] }, 250, 'send');
+              sendReady = !!sendEl && !!sendEl.getClientRects().length;
+            }
+            const inputReady = !!inputEl && !!inputEl.getClientRects().length;
+            if (inputReady && sendReady) {
+              reportPageEvent('recorded_elements_ready', { waitedMs: Date.now() - started, input: selectorText(selectors.input), send: strategy?.kind || selectorText(selectors.send) });
+              sendResponse({ ready: true, input_ready: true, send_ready: true, waited_ms: Date.now() - started });
+              return;
+            }
+            await sleep(100);
+          }
+          sendResponse({ ready: false, input_ready: !!inputEl, send_ready: sendReady, waited_ms: Date.now() - started });
+        })();
+        return true;
+      }
+
       case 'auto_capture':
-        autoCapture(msg.message).then(sendResponse);
+        Promise.resolve().then(() => autoCapture(msg.message, msg.job_id || '')).then(sendResponse).catch(error => {
+          console.error('[Phantom Relay] auto_capture failed', error);
+          sendResponse({ error: error?.message || String(error) });
+        });
         return true;
 
       case 'find_response':
@@ -1121,11 +1613,128 @@
         break;
 
       case 'clear_selectors':
-        selectors = { input: null, send: null, copy: null, response: null };
+        selectors = { input: null, send: null, response: null };
         sendResponse({ status: 'cleared' });
         break;
     }
   });
+
+  // page_ready 是“录制元素可用”握手，不是仅仅 DOMContentLoaded。
+  // 页面保持 ready 租约，避免后台短暂休眠后后端误判离线。
+  let readyLeaseInFlight = false;
+  let directBridgeInFlight = false;
+  let directBridgeReady = false;
+  let directBridgeTimer = null;
+
+  async function requestReadyLease() {
+    if (readyLeaseInFlight || !isCurrentGeneration()) return;
+    readyLeaseInFlight = true;
+    try {
+      await new Promise((resolve) => {
+        let settled = false;
+        const finish = () => { if (!settled) { settled = true; resolve(); } };
+        try {
+          chrome.runtime.sendMessage({ type: 'page_ready' }, () => {
+            void chrome.runtime.lastError;
+            finish();
+          });
+          setTimeout(finish, 4000);
+        } catch (_) { finish(); }
+      });
+    } finally {
+      readyLeaseInFlight = false;
+    }
+  }
+
+  function loadDirectBridgeSelectors() {
+    try {
+      chrome.storage.local.get(['phantomSelectors'], async (data) => {
+        const local = data?.phantomSelectors?.[location.hostname];
+        if (local?.input && local?.send) {
+          selectors = {
+            ...selectors,
+            input: normalizeRecordedSelector(local.input),
+            send: (local.send && typeof local.send === 'object' && local.send.kind) ? local.send : normalizeRecordedSelector(local.send),
+            response: normalizeRecordedSelector(local.response)
+          };
+        }
+        try {
+          const resp = await fetch(`http://localhost:8765/browser/selectors?domain=${encodeURIComponent(location.hostname)}`);
+          const remote = await resp.json();
+          const saved = remote?.selectors;
+          if (!saved?.input || !saved?.send) return;
+          // Backend contains the latest manually recorded template. Prefer it
+          // over stale local extension storage after a browser/profile restore.
+          selectors = {
+            ...selectors,
+            input: normalizeRecordedSelector(saved.input),
+            send: (saved.send && typeof saved.send === 'object' && saved.send.kind) ? saved.send : normalizeRecordedSelector(saved.send),
+            response: normalizeRecordedSelector(saved.response)
+          };
+        } catch (_) {}
+      });
+    } catch (_) {}
+  }
+
+  async function directBrowserBridgeTick() {
+    if (directBridgeInFlight || !isCurrentGeneration()) return;
+    directBridgeInFlight = true;
+    try {
+      const inputEl = await waitForElement({ css: selectorText(selectors.input), alternatives: [] }, 50, 'input');
+      const isStrategySend = selectors.send && typeof selectors.send === 'object' && selectors.send.kind;
+      const inputReady = !!inputEl && !!inputEl.getClientRects().length;
+      let sendReady = isStrategySend && (selectors.send.kind === 'enter' || selectors.send.kind === 'shortcut');
+      if (!sendReady) {
+        const sendEl = await waitForElement({ css: selectorText(selectors.send), alternatives: [] }, 50, 'send');
+        sendReady = !!sendEl && !!sendEl.getClientRects().length;
+      }
+      directBridgeReady = inputReady && sendReady;
+      const heartbeat = {
+        domain: location.hostname,
+        tab_id: null,
+        url: location.href,
+        source: 'content-direct',
+        ready: directBridgeReady,
+        input_ready: inputReady,
+        send_ready: sendReady
+      };
+      await fetch('http://localhost:8765/browser/heartbeat', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(heartbeat)
+      });
+      if (!directBridgeReady) return;
+      const poll = await fetch('http://localhost:8765/browser/poll', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ domain: location.hostname })
+      });
+      const data = await poll.json();
+      if (!data?.job) return;
+      const job = data.job;
+      const result = await autoCapture(job.message);
+      await fetch('http://localhost:8765/browser/result', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ job_id: job.id, domain: location.hostname, model: job.model || '', ...result })
+      });
+    } catch (_) {
+      // The page may be navigating or the local API may be restarting.
+    } finally {
+      directBridgeInFlight = false;
+    }
+  }
+
+  function startDirectBrowserBridge() {
+    if (directBridgeTimer) return;
+    loadDirectBridgeSelectors();
+    directBrowserBridgeTick();
+    directBridgeTimer = setInterval(directBrowserBridgeTick, 1500);
+  }
+
+  requestReadyLease();
+  setInterval(requestReadyLease, 3000);
+  // The background service worker is the sole job scheduler/claimer.
+  // Content script only reports readiness and executes assigned jobs; do not
+  // run a second direct poller here, otherwise one API request can be sent twice.
+  loadDirectBridgeSelectors();
 
   // 页面加载完成后持续监测消息节点，不等到点击“自动抓取”才开始。
   // 这样模型正常回复但 copy 控件尚未出现时，也能看到真实新增/更新消息。

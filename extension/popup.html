@@ -65,6 +65,9 @@
       color: #58a6ff; margin-top: 3px;
       white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
     }
+    .send-tabs { display:flex; gap:4px; margin-top:6px; }
+    .send-tab { border:1px solid #30363d; background:#21262d; color:#8b949e; border-radius:4px; padding:4px 6px; font-size:10px; cursor:pointer; }
+    .send-tab.active { border-color:#58a6ff; color:#58a6ff; background:#0d1f32; }
 
     .step-btn {
       padding: 6px 12px;
@@ -133,6 +136,14 @@
 
     .empty { text-align: center; padding: 16px; color: #484f58; font-size: 11px; }
 
+    /* 模型选择 */
+    .model-row {
+      display: flex; gap: 6px; align-items: center; margin-top: 6px;
+    }
+    .model-label {
+      font-size: 10px; color: #8b949e; flex: none; white-space: nowrap;
+    }
+
     .debug-actions { display: flex; gap: 6px; margin-bottom: 6px; }
     .mini-btn { border: 1px solid #30363d; background: #21262d; color: #8b949e; border-radius: 4px; padding: 3px 7px; font-size: 10px; cursor: pointer; }
     .mini-btn:hover { background: #30363d; color: #c9d1d9; }
@@ -165,26 +176,31 @@
       <button id="btnInput" class="step-btn btn-record" data-role="input">⏺ 录制</button>
     </div>
 
-    <!-- Step 2: Send -->
+    <!-- Step 2: Send strategy -->
     <div id="stepSend" class="step-card waiting">
       <div id="step2Num" class="step-num pending">2</div>
       <div class="step-info">
-        <div class="step-label">发送按钮</div>
-        <div class="step-desc">点击发送/提交按钮</div>
+        <div class="step-label">发送方式</div>
+        <div class="step-desc">默认回车；也可录制快捷键或发送按钮</div>
+        <div class="send-tabs" role="tablist">
+          <button id="tabShortcut" class="send-tab" data-send-kind="shortcut">快捷键</button>
+          <button id="tabEnter" class="send-tab active" data-send-kind="enter">回车</button>
+          <button id="tabButton" class="send-tab" data-send-kind="button">发送按钮</button>
+        </div>
         <div id="selSend" class="step-selector"></div>
       </div>
-      <button id="btnSend" class="step-btn btn-record" data-role="send" disabled>⏺ 录制</button>
+      <button id="btnSend" class="step-btn btn-record" data-role="send_strategy" disabled>⏺ 录制</button>
     </div>
 
-    <!-- Step 3: Copy -->
+    <!-- Step 3: Response anchor -->
     <div id="stepCopy" class="step-card waiting">
       <div id="step3Num" class="step-num pending">3</div>
       <div class="step-info">
-        <div class="step-label">复制按钮</div>
-        <div class="step-desc">等待 AI 回复完成后点击复制</div>
+        <div class="step-label">回复区域</div>
+        <div class="step-desc">点击任意已完成的 AI 回复正文，作为回复锚点</div>
         <div id="selCopy" class="step-selector"></div>
       </div>
-      <button id="btnCopy" class="step-btn btn-record" data-role="copy" disabled>⏺ 录制</button>
+      <button id="btnCopy" class="step-btn btn-record" data-role="response" disabled>⏺ 录制</button>
     </div>
 
     <!-- Auto Capture -->
@@ -193,6 +209,11 @@
       <div class="input-row">
         <input id="msgInput" class="text-input" placeholder="输入要发送的消息..." />
         <button id="btnCapture" class="step-btn btn-record" style="flex:none;padding:8px 14px">▶ 抓取</button>
+      </div>
+      <div class="model-row">
+        <label class="model-label">模型：</label>
+        <input id="modelName" class="text-input" list="modelDatalist" placeholder="model alias (bind it to a recorded site)" style="font-size:10px;padding:5px 8px;width:100%" />
+        <datalist id="modelDatalist"></datalist>
       </div>
       <div id="captureStatus" style="font-size:10px;color:#8b949e;margin-top:4px"></div>
     </div>
