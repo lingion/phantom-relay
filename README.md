@@ -2,6 +2,8 @@
 
 > A local, browser-based AI proxy that exposes logged-in web AI sessions through an OpenAI-compatible API.
 
+[中文文档](README-zh-CN.md) · **English**
+
 Phantom Relay connects a local HTTP API to AI chat websites running in Google Chrome Canary. Instead of calling a provider's private API directly, it uses a browser session owned by the user and a site template recorded from that website's interface.
 
 The project is designed as a reusable browser-agent framework: users can record the input field, submission method, and response area for a website, bind a model name to that site, and then access it through a local OpenAI-compatible endpoint.
