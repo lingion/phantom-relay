@@ -167,3 +167,256 @@ class ModelNotFoundError(Exception):
             f"Available: {', '.join(available)}. "
             f"Aliases: {alias_list}"
         )
+
+
+# ═══ Public API: Model Resolution ═══
+
+def resolve_model(
+    model_id: str,
+    routes: dict[str, ModelRoute],
+    aliases: dict[str, str],
+) -> ModelRoute:
+    resolved_id = aliases.get(model_id, model_id)
+    route = routes.get(resolved_id)
+    if route is not None:
+        return route
+    available = list(routes.keys())
+    raise ModelNotFoundError(model=model_id, available=available, aliases=aliases)
+
+
+# ═══ Public API: Message Conversion ═══
+
+def messages_to_text(messages: list[Message]) -> str:
+    lines: list[str] = []
+    for msg in messages:
+        role = msg.role
+        label = ROLE_LABELS.get(role, role.capitalize())
+        content = msg.content or ""
+
+        if role == "assistant" and msg.tool_calls:
+            tc_parts = [label + ":"]
+            for tc in msg.tool_calls:
+                tc_id = tc.get("id", "")
+                fn = tc.get("function", {})
+                fn_name = fn.get("name", "")
+                fn_args = fn.get("arguments", "{}")
+                tc_parts.append(
+                    f'<tool_call id="{tc_id}" name="{fn_name}">{fn_args}</tool_call>'
+                )
+            if content.strip():
+                tc_parts.append(content)
+            lines.append(" ".join(tc_parts))
+        elif role == "tool":
+            tool_name = msg.name or "unknown"
+            lines.append(f"Tool {tool_name} returned: {content}")
+        else:
+            if content.strip():
+                lines.append(f"{label}: {content}")
+
+    return "\n\n".join(lines)
+
+
+# ═══ Public API: Tool Injection ═══
+
+def inject_tool_defs(
+    tools: list[ToolDefinition],
+    supports_tool_calling: bool = True,
+) -> str:
+    if not tools or not supports_tool_calling:
+        return ""
+    tool_list: list[dict] = []
+    for tool in tools:
+        fn = tool.function or {}
+        tool_list.append({
+            "name": fn.get("name", ""),
+            "description": fn.get("description", ""),
+            "parameters": fn.get("parameters", {}),
+        })
+    tool_defs_json = json.dumps(tool_list, ensure_ascii=False, indent=2)
+    return "\n\n" + TOOL_PROMPT_TEMPLATE.format(tool_defs_json=tool_defs_json)
+
+
+# ═══ Public API: Tool Call Extraction ═══
+
+def extract_tool_calls(text: str) -> list[ParsedToolCall]:
+    if not text:
+        return []
+
+    # Pattern 1: Fenced
+    for match in _FENCED_PATTERN.finditer(text):
+        parsed = _parse_tool_json(match.group(1))
+        if parsed:
+            return [parsed]
+
+    # Pattern 2: Bare JSON
+    for match in _BARE_JSON_PATTERN.finditer(text):
+        tool_name = match.group(1)
+        try:
+            params = json.loads(match.group(2))
+        except json.JSONDecodeError:
+            continue
+        return [ParsedToolCall(
+            id=f"call_{_short_uuid()}",
+            function_name=tool_name,
+            arguments=json.dumps(params),
+        )]
+
+    # Pattern 3: XML
+    for match in _XML_PATTERN.finditer(text):
+        parsed = _parse_tool_json(match.group(1))
+        if parsed:
+            return [parsed]
+
+    return []
+
+
+# ═══ Public API: Response Building ═══
+
+def text_to_openai_response(
+    text: str,
+    model: str,
+    tool_calls: list[ParsedToolCall] | None = None,
+    stream: bool = False,
+    finish_reason: str = "stop",
+    system_fingerprint: str | None = None,
+) -> OpenAIResponse:
+    response_id = f"chatcmpl-{_short_uuid()}"
+    created = int(time.time())
+
+    tool_calls = tool_calls or []
+    prompt_tokens = estimate_tokens(text) if text else 0
+    completion_tokens = estimate_tokens(text) if text else 0
+
+    if tool_calls:
+        openai_tool_calls = []
+        for i, tc in enumerate(tool_calls):
+            openai_tool_calls.append({
+                "index": i,
+                "id": tc.id or f"call_{_short_uuid()}",
+                "type": "function",
+                "function": {
+                    "name": tc.function_name,
+                    "arguments": tc.arguments,
+                },
+            })
+        choices = [{
+            "index": 0,
+            "message": {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": openai_tool_calls,
+            },
+            "finish_reason": "tool_calls",
+            "logprobs": None,
+        }]
+    elif not text.strip():
+        choices = [{
+            "index": 0,
+            "message": {"role": "assistant", "content": ""},
+            "finish_reason": "error",
+            "logprobs": None,
+        }]
+    else:
+        choices = [{
+            "index": 0,
+            "message": {"role": "assistant", "content": text},
+            "finish_reason": finish_reason,
+            "logprobs": None,
+        }]
+
+    return OpenAIResponse(
+        id=response_id,
+        object="chat.completion",
+        created=created,
+        model=model,
+        choices=choices,
+        usage={
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": completion_tokens,
+            "total_tokens": prompt_tokens + completion_tokens,
+        },
+        system_fingerprint=system_fingerprint,
+    )
+
+
+def text_to_sse_chunk(
+    delta_content: str | None = None,
+    delta_role: str | None = None,
+    tool_calls_delta: list[dict] | None = None,
+    model: str = "",
+    finish_reason: str | None = None,
+    response_id: str = "",
+    created: int = 0,
+) -> str:
+    if not response_id:
+        response_id = f"chatcmpl-{_short_uuid()}"
+    if not created:
+        created = int(time.time())
+
+    delta: dict[str, Any] = {}
+    if delta_role:
+        delta["role"] = delta_role
+    if delta_content is not None:
+        delta["content"] = delta_content
+    if tool_calls_delta is not None:
+        delta["tool_calls"] = tool_calls_delta
+
+    chunk = {
+        "id": response_id,
+        "object": "chat.completion.chunk",
+        "created": created,
+        "model": model,
+        "choices": [{
+            "index": 0,
+            "delta": delta,
+            "finish_reason": finish_reason,
+            "logprobs": None,
+        }],
+    }
+    return f"data: {json.dumps(chunk)}\n\n"
+
+
+def build_sse_done() -> str:
+    return "data: [DONE]\n\n"
+
+
+def build_sse_error(message: str, error_type: str = "server_error") -> str:
+    error_obj = {"error": {"message": message, "type": error_type}}
+    return f"data: {json.dumps(error_obj)}\n\n"
+
+
+def build_openai_error(
+    message: str,
+    error_type: str = "server_error",
+    code: str = "internal_error",
+    status_code: int = 500,
+) -> tuple[dict, int]:
+    return {
+        "error": {
+            "message": message,
+            "type": error_type,
+            "code": code,
+        }
+    }, status_code
+
+
+def build_model_list(models: dict[str, ModelRoute]) -> dict:
+    data = []
+    for model_id, route in models.items():
+        data.append({
+            "id": model_id,
+            "object": "model",
+            "created": route.created,
+            "owned_by": route.owned_by,
+        })
+    return {"object": "list", "data": data}
+
+
+def estimate_tokens(text: str) -> int:
+    if not text:
+        return 0
+    char_count = len(text)
+    cjk_count = sum(1 for c in text if '\u4e00' <= c <= '\u9fff')
+    non_cjk = char_count - cjk_count
+    tokens = (cjk_count / 1.5) + (non_cjk / 4.0)
+    return max(1, int(tokens))
