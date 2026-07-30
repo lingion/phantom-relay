@@ -1,0 +1,123 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Phantom Relay Admin</title>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; background: #1a1a2e; color: #e0e0e0; padding: 20px; }
+h1 { color: #7b68ee; margin-bottom: 20px; }
+button { background: #7b68ee; color: white; border: none; padding: 8px 16px; border-radius: 4px; cursor: pointer; margin: 4px; }
+button:hover { background: #6a5acd; }
+button.danger { background: #e74c3c; }
+table { width: 100%; border-collapse: collapse; margin: 10px 0; background: #16213e; border-radius: 8px; overflow: hidden; }
+th, td { padding: 12px; text-align: left; border-bottom: 1px solid #2a2a4a; }
+th { background: #0f3460; color: #7b68ee; }
+tr:hover { background: #1a1a3e; }
+.section { margin: 20px 0; }
+.badge { display: inline-block; padding: 2px 8px; border-radius: 10px; font-size: 12px; }
+.badge.green { background: #27ae60; }
+.badge.red { background: #e74c3c; }
+.badge.blue { background: #3498db; }
+input, select, textarea { background: #16213e; color: #e0e0e0; border: 1px solid #2a2a4a; padding: 8px; border-radius: 4px; width: 100%; margin: 4px 0; }
+#result { white-space: pre-wrap; padding: 10px; background: #0f3460; border-radius: 4px; margin: 10px 0; min-height: 100px; }
+</style>
+</head>
+<body>
+
+<h1>🔄 Phantom Relay Admin</h1>
+
+<div class="section">
+  <h2>Models</h2>
+  <table id="models-table">
+    <thead>
+      <tr>
+        <th>ID</th>
+        <th>Name</th>
+        <th>Domain</th>
+        <th>Tool Calling</th>
+        <th>Streaming</th>
+        <th>File Upload</th>
+        <th>Max Input</th>
+        <th>Actions</th>
+      </tr>
+    </thead>
+    <tbody></tbody>
+  </table>
+  <button onclick="addModel()">+ Add Model</button>
+</div>
+
+<div class="section">
+  <h2>Test</h2>
+  <select id="test-model"></select>
+  <textarea id="test-prompt" rows="3" placeholder="Enter test prompt...">1+1=?</textarea>
+  <label><input type="checkbox" id="test-stream" checked> Stream</label>
+  <button onclick="runTest()">Send Test</button>
+  <div id="result"></div>
+</div>
+
+<script>
+const API = '/admin/api/models';
+
+async function loadModels() {
+  const res = await fetch(API);
+  const data = await res.json();
+  const tbody = document.querySelector('#models-table tbody');
+  const select = document.getElementById('test-model');
+  tbody.innerHTML = '';
+  select.innerHTML = '';
+  
+  for (const m of data.models) {
+    const c = m.capabilities || {};
+    tbody.innerHTML += `
+      <tr>
+        <td>${m.id}</td>
+        <td>${m.name}</td>
+        <td>${m.provider?.domain || ''}</td>
+        <td><span class="badge ${c.supports_tool_calling ? 'green' : 'red'}">${c.supports_tool_calling ? '✓' : '✗'}</span></td>
+        <td><span class="badge ${c.supports_streaming ? 'green' : 'red'}">${c.supports_streaming ? '✓' : '✗'}</span></td>
+        <td><span class="badge ${c.supports_file_upload ? 'green' : 'red'}">${c.supports_file_upload ? '✓' : '✗'}</span></td>
+        <td>${c.max_input_chars || 'N/A'}</td>
+        <td><button onclick="editModel('${m.id}')">Edit</button><button class="danger" onclick="deleteModel('${m.id}')">Delete</button></td>
+      </tr>`;
+    select.innerHTML += `<option value="${m.id}">${m.name} (${m.id})</option>`;
+  }
+}
+
+async function runTest() {
+  const model = document.getElementById('test-model').value;
+  const prompt = document.getElementById('test-prompt').value;
+  const stream = document.getElementById('test-stream').checked;
+  document.getElementById('result').textContent = 'Sending...';
+  
+  const start = Date.now();
+  const res = await fetch('/v1/chat/completions', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({model, messages: [{role: 'user', content: prompt}], stream})
+  });
+  
+  const elapsed = Date.now() - start;
+  if (stream) {
+    const text = await res.text();
+    document.getElementById('result').textContent = `[${elapsed}ms]\n${text}`;
+  } else {
+    const json = await res.json();
+    document.getElementById('result').textContent = `[${elapsed}ms]\n${JSON.stringify(json, null, 2)}`;
+  }
+}
+
+async function deleteModel(id) {
+  if (!confirm(`Delete ${id}?`)) return;
+  await fetch(`${API}/${id}`, {method: 'DELETE'});
+  loadModels();
+}
+
+function editModel(id) { alert('Edit model: ' + id + '\nEdit JSON in model_routes.json directly for now.'); }
+function addModel() { alert('Add model: add to model_routes.json and restart server.'); }
+
+loadModels();
+</script>
+</body>
+</html>
