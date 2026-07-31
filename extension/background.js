@@ -4,6 +4,7 @@
 // ============================================================
 
 importScripts('profile_lifecycle.js');
+importScripts('profile_store.js');
 
 const LOCAL_API = 'http://localhost:8765';
 const BROWSER_POLL_ALARM = 'phantom-relay-browser-poll';
@@ -28,6 +29,7 @@ let debugLogs = [];
 let modelRoutes = {};      // 用户录制后绑定：模型名 -> 官网 hostname
 let storageReadyResolve;
 const storageReady = new Promise(resolve => { storageReadyResolve = resolve; });
+let profileStore = { version: 1, profiles: {}, diagnostics: [], legacyHints: [] };
 const readyFlights = new Map();
 function emptySelectors() {
   return { input: null, send: null, response: null };
@@ -99,12 +101,19 @@ function addDebugLog(message, details = null, domain = currentDomain) {
 }
 
 // ── 持久化 ────────────────────────────────────────────────
-chrome.storage.local.get(['phantomSelectors', 'phantomDomainState', 'phantomConversations', 'phantomDebugLogs', 'phantomModelRoutes'], (data) => {
+chrome.storage.local.get(['phantomSelectors', 'phantomDomainState', 'phantomConversations', 'phantomDebugLogs', 'phantomModelRoutes'], async (data) => {
   if (data.phantomSelectors) selectors = data.phantomSelectors;
   if (data.phantomDomainState) domainState = data.phantomDomainState;
   if (data.phantomConversations) conversations = data.phantomConversations;
   if (data.phantomDebugLogs) debugLogs = data.phantomDebugLogs;
   if (data.phantomModelRoutes) modelRoutes = data.phantomModelRoutes;
+  try {
+    profileStore = await PhantomRelayProfileStore.loadProfileStore(chrome.storage.local);
+    const migration = PhantomRelayProfileStore.migrateLegacySelectors(data.phantomSelectors || {});
+    profileStore.legacyHints = migration.hints;
+  } catch (error) {
+    profileStore.diagnostics.push({ slot: 'store', code: error?.code || 'profile_store_load_failed', message: error?.message || String(error) });
+  }
   storageReadyResolve();
 });
 
@@ -134,6 +143,9 @@ function persist() {
     phantomDomainState: domainState,
     phantomConversations: conversations,
     phantomModelRoutes: modelRoutes,
+  });
+  PhantomRelayProfileStore.saveProfileStore(chrome.storage.local, profileStore).catch(error => {
+    addDebugLog('profile_store_persist_failed', { error: error?.message || String(error) });
   });
   syncRoutesToBackend();
 }
