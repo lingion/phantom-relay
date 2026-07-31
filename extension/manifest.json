@@ -46,6 +46,7 @@
       ],
       "js": [
         "universal_bridge.js",
+        "profile_lifecycle.js",
         "content.js"
       ],
       "run_at": "document_idle"

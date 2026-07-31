@@ -56,7 +56,7 @@ async function ensureContentScript() {
     try {
       await chrome.scripting.executeScript({
         target: { tabId: currentTabId },
-        files: ['content.js']
+        files: ['universal_bridge.js', 'profile_contract.js', 'profile_lifecycle.js', 'content.js']
       });
       await sleep(500);
       await chrome.tabs.sendMessage(currentTabId, { action: 'ping' });

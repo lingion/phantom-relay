@@ -3,6 +3,8 @@
 // 多站点: 按域名独立存储选择器模板
 // ============================================================
 
+importScripts('profile_lifecycle.js');
+
 const LOCAL_API = 'http://localhost:8765';
 const BROWSER_POLL_ALARM = 'phantom-relay-browser-poll';
 
