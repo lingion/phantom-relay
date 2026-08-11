@@ -1,350 +1,317 @@
 # Phantom Relay
 
-> 一个基于浏览器的本地 AI 代理，通过 OpenAI 兼容 API 调用用户已登录的网页 AI 会话。
+> 在浏览器里录制一次网页 AI 的交互界面，把用户自己的登录会话转换成本地 OpenAI-compatible API。
 
-[English](README.md) · **中文**
+**中文** | [English](README.md)
 
-Phantom Relay 将本地 HTTP API 与浏览器中的 AI 聊天网站连接起来。它不直接调用 provider 的私有 API，而是使用用户自己的浏览器登录态，并通过用户在目标网站上录制的页面交互模板完成请求。
+当前扩展版本：**2.5.7**
 
-这个项目的定位是一个可复用的浏览器 AI 代理框架：用户可以为某个网站录制输入框、发送方式和回复区域，绑定一个模型名称，然后通过本地 OpenAI-compatible API 使用它。
+当前浏览器运行时协议：**2026-08-11.05**
 
-## 工作原理
+Phantom Relay 是一个本地浏览器会话网关。用户把未打包扩展安装到自己的 Chromium 系浏览器，运行 Python 后端，然后录制目标网页的输入框、发送动作和一条已完成回复。录制成功后，即可通过 `POST /v1/chat/completions` 调用这个网页会话。
+
+它不是 provider SDK，也不会携带作者的账号、Cookie、录制 selector 或站点专用集成。每个安装实例只使用用户自己的浏览器登录态和用户自己录制的 DOM profile。
+
+## 产品契约
 
 ```text
-OpenAI 兼容客户端
-        |
-        v
-本地 Python API（:8765）
-        |
-        v
-模型名称 -> 网站路由
-        |
-        v
-Chrome / Chromium 扩展
-        |
-        v
-用户录制的网站模板
-        |
-        v
-网页交互与 DOM 回复提取
-        |
-        v
-OpenAI 兼容 JSON 或 SSE 响应
+OpenAI-compatible 客户端
+          |
+          v
+本地 Flask API：127.0.0.1:8765
+          |
+          v
+用户模型别名 -> 用户录制的站点/profile
+          |
+          v
+后端唤醒或复用用户浏览器
+          |
+          v
+MV3 扩展执行一次已录制发送动作
+          |
+          v
+只返回拥有全新录制身份的回复
+          |
+          v
+OpenAI-compatible JSON 或 SSE
 ```
 
-Phantom Relay 不会携带作者的浏览器配置文件、登录会话、历史对话或录制选择器。全新安装时没有站点配置；每个用户都需要在自己的浏览器中完成录制和绑定。
+当前主线遵守以下边界：
 
-## 功能特性
+- 录制的 DOM profile 是回复判断的唯一权威。
+- API 请求执行期间，扩展不会临时猜测或发现 selector。
+- 扩展 background 不会创建、导航、关闭或置顶 provider 标签页。
+- 后端拥有浏览器激活职责；没有可复用页面时，只打开该 profile 录制的目标 URL。
+- 一个请求只执行一次录制的发送动作；发送结果不确定时不会盲目重发。
+- 回复必须证明出现了新的录制身份，或同一结构身份下出现了可验证的新正文。
+- 身份归属不明确时失败关闭，不返回旧助手消息，也不返回用户刚发送的内容。
+- 产品主路径禁用网络拦截；当前支持的稳定路径是录制 DOM 抓取。
 
-- 基于 Manifest V3 的浏览器扩展。
-- 本地 Python HTTP 服务。
-- OpenAI-compatible `GET /v1/models` 接口。
-- OpenAI-compatible `POST /v1/chat/completions` 接口。
-- 非流式 JSON 响应。
-- 基于浏览器 DOM 增长快照的 SSE 响应。
-- 按 hostname 保存的网站模板。
-- 支持手动录制：
-  - 输入框；
-  - Enter 发送；
-  - 键盘快捷键；
-  - 发送按钮；
-  - 回复区域锚点。
-- 基于稳定属性和 CSS 的选择器生成及备用选择器。
-- 在完整模板不可用时，尝试通用发现输入框和发送控件。
-- 面向虚拟列表聊天页面的逻辑消息识别。
-- 面向 Markdown 内容的回复提取。
-- 对可识别的思考、搜索和加载状态文本进行过滤。
-- 单次提交保护，降低重复发送的风险。
-- API 请求幂等处理。
-- 本地对话保存和扩展 popup JSON 导出。
-- 浏览器 heartbeat 和页面 trace 诊断接口。
+## 当前能力
 
-## 兼容性状态
+| 能力 | 当前状态 |
+| --- | --- |
+| Manifest V3 扩展 | 已实现 |
+| 用户录制输入框、Enter、快捷键或发送按钮 | 已实现 |
+| 用户录制回复身份 | 执行前强制要求 |
+| 按站点保存 profile 和模型别名 | 已实现 |
+| 后端唤醒/复用浏览器 | 已实现 |
+| `GET /v1/models` | 已实现 |
+| `POST /v1/chat/completions` JSON | 已实现并完成真实请求测试 |
+| SSE 响应封装 | 已实现，效果取决于网页 DOM |
+| provider 原生 token 流 | 不提供 |
+| 网络响应拦截 | 已禁用 |
+| 统一工具、视觉、文件、音频或 structured output | 尚未提供 |
 
-Phantom Relay 的设计不是固定支持一组 provider，而是让用户通过录制为网站建立本地适配配置。
-
-作者已经在本地浏览器环境中实测通过 DeepSeek 和 Doubao。这些结果说明当前版本具备相应的网页兼容性，但它们不是随发行代码提供的内置集成。用户安装后仍然需要登录自己的账号，并为自己的浏览器配置录制网站模板。
-
-其他网站也可以通过相同的录制流程接入，但最终效果取决于网站的 DOM 结构、消息渲染方式和发送行为。扩展权限中出现某个 hostname，并不代表该网站已经完成适配。
+当前运行时已经针对用户录制的 Mimo 和豆包页面发过真实后端请求，包括 Mimo 连续请求、长输入防用户回声回归以及跨站切回测试。这些只是测试目标，不是内置集成，也不代表网站未来改版后仍然无需重录。
 
 ## 环境要求
 
-### 仅安装浏览器扩展
+- Python 3.10 或更高版本；
+- 能够加载未打包 Manifest V3 扩展的 Chromium 系浏览器；
+- 用户已经登录准备录制的 AI 网站；
+- 系统打开录制目标 URL 时，必须进入安装了 Phantom Relay 的同一个浏览器 profile。
 
-Phantom Relay 扩展本身是 Manifest V3 浏览器扩展，可以安装在支持加载未打包 Manifest V3 扩展的 Chromium 系浏览器中，包括：
+目前主要开发和真实测试环境是 macOS + Chrome for Testing。Chrome、Edge、Brave 和其他 Chromium 系浏览器是预期目标，但不同浏览器的行为仍需在目标环境实测。
 
-- Google Chrome；
-- Google Chrome Canary；
-- Microsoft Edge；
-- Brave；
-- Chromium 以及其他兼容的 Chromium 系浏览器。
+## 快速开始
 
-使用浏览器扩展需要：
-
-- 在浏览器中打开目标 AI 网站；
-- 已经登录该网站的账号；
-- 浏览器允许加载未打包扩展；
-- 如果需要使用本地 API，还需要一个能够发送 OpenAI-compatible 请求的客户端。
-
-### 可选的本地 API 服务
-
-只有在需要通过 `/v1/chat/completions` 使用浏览器代理时，才需要启动本地 Python API。它需要 Python 3 和一台能够运行本地服务的设备。
-
-浏览器扩展和本地 API 是两个独立组件。只使用扩展进行录制和浏览器侧操作时，不应把 macOS 或 Chrome Canary 视为硬性要求。
-
-项目当前在 macOS + Chrome Canary 环境中开发和测试，但这只是开发环境，不是产品的强制要求。不同 Chromium 系浏览器的行为可能存在差异，建议在目标浏览器中实际验证。
-
-## 安装
-
-### 1. 在浏览器中安装扩展
-
-Phantom Relay 可以作为未打包的 Manifest V3 扩展安装到兼容的 Chromium 系浏览器中。不同浏览器的菜单名称可能略有差异。
-
-1. 打开浏览器的扩展页面：
-   - Chrome / Chromium：`chrome://extensions/`
-   - Edge：`edge://extensions/`
-   - Brave：`brave://extensions/`
-2. 开启 **Developer mode（开发者模式）**。
-3. 点击 **Load unpacked（加载已解压的扩展）**。
-4. 选择仓库中的 `extension/` 目录。
-5. 打开你要接入的 AI 网站。
-6. 打开 Phantom Relay 扩展 popup。
-
-可选的 `launch.sh` 仅用于 macOS 上 Chrome Canary 的开发启动便利，不是安装所必需的，也不代表项目只支持该浏览器。
-
-### 2. 启动本地 API（可选）
-
-如果要通过 `/v1/chat/completions` 调用浏览器代理，请启动本地 API：
+### 1. 克隆并启动后端
 
 ```bash
+git clone https://github.com/lingion/phantom-relay.git
 cd phantom-relay
-python3 server/api_server.py
+
+python3 -m venv .venv
+source .venv/bin/activate
+python3 -m pip install -i https://pypi.tuna.tsinghua.edu.cn/simple -r requirements.txt
+python3 -m server.api_server
 ```
 
-服务默认监听：
+API 默认监听 `http://127.0.0.1:8765`。
 
-```text
-http://127.0.0.1:8765
-```
-
-也可以使用：
+在 macOS 或 Linux 上也可以使用仓库启动脚本：
 
 ```bash
-./server/run-api.sh
+./launch.sh
 ```
 
-启动脚本会先检查是否已有健康的 API 进程，避免重复监听同一个端口。
-
-## 首次接入网站
-
-网站配置由用户自己拥有，并保存在本地。
-
-### 1. 录制输入框
-
-在扩展 popup 中开始录制输入框，然后点击网页中的 textarea、input 或 contenteditable 元素。
-
-扩展会尽量使用稳定的页面标识生成选择器，包括：
-
-1. 唯一 `id`；
-2. `data-*` 属性；
-3. `aria-label`；
-4. 唯一的标签名与 class 组合；
-5. CSS 路径备用方案。
-
-### 2. 录制发送方式
-
-选择一种发送方式：
-
-- **Enter**：派发一次 Enter 键操作；
-- **快捷键**：录制并回放键盘快捷键；
-- **发送按钮**：等待网站发送控件出现并启用后点击一次。
-
-发送后，扩展会等待网页中出现与本次请求对应的新用户消息。如果发送结果不确定，不会盲目重复提交。
-
-### 3. 录制回复锚点
-
-点击页面中已有的一条 AI 回复。这个锚点用于帮助扩展定位相关消息区域；实际回复提取主要依赖网页提供的逻辑消息节点。
-
-### 4. 绑定模型名称
-
-在 popup 中填写一个模型别名，并将它绑定到当前 hostname。例如：
-
-```text
-my-deepseek
-chat-model-1
-```
-
-这个别名只是用户本地配置，不是 provider API key，也不会创建或连接 provider 账号。
-
-完成录制和绑定后，该别名才会出现在当前用户安装的 `/v1/models` 中。
-
-## API 使用
-
-### 健康检查
+录制前先确认服务健康：
 
 ```bash
 curl http://127.0.0.1:8765/health
 ```
 
-### 查看已配置模型
+正常响应包含：
+
+```json
+{
+  "browser_activation_owner": "api",
+  "service": "phantom-relay-api",
+  "status": "ok"
+}
+```
+
+### 2. 安装扩展
+
+1. 打开浏览器扩展管理页：
+   - Chrome / Chromium：`chrome://extensions/`
+   - Edge：`edge://extensions/`
+   - Brave：`brave://extensions/`
+2. 开启 **开发者模式**；
+3. 点击 **加载已解压的扩展**；
+4. 选择本仓库的 `extension/` 目录；
+5. 如需方便操作，可以把 Phantom Relay 固定到工具栏。
+
+扩展申请广泛网页权限，是因为它面向用户录制的任意站点，而不是写死一组 provider。安装前可以直接检查 `extension/manifest.json`。
+
+### 3. 录制站点 profile
+
+1. 打开目标 AI 聊天页面并登录；
+2. 在该页面打开 Phantom Relay popup；
+3. 确认后端地址，默认是 `http://127.0.0.1:8765`；
+4. 点击录制 **输入框**，再点击网页上真实的输入编辑器；
+5. 选择一种发送方式：
+   - **回车**：直接采用 Enter，不需要再录制按钮；
+   - **快捷键**：录制网页实际使用的键盘组合；
+   - **发送按钮**：录制网页上真实的发送控件；
+6. 点击录制 **回复区域**，再点击一条已经完成生成的助手回复。页面会显示候选框，用户可以看到自己选中了什么；
+7. 保留或修改 popup 中的模型别名。完整 profile 建立后，这个别名会绑定到当前站点；
+8. 等待 Profile 生命周期显示已经同步并可执行。
+
+回复录制不能跳过。只录制一个宽泛的对话容器，无法稳定区分新助手回复、历史回复和用户消息，因此这类 profile 会被拒绝。
+
+### 4. 调用本地 API
+
+查看当前用户自己录制并绑定的模型：
 
 ```bash
 curl http://127.0.0.1:8765/v1/models
 ```
 
-全新安装在用户完成网站录制和模型绑定之前，不会返回用户配置的模型。
-
-### 聊天请求
+发送非流式请求：
 
 ```bash
 curl -sS http://127.0.0.1:8765/v1/chat/completions \
   -H 'Content-Type: application/json' \
   -d '{
-    "model": "my-deepseek",
+    "model": "my-chat",
     "messages": [
-      {"role": "user", "content": "Hello"}
+      {"role": "user", "content": "只回复：relay-ok"}
     ]
   }'
 ```
 
-### 流式聊天请求
+请求 SSE 响应：
 
 ```bash
 curl -N -sS http://127.0.0.1:8765/v1/chat/completions \
   -H 'Content-Type: application/json' \
   -d '{
-    "model": "my-deepseek",
+    "model": "my-chat",
     "stream": true,
     "messages": [
-      {"role": "user", "content": "Hello"}
+      {"role": "user", "content": "你好"}
     ]
   }'
 ```
 
-当前流式实现会把浏览器中连续增长的 DOM 快照转换为 SSE 增量。它不是 provider 原生 token 流，也不保证 token 级别的边界。
+SSE 只说明调用方使用流式传输格式，不代表网页一定提供 provider 原生 token 流。有些网页会暴露连续增长的 DOM 快照，有些网页只能捕获一次合格的终态快照。没有观察到连续合格快照时，不能把 Phantom Relay 宣称为逐 token 流式。
 
-### 支持的消息输入
+## 请求行为
 
-服务端接受经过归一化的 `system`、`developer`、`user`、`assistant` 和 `tool` 消息角色。由于浏览器桥接层是 provider-neutral 的，历史消息目前会被格式化为网页可读的文本上下文，而不是映射成 provider 原生 conversation ID。
+后端接受经过归一化的 `system`、`developer`、`user`、`assistant` 和 `tool` 消息记录。历史消息会转换成网页可读的文本上下文，不会被伪装成统一的 provider 原生 conversation ID。
 
-## 运行时数据
-
-运行时数据在本地生成，并被排除在代码仓库之外：
+常用请求字段：
 
 ```text
-server/model_routes.json       模型别名与 hostname 路由
-server/selector_templates.json 用户录制的网站选择器
-server/conversations.json      本地对话记录
-server/page-trace.jsonl        本地页面诊断信息
+model             必填，本地模型别名
+messages          OpenAI 风格消息数组
+stream            false 返回 JSON，true 返回 SSE
+conversation_id   可选，本地稳定会话身份
 ```
 
-这些文件不会作为源码发行包的一部分。它们包含用户自己的配置、浏览器行为和对话数据。
+重复 HTTP 请求可以使用 `Idempotency-Key`。幂等键不会把一次不确定的浏览器动作变成“允许发送第二次”。
 
-扩展还会通过 `chrome.storage.local` 保存每个用户自己的状态。
+`temperature`、`top_p` 或 provider 特有 reasoning 参数目前不会自动映射成网页 UI 控件操作。
 
-## API 端点
+## 浏览器激活职责
 
-### 客户端主要端点
+收到请求后：
+
+1. 后端把模型别名解析成用户录制的目标；
+2. 如果该域名已有 ready 的扩展页面，就直接复用；
+3. 否则后端请求操作系统打开 profile 中保存的目标 URL；
+4. 扩展在领取任务前验证页面域名、录制 profile、运行代际和回复身份。
+
+macOS 默认通过 LaunchServices 在后台请求打开目标。其他平台使用 Python 默认浏览器接口，前后台表现可能不同。受管环境可以配置 `PHANTOM_RELAY_BROWSER_BUNDLE_ID` 或 `PHANTOM_RELAY_BROWSER_WAKE_COMMAND`。
+
+`scripts/` 下的可选 BiDi host 是测试基础设施，默认禁用，不能与正常的 API 激活路径同时拥有导航职责。
+
+## 本地数据与隐私
+
+所有网页登录状态都留在用户浏览器内。Phantom Relay 不读取或导出浏览器 Cookie、密码或 OAuth refresh token。
+
+本地运行时文件包括：
 
 ```text
-GET  /health
-GET  /model-routes
-GET  /v1/models
-POST /v1/chat/completions
+server/model_routes.json        通用源码配置
+server/user_bindings.json       本地模型别名与录制目标
+server/selector_templates.json  本地录制 selector 与 profile
+server/conversations.json       本地对话历史
+server/browser_jobs.sqlite3     持久化浏览器任务状态
+server/page-trace.jsonl         以元数据为主的运行诊断
 ```
 
-### 浏览器桥接端点
+用户绑定、profile、对话、任务数据库、日志、截图和浏览器 profile 都被 Git 排除。全新 clone 不包含任何已录制站点。
 
-```text
-GET  /browser/clients
-GET  /browser/pending-domains
-GET  /browser/selectors?domain=<hostname>
-POST /browser/sync-routes
-POST /browser/selectors
-POST /browser/submit
-POST /browser/poll
-POST /browser/heartbeat
-POST /browser/ready
-POST /browser/delta
-POST /browser/result
+API 默认只监听 `127.0.0.1`，并且没有认证层。不要把 `8765` 暴露到公网或不可信局域网。
+
+## 常见问题
+
+### `Failed to fetch` 或 `profile_sync_failed`
+
+- 确认 `curl http://127.0.0.1:8765/health` 能成功；
+- 确认 popup 中的后端地址使用同一个 host 和端口；
+- 保存后端地址，然后重新验证或重新录制 profile。
+
+### `recording_route_missing`
+
+- 在安装扩展的同一个浏览器 profile 中打开目标网页；
+- 在该网页完成输入框、发送方式和回复区域录制；
+- 完整 profile 建立后再确认模型别名绑定。
+
+### 请求超时
+
+超时表示任务没有在配置期限内产生一个合格终态回复。先检查 popup 诊断和 `/trace/tail`，在确认网页是否接受第一次发送之前，不要连续重复提交同一个请求。
+
+### 返回了旧回复或用户消息
+
+运行时 `2026-08-11.05` 会拒绝已知用户回声，并让发送确认与最终抓取共用同一个规范化录制边界。如果网站改版导致录制身份失效，应重新录制一条完成的助手回复，而不是把 selector 扩大到整个页面或整个对话容器。
+
+### 扩展已更新，但网页仍使用旧运行时
+
+在扩展管理页重新加载 Phantom Relay，然后刷新已经录制的站点页面。Popup 诊断会显示 content script 版本漂移。
+
+## 更新
+
+```bash
+git pull --ff-only
+python3 -m pip install -i https://pypi.tuna.tsinghua.edu.cn/simple -r requirements.txt
 ```
 
-### 诊断端点
+随后在扩展管理页重新加载 Phantom Relay，刷新已录制标签页，并重启后端进程。
 
-```text
-POST /trace
-GET  /trace/tail?limit=20
+本地 profile 不进入 Git。执行浏览器 profile 或本地数据清理之前，应自行备份。
+
+## 开发与验证
+
+安装仅用于开发测试的依赖：
+
+```bash
+python3 -m pip install -i https://pypi.tuna.tsinghua.edu.cn/simple -r requirements-dev.txt
 ```
 
-当前本地服务没有提供 `/export` 或 `/export/jsonl` 服务端端点。对话导出由扩展 popup 提供 JSON 导出功能。
+运行当前静态测试：
 
-## 项目结构
+```bash
+node --test tests/*.js
+python3 -m pytest -q
+
+node --check extension/content.js
+node --check extension/background.js
+node --check extension/profile_contract.js
+node --check extension/response_observation.js
+git diff --check
+```
+
+静态测试只能证明代码契约和回归用例，不能证明登录网站仍然可用。浏览器侧改动达到发布标准，还必须执行真实后端请求、真实录制发送动作，捕获全新回复身份，确认用户哨兵没有泄漏，并确认任务队列最终回到零。
+
+## 仓库结构
 
 ```text
 phantom-relay/
-├── extension/
-│   ├── background.js          MV3 service worker 与任务调度
-│   ├── content.js             录制、回放与 DOM 提取
-│   ├── popup.html              扩展界面
-│   ├── popup.js                popup 控制器
-│   └── universal_bridge.js     provider-neutral 桥接基础能力
-├── server/
-│   ├── api_server.py           本地 HTTP API 与浏览器任务队列
-│   ├── run-api.sh              API 启动脚本
-│   └── *.json                  本地运行时数据，已被 Git 忽略
-├── tests/
-│   ├── test_universal_bridge.js
-│   ├── test_api_idempotency.py
-│   └── fixtures/
-├── docs/
-│   └── universal-adapter-architecture.md
-├── launch.sh
+├── extension/              MV3 popup、worker、录制器和 DOM 运行时
+├── server/                 Flask API、路由/profile registry 和任务存储
+├── scripts/                迁移脚本和隔离浏览器测试工具
+├── tests/                  Node 与 pytest 契约/回归测试
+├── docs/                   架构、决策和测试证据
+├── launch.sh               可移植后端启动脚本
+├── requirements.txt        Python 运行依赖
+├── requirements-dev.txt    开发与浏览器测试依赖
 └── README.md
 ```
 
 ## 当前限制
 
-Phantom Relay 是浏览器自动化代理，不是 provider 原生 API 的完整替代品。
-
-当前限制包括：
-
-- 目标网站必须已在用户浏览器中登录；
-- 每个网站都需要录制，页面 UI 变化后可能需要重新录制；
-- 浏览器执行路径围绕本地任务队列设计，目前不是生产级多账号并行系统；
-- 流式输出基于 DOM 快照，而不是 token 流；
-- `temperature`、`top_p` 等 OpenAI 请求参数不会自动转换为目标网站的原生控件操作；
-- 不同网站的 provider 原生 conversation ID 尚未统一；
-- 当前没有统一的 tool calls、视觉输入、文件上传、音频、structured output 和原生 reasoning 能力层；
-- 本地 API 默认没有认证层，不要把 `8765` 端口暴露到公网或不可信网络；
-- 浏览器登录凭据和 cookies 保留在用户自己的浏览器中，Phantom Relay 不实现 OAuth refresh。
-
-## 开发
-
-运行语法检查和仓库测试：
-
-```bash
-node --check extension/universal_bridge.js
-node --check extension/content.js
-node --check extension/background.js
-node --check extension/popup.js
-python3 -m py_compile server/api_server.py tests/test_api_idempotency.py
-node tests/test_universal_bridge.js
-python3 tests/test_api_idempotency.py
-git diff --check
-```
-
-自动化测试覆盖桥接基础能力、消息归一化、回复跟踪、快照合并、发送动作安全和 API 幂等性。它们不能替代针对真实登录网站的浏览器回归测试。
-
-## 未来路线
-
-- 为用户录制的网站模板增加可重复的端到端浏览器测试；
-- 改进 adapter 能力声明和站点错误报告；
-- 将 provider adapter 与核心 HTTP 生命周期分离；
-- 对无法映射到网页的请求能力返回明确的 unsupported capability；
-- 在网站能够提供可靠增量边界时改进流式事件语义；
-- 支持可选的多 profile 与多会话调度；
-- 增加认证、访问控制和更安全的生产默认配置；
-- 在目标网站能够稳定暴露这些能力时，探索统一的工具调用、视觉、文件、structured output 和 provider 原生会话支持。
+- 每个站点都需要用户录制，网页 UI 改版后可能需要重录；
+- 必须保留网页登录状态；
+- 目前还没有持续覆盖所有 Chromium 浏览器的自动化矩阵；
+- DOM 抓取不是 provider 原生 token 流；
+- 网站延迟和生成状态仍然会造成超时波动；
+- 多账号和高并发生产调度尚未完成；
+- 工具、视觉、上传、音频、structured output 和 provider 原生 reasoning 还不是统一可靠契约；
+- 网络拦截被明确排除在当前产品主路径之外。
 
 ## 许可证
 
