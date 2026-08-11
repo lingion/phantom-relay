@@ -134,6 +134,30 @@
     .status-recording { background: #1a120b; color: #d2991d; }
     .status-ready { background: #0d1f16; color: #3fb950; }
 
+    /* Profile lifecycle */
+    .profile-status { margin-bottom: 10px; }
+    .profile-status-card {
+      background: #161b22; border: 1px solid #30363d; border-radius: 8px; padding: 10px 12px;
+    }
+    .profile-status-heading { display:flex; align-items:center; justify-content:space-between; gap:8px; font-size:10px; color:#8b949e; text-transform:uppercase; letter-spacing:.6px; }
+    .profile-state-badge { color:#58a6ff; text-transform:none; letter-spacing:0; font-weight:600; text-align:right; }
+    .profile-status-grid { display:grid; grid-template-columns:1fr 1fr; gap:7px 12px; margin-top:9px; }
+    .profile-status-grid dt { color:#8b949e; font-size:9px; }
+    .profile-status-grid dd { color:#c9d1d9; font-size:10px; margin-top:2px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+    .profile-status-reasons { border-top:1px solid #21262d; margin-top:9px; padding-top:7px; color:#8b949e; font-size:9px; line-height:1.4; word-break:break-word; }
+    .profile-status-reasons code { color:#f0883e; font:9px ui-monospace, SFMono-Regular, Menlo, monospace; }
+    .profile-verify-row { display:flex; justify-content:flex-end; margin-top:8px; }
+    .profile-verify-row .mini-btn:disabled { opacity:.45; cursor:not-allowed; }
+
+    .recording-route-card {
+      background: #161b22; border: 1px solid #30363d; border-radius: 8px;
+      padding: 10px 12px; margin-bottom: 10px;
+    }
+    .recording-route-heading { display:flex; justify-content:space-between; gap:8px; align-items:center; }
+    .recording-route-title { font-size:10px; color:#8b949e; text-transform:uppercase; letter-spacing:.6px; }
+    .recording-route-status { margin-top:7px; color:#c9d1d9; font-size:10px; line-height:1.4; word-break:break-word; }
+    .recording-route-target { margin-top:4px; color:#58a6ff; font:9px ui-monospace, SFMono-Regular, Menlo, monospace; word-break:break-all; }
+
     .empty { text-align: center; padding: 16px; color: #484f58; font-size: 11px; }
 
     /* 模型选择 */
@@ -143,6 +167,9 @@
     .model-label {
       font-size: 10px; color: #8b949e; flex: none; white-space: nowrap;
     }
+    .backend-row { display:flex; gap:6px; align-items:center; }
+    .backend-row .text-input { min-width:0; }
+    .backend-status { color:#8b949e; font-size:9px; margin-top:4px; min-height:12px; }
 
     .debug-actions { display: flex; gap: 6px; margin-bottom: 6px; }
     .mini-btn { border: 1px solid #30363d; background: #21262d; color: #8b949e; border-radius: 4px; padding: 3px 7px; font-size: 10px; cursor: pointer; }
@@ -165,12 +192,44 @@
     <!-- Status -->
     <div id="statusBar" class="status-bar status-idle">等待录制</div>
 
+    <!-- Recorded page route -->
+    <section class="recording-route-card" aria-labelledby="recordingRouteTitle">
+      <div class="recording-route-heading">
+        <div id="recordingRouteTitle" class="recording-route-title">录制页面</div>
+        <button id="btnOpenRecordingPage" class="mini-btn" type="button">打开录制页</button>
+      </div>
+      <div id="recordingRouteStatus" class="recording-route-status">正在检查当前页面…</div>
+      <div id="recordingRouteTarget" class="recording-route-target"></div>
+    </section>
+
+    <!-- Recorded profile lifecycle status -->
+    <section id="profileStatusSection" class="section profile-status" aria-labelledby="profileStatusTitle">
+      <div id="profileStatusPanel" aria-live="polite">
+        <div class="profile-status-card">
+          <div class="profile-status-heading"><span id="profileStatusTitle">Profile 生命周期</span><span class="profile-state-badge">未加载</span></div>
+        </div>
+      </div>
+      <div class="profile-verify-row">
+        <button id="btnReverify" class="mini-btn" type="button">重新验证</button>
+      </div>
+    </section>
+
+    <!-- Backend endpoint -->
+    <section class="section" aria-labelledby="backendTitle">
+      <div id="backendTitle" class="section-title">🔌 后端连接</div>
+      <div class="backend-row">
+        <input id="backendUrl" class="text-input" type="url" placeholder="http://localhost:8765" autocomplete="off" spellcheck="false" />
+        <button id="btnSaveBackend" class="mini-btn" type="button">保存</button>
+      </div>
+      <div id="backendStatus" class="backend-status" aria-live="polite"></div>
+    </section>
+
     <!-- Step 1: Input -->
     <div id="stepInput" class="step-card">
       <div id="step1Num" class="step-num pending">1</div>
       <div class="step-info">
         <div class="step-label">输入框</div>
-        <div class="step-desc">点击页面上的输入框</div>
+        <div class="step-desc">页面会框出候选，移动鼠标查看后点击输入框</div>
         <div id="selInput" class="step-selector"></div>
       </div>
       <button id="btnInput" class="step-btn btn-record" data-role="input">⏺ 录制</button>
@@ -181,7 +240,7 @@
       <div id="step2Num" class="step-num pending">2</div>
       <div class="step-info">
         <div class="step-label">发送方式</div>
-        <div class="step-desc">默认回车；也可录制快捷键或发送按钮</div>
+        <div class="step-desc">默认回车；选择按钮时页面会框出发送候选</div>
         <div class="send-tabs" role="tablist">
           <button id="tabShortcut" class="send-tab" data-send-kind="shortcut">快捷键</button>
           <button id="tabEnter" class="send-tab active" data-send-kind="enter">回车</button>
@@ -196,8 +255,8 @@
     <div id="stepCopy" class="step-card waiting">
       <div id="step3Num" class="step-num pending">3</div>
       <div class="step-info">
-        <div class="step-label">回复区域</div>
-        <div class="step-desc">点击任意已完成的 AI 回复正文，作为回复锚点</div>
+        <div id="responseStepLabel" class="step-label">回复区域</div>
+        <div id="responseStepDesc" class="step-desc">页面会框出候选；优先点击一条已完成回复正文</div>
         <div id="selCopy" class="step-selector"></div>
       </div>
       <button id="btnCopy" class="step-btn btn-record" data-role="response" disabled>⏺ 录制</button>
@@ -255,8 +314,11 @@
     </div>
   </div>
 
-  <div class="footer">v2.0 · Phantom Relay</div>
+  <div class="footer" title="正在读取扩展运行版本…">正在读取扩展版本 · Phantom Relay</div>
 
+  <script src="profile_contract.js"></script>
+  <script src="popup_profile_status.js"></script>
+  <script src="popup_profile_contract.js"></script>
   <script src="popup.js"></script>
 </body>
 </html>

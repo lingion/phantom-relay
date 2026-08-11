@@ -1,0 +1,53 @@
+<!doctype html>
+<main data-chat-root>
+  <textarea id="prompt" aria-label="Message"></textarea>
+  <button id="send" type="button">Send</button>
+  <div data-row-key="row-user-1" data-role="user">
+    <article data-message-id="inner-user-1">Previous question</article>
+  </div>
+  <div data-row-key="row-assistant-1" data-role="assistant">
+    <article data-message-id="inner-assistant-1">A previous stable answer</article>
+    <div data-toolbar aria-hidden="true">actions</div>
+  </div>
+  <script>
+    (() => {
+      let turn = 1;
+      const input = document.querySelector('#prompt');
+      const send = document.querySelector('#send');
+      const root = document.querySelector('[data-chat-root]');
+
+      send.addEventListener('click', () => {
+        const text = String(input.value || '').trim();
+        if (!text) return;
+        input.value = '';
+        turn += 1;
+
+        const userRow = document.createElement('div');
+        userRow.dataset.rowKey = `row-user-${turn}`;
+        userRow.dataset.role = 'user';
+        userRow.innerHTML = `<article data-message-id="inner-user-${turn}"></article>`;
+        userRow.querySelector('article').textContent = text;
+        root.appendChild(userRow);
+
+        const assistantRow = document.createElement('div');
+        assistantRow.dataset.rowKey = `row-assistant-${turn}`;
+        assistantRow.dataset.role = 'assistant';
+        assistantRow.dataset.streaming = 'true';
+        assistantRow.setAttribute('aria-busy', 'true');
+        assistantRow.innerHTML = `<article data-message-id="inner-assistant-${turn}">Echo:</article><div data-toolbar aria-hidden="true">actions</div>`;
+        root.appendChild(assistantRow);
+
+        setTimeout(() => {
+          assistantRow.querySelector('article').textContent = `Echo: ${text.slice(0, 12)}`;
+        }, 100);
+        setTimeout(() => {
+          assistantRow.querySelector('article').textContent = `Echo: ${text}`;
+        }, 350);
+        setTimeout(() => {
+          delete assistantRow.dataset.streaming;
+          assistantRow.removeAttribute('aria-busy');
+        }, 650);
+      });
+    })();
+  </script>
+</main>

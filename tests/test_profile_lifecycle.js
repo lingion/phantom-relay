@@ -26,11 +26,12 @@ test('exports the lifecycle schema and complete state set', () => {
 
 test('canonical checksum ignores object key insertion order', async () => {
   const base = validProfile();
-  const a = { ...base, response: { ...base.response, selector: '#a', identity: { attributes: ['id'] } } };
+  const a = { ...base, response: { ...base.response, selector: '#a', identity: { attributes: ['id'] }, identityVerification: { status: 'verified', method: 'fixture-dom-unique', attributes: ['id'] } } };
   const b = {
     capabilities: a.capabilities,
     response: {
       identity: { attributes: ['id'] },
+      identityVerification: { status: 'verified', method: 'fixture-dom-unique', attributes: ['id'] },
       selector: '#a',
       role: a.response.role,
       streamingIndicators: a.response.streamingIndicators,
@@ -62,6 +63,15 @@ test('invalid response identity fails closed before an envelope is created', asy
   await assert.rejects(
     createProfileEnvelope({ ...validProfile(), response: { selector: '#answer' } }),
     error => error.code === 'response_contract_missing'
+  );
+});
+
+test('DOM profile without recorded identity evidence cannot be staged', async () => {
+  const profile = validProfile();
+  delete profile.response.identityVerification;
+  await assert.rejects(
+    createProfileEnvelope(profile),
+    error => error.code === 'profile_identity_evidence_missing'
   );
 });
 

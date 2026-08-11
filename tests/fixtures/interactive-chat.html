@@ -1,0 +1,44 @@
+<!doctype html>
+<main data-chat-root>
+  <textarea id="prompt" aria-label="Message"></textarea>
+  <button id="send" data-role="send" type="button">Send</button>
+  <section data-message-id="assistant-1" data-role="assistant">
+    <p>Previous answer</p>
+    <button data-action="copy" aria-label="Copy">Copy</button>
+  </section>
+  <script>
+    (() => {
+      let turn = 1;
+      const input = document.querySelector('#prompt');
+      const send = document.querySelector('#send');
+      const root = document.querySelector('[data-chat-root]');
+      send.addEventListener('click', () => {
+        const text = String(input.value || '').trim();
+        if (!text) return;
+        input.value = '';
+        turn += 1;
+        const user = document.createElement('section');
+        user.dataset.messageId = `user-${turn}`;
+        user.dataset.role = 'user';
+        user.innerHTML = `<p>${text.replace(/[&<>]/g, c => ({'&': '&amp;', '<': '&lt;', '>': '&gt;'}[c]))}</p>`;
+        root.appendChild(user);
+
+        const assistant = document.createElement('section');
+        assistant.dataset.messageId = `assistant-${turn}`;
+        assistant.dataset.role = 'assistant';
+        assistant.dataset.streaming = 'true';
+        assistant.setAttribute('aria-busy', 'true');
+        assistant.innerHTML = '<p>Thinking</p>';
+        root.appendChild(assistant);
+
+        setTimeout(() => {
+          assistant.innerHTML = `<p>Echo: ${text.replace(/[&<>]/g, c => ({'&': '&amp;', '<': '&lt;', '>': '&gt;'}[c]))}</p>`;
+        }, 100);
+        setTimeout(() => {
+          delete assistant.dataset.streaming;
+          assistant.removeAttribute('aria-busy');
+        }, 250);
+      });
+    })();
+  </script>
+</main>

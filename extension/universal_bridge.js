@@ -49,10 +49,14 @@
   }
 
   function cleanAssistantText(value) {
-    return text(value).split(/\r?\n/)
-      .map(function (line) { return line.trim(); })
-      .filter(function (line) { return line && !isStatusLine(line); })
-      .join('\n').trim();
+    // The recorded response region is the authority. Do not classify or remove
+    // language-specific words: a thinking panel, disclaimer panel, and final
+    // answer panel are separate DOM regions and are selected by identity.
+    return text(value).replace(/\r\n/g, '\n').replace(/\r/g, '\n')
+      .split('\n')
+      .map(function (line) { return line.replace(/[\u00a0\u200b\ufeff]/g, ' ').replace(/[ \t]+$/g, ''); })
+      .filter(function (line) { return !isStatusLine(line); })
+      .join('\n').replace(/^\n+|\n+$/g, '');
   }
 
   function isReasoningOrStatusElement(el) {
@@ -217,10 +221,11 @@
     var next = Object.assign({}, tracker);
     var candidateText = responseText(candidate.text);
     if (!candidateText || sameText(candidateText, tracker.userText || '')) return tracker;
-    const sameKey = next.key === (candidate.key || '');
+    const sameKey = next.key === (candidate.key || '')
+      || (next.text && (candidateText.startsWith(next.text) || next.text.startsWith(candidateText)));
     const delta = sameKey ? mergeSnapshot(next.text, candidateText) : candidateText;
     if (sameKey && next.text === candidateText) next.stable += 1;
-    else { next.key = candidate.key || ''; next.text = candidateText; next.stable = 1; }
+    else { next.key = candidate.key || next.key || ''; next.text = candidateText; next.stable = sameKey ? next.stable + 1 : 1; }
     next.delta = delta;
     next.seen = true;
     next.streaming = candidate.streaming === true || candidate.busy === true;
@@ -233,6 +238,73 @@
     if (tracker.complete && tracker.text) return { status: 'complete', text: tracker.text, partial: false, completion_reason: 'stable_snapshot' };
     if (timeoutReached && tracker.bestText) return { status: 'partial', text: tracker.bestText, partial: true, streaming: tracker.streaming, completion_reason: 'idle_timeout' };
     return { status: tracker.seen ? 'waiting' : 'not_found', text: '', completion_reason: tracker.seen ? 'waiting_for_content' : 'no_content_timeout' };
+  }
+
+  function safeJson(value) {
+    try { return JSON.parse(value); } catch (_) { return null; }
+  }
+
+  function balancedJsonCandidates(source, limit) {
+    var out = [];
+    source = text(source);
+    var max = Math.min(source.length, limit || 65536);
+    for (var start = 0; start < max; start += 1) {
+      if (source[start] !== '{') continue;
+      var depth = 0, inString = false, escaped = false;
+      for (var i = start; i < max; i += 1) {
+        var ch = source[i];
+        if (inString) {
+          if (escaped) escaped = false;
+          else if (ch === '\\') escaped = true;
+          else if (ch === '"') inString = false;
+          continue;
+        }
+        if (ch === '"') { inString = true; continue; }
+        if (ch === '{') depth += 1;
+        else if (ch === '}') {
+          depth -= 1;
+          if (depth === 0) { out.push(source.slice(start, i + 1)); start = i; break; }
+        }
+      }
+    }
+    return out;
+  }
+
+  function parsedToolObject(value) {
+    var parsed = typeof value === 'string' ? safeJson(value) : value;
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return null;
+    var name = parsed.tool || parsed.name;
+    if (typeof name !== 'string' || !/^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$/.test(name)) return null;
+    var args = parsed.parameters !== undefined ? parsed.parameters : parsed.arguments;
+    if (typeof args === 'string') args = safeJson(args);
+    if (!args || typeof args !== 'object' || Array.isArray(args)) return null;
+    return { tool: name, parameters: args };
+  }
+
+  function parseToolCall(value) {
+    var source = text(value);
+    if (!source || source.length > 65536) return null;
+    var fenced = source.match(/```tool_json\s*\n?([\s\S]*?)\n?\s*```/i);
+    var xml = source.match(/<tool_call[^>]*>([\s\S]*?)<\/tool_call>/i);
+    var toolUse = source.match(/<tool_use[^>]*>[\s\S]*?<name>\s*([^<]+?)\s*<\/name>[\s\S]*?<arguments>\s*([\s\S]*?)\s*<\/arguments>[\s\S]*?<\/tool_use>/i);
+    var regions = [];
+    if (fenced) regions.push(fenced[1]);
+    if (xml) regions.push(xml[1]);
+    if (toolUse) {
+      var toolUseArgs = safeJson(toolUse[2]);
+      if (/^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$/.test(toolUse[1].trim()) && toolUseArgs && typeof toolUseArgs === 'object' && !Array.isArray(toolUseArgs)) {
+        return { tool: toolUse[1].trim(), parameters: toolUseArgs };
+      }
+    }
+    regions = regions.concat(balancedJsonCandidates(source, 65536));
+    for (var i = 0; i < regions.length; i += 1) {
+      var candidates = balancedJsonCandidates(regions[i], 65536);
+      for (var j = 0; j < candidates.length; j += 1) {
+        var parsed = parsedToolObject(candidates[j]);
+        if (parsed) return parsed;
+      }
+    }
+    return null;
   }
 
   var api = {
@@ -253,6 +325,7 @@
     createResponseTracker: createResponseTracker,
     observeResponse: observeResponse,
     responseDecision: responseDecision,
+    parseToolCall: parseToolCall,
     mergeSnapshot: mergeSnapshot,
     appendSnapshot: appendSnapshot
   };

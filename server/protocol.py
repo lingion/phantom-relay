@@ -100,7 +100,7 @@ Tools: {tool_defs_json}
 
 Example: to add 1 to number 5, return:
 ```tool_json
-{"tool":"plus_one","parameters":{"number":"5"}}
+{{"tool":"plus_one","parameters":{{"number":"5"}}}}
 ```
 (plus_one is just an example, not a real tool)
 
@@ -187,7 +187,7 @@ def resolve_model(
 # ═══ Public API: Message Conversion ═══
 
 def messages_to_text(messages: list[Message]) -> str:
-    lines: list[str] = []
+    rendered: list[tuple[str, str]] = []
     for msg in messages:
         role = msg.role
         label = ROLE_LABELS.get(role, role.capitalize())
@@ -205,15 +205,25 @@ def messages_to_text(messages: list[Message]) -> str:
                 )
             if content.strip():
                 tc_parts.append(content)
-            lines.append(" ".join(tc_parts))
+            rendered.append((role, " ".join(tc_parts)))
         elif role == "tool":
             tool_name = msg.name or "unknown"
-            lines.append(f"Tool {tool_name} returned: {content}")
+            rendered.append((role, f"Tool {tool_name} returned: {content}"))
         else:
             if content.strip():
-                lines.append(f"{label}: {content}")
+                rendered.append((role, f"{label}: {content}"))
 
-    return "\n\n".join(lines)
+    if not rendered:
+        return ""
+
+    if len(rendered) == 1:
+        return rendered[0][1]
+
+    # Browser-chat targets behave more reliably with a plain linear transcript
+    # than with meta wrappers like “current question / historical dialogue”.
+    # Meta wrappers can cause browser-chat targets to mirror the large user
+    # block instead of answering the final turn. Preserve role order directly.
+    return "\n\n".join(text for _, text in rendered)
 
 
 # ═══ Public API: Tool Injection ═══
@@ -373,7 +383,7 @@ def text_to_sse_chunk(
             "logprobs": None,
         }],
     }
-    return f"data: {json.dumps(chunk)}\n\n"
+    return f"data: {json.dumps(chunk, separators=(',', ':'))}\n\n"
 
 
 def build_sse_done() -> str:
@@ -382,7 +392,7 @@ def build_sse_done() -> str:
 
 def build_sse_error(message: str, error_type: str = "server_error") -> str:
     error_obj = {"error": {"message": message, "type": error_type}}
-    return f"data: {json.dumps(error_obj)}\n\n"
+    return f"data: {json.dumps(error_obj, separators=(',', ':'))}\n\n"
 
 
 def build_openai_error(

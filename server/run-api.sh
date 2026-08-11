@@ -1,7 +1,7 @@
 #!/bin/bash
-set -u
-ROOT=/Users/lingion_k/Desktop/phantom-relay
-PY=/Library/Frameworks/Python.framework/Versions/3.10/Resources/Python.app/Contents/MacOS/Python
+set -euo pipefail
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+PYTHON="${PHANTOM_RELAY_PYTHON:-$(command -v python3)}"
 API="http://127.0.0.1:8765/health"
 
 # Do not start duplicate API instances. Reuse the healthy listener.
@@ -10,4 +10,4 @@ if curl -fsS --max-time 2 "$API" >/dev/null 2>&1; then
   exit 0
 fi
 
-exec "$PY" "$ROOT/server/api_server.py"
+exec env PYTHONPATH="$ROOT${PYTHONPATH:+:$PYTHONPATH}" "$PYTHON" "$ROOT/server/api_server.py"

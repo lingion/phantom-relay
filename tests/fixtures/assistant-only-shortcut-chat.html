@@ -1,0 +1,49 @@
+<!doctype html>
+<main data-chat-root>
+  <textarea id="prompt" aria-label="Message"></textarea>
+  <section class="assistant-shell" id="assistant-1">
+    <div class="assistant-answer">Previous answer</div>
+  </section>
+  <script>
+    (() => {
+      let turn = 1;
+      const input = document.querySelector('#prompt');
+      const root = document.querySelector('[data-chat-root]');
+
+      input.addEventListener('keydown', (event) => {
+        if (event.key !== 'Enter' || event.isComposing) return;
+        event.preventDefault();
+        const text = String(input.value || '').trim();
+        if (!text) return;
+        input.value = '';
+        turn += 1;
+
+        // Deliberately unkeyed user projection: the response contract must not
+        // require a provider-specific user-message selector to proceed.
+        const user = document.createElement('p');
+        user.className = 'user-copy';
+        user.textContent = text;
+        root.appendChild(user);
+
+        const shell = document.createElement('section');
+        shell.className = 'assistant-shell';
+        shell.id = `assistant-${turn}`;
+        const answer = document.createElement('div');
+        answer.className = 'assistant-answer';
+        answer.dataset.streaming = 'true';
+        answer.setAttribute('aria-busy', 'true');
+        answer.textContent = 'Thinking';
+        shell.appendChild(answer);
+        root.appendChild(shell);
+
+        setTimeout(() => {
+          answer.textContent = `Echo: ${text}`;
+        }, 100);
+        setTimeout(() => {
+          delete answer.dataset.streaming;
+          answer.removeAttribute('aria-busy');
+        }, 250);
+      });
+    })();
+  </script>
+</main>

@@ -110,6 +110,32 @@ function testTimeoutAndDuplicateSafety() {
   assert.strictEqual(U.mergeSnapshot('hello', '被'), '被');
 }
 
+function testToolCallParsing() {
+  assert.deepStrictEqual(U.parseToolCall('```tool_json\n{"tool":"search","parameters":{"q":"hello"}}\n```'), {
+    tool: 'search', parameters: { q: 'hello' }
+  });
+  assert.deepStrictEqual(U.parseToolCall('<tool_call>{"name":"read","arguments":{"path":"a"}}</tool_call>'), {
+    tool: 'read', parameters: { path: 'a' }
+  });
+  assert.deepStrictEqual(U.parseToolCall('<tool_use><name>exec</name><arguments>{"code":"return 1"}</arguments></tool_use>'), {
+    tool: 'exec', parameters: { code: 'return 1' }
+  });
+  assert.strictEqual(U.parseToolCall('ordinary answer'), null);
+  assert.deepStrictEqual(U.parseToolCall('```tool_json\n{"tool":"write","parameters":{"content":"brace } in text","meta":{"nested":true}}}\n```'), {
+    tool: 'write', parameters: { content: 'brace } in text', meta: { nested: true } }
+  });
+  assert.deepStrictEqual(U.parseToolCall('{"name":"exec","arguments":{"command":"printf x}"}}'), {
+    tool: 'exec', parameters: { command: 'printf x}' }
+  });
+  assert.strictEqual(U.parseToolCall('{"tool":"bad tool","parameters":{}}'), null);
+  assert.strictEqual(U.parseToolCall('{"tool":"exec","parameters":[]}'), null);
+}
+
+function testStatusFilteringPreservesNormalLines() {
+  assert.strictEqual(U.cleanAssistantText('正在思考\n答案是 42\n第二段'), '答案是 42\n第二段');
+  assert.strictEqual(U.cleanAssistantText('分析中但这是正文'), '分析中但这是正文');
+}
+
 testMessageNormalization();
 testRecordedActionsAndBudget();
 testLogicalMessageMerge();
@@ -118,4 +144,6 @@ testStreamingStateMachine();
 testReasoningAndStatusFiltering();
 testSnapshotDeltas();
 testTimeoutAndDuplicateSafety();
+testToolCallParsing();
+testStatusFilteringPreservesNormalLines();
 console.log('UNIVERSAL_BRIDGE_TESTS_PASS');

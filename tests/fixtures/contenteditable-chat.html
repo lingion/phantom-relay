@@ -1,0 +1,43 @@
+<!doctype html>
+<main data-chat-root>
+  <div contenteditable="true" role="textbox" data-input="prompt"></div>
+  <div data-message-id="assistant-1" data-role="assistant">Previous editable answer</div>
+  <script>
+    (() => {
+      let turn = 1;
+      const input = document.querySelector('[contenteditable="true"]');
+      const root = document.querySelector('[data-chat-root]');
+
+      input.addEventListener('keydown', (event) => {
+        if (event.key !== 'Enter' || event.isComposing) return;
+        event.preventDefault();
+        const text = String(input.textContent || '').trim();
+        if (!text) return;
+        input.textContent = '';
+        turn += 1;
+
+        const user = document.createElement('div');
+        user.dataset.messageId = `user-${turn}`;
+        user.dataset.role = 'user';
+        user.textContent = text;
+        root.appendChild(user);
+
+        const assistant = document.createElement('div');
+        assistant.dataset.messageId = `assistant-${turn}`;
+        assistant.dataset.role = 'assistant';
+        assistant.dataset.streaming = 'true';
+        assistant.setAttribute('aria-busy', 'true');
+        assistant.textContent = 'Echo:';
+        root.appendChild(assistant);
+
+        setTimeout(() => {
+          assistant.textContent = `Echo: ${text}`;
+        }, 100);
+        setTimeout(() => {
+          delete assistant.dataset.streaming;
+          assistant.removeAttribute('aria-busy');
+        }, 250);
+      });
+    })();
+  </script>
+</main>

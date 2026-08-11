@@ -142,16 +142,118 @@
     return next;
   }
 
-  async function stageProfile(store, profile) {
+  async function stageProfile(store, profile, options = {}) {
     const lifecycle = requireLifecycle();
     const normalized = requireContract().normalizeProfile(profile);
     const profileId = normalized.profileId;
     const next = entryFor(store, profileId);
     const previous = next.profiles[profileId].active;
-    const recorded = await lifecycle.createProfileEnvelope(normalized, previous || undefined);
+    const localRevision = Number(previous?.lifecycle?.revision || 0);
+    const remoteRevision = Number(options?.remoteRevision || 0);
+    const anchorRevision = Number.isInteger(remoteRevision)
+      ? Math.max(localRevision, remoteRevision)
+      : localRevision;
+    const revisionAnchor = anchorRevision > localRevision
+      ? {
+          ...(previous || {}),
+          lifecycle: {
+            ...(previous?.lifecycle || {}),
+            revision: anchorRevision,
+          },
+        }
+      : previous;
+    const recorded = await lifecycle.createProfileEnvelope(normalized, revisionAnchor || undefined);
     next.profiles[profileId].pending = lifecycle.transitionProfileEnvelope(recorded, 'sync_requested');
     next.profiles[profileId].lastError = null;
     return next;
+  }
+
+  async function bootstrapProfile(store, profile, options = {}) {
+    const lifecycle = requireLifecycle();
+    const contract = requireContract();
+    const normalized = contract.normalizeProfile(profile);
+    const profileId = normalized.profileId;
+    const next = entryFor(store, profileId);
+    const entry = next.profiles[profileId];
+
+    if (entry.active) {
+      const [activeChecksum, incomingChecksum] = await Promise.all([
+        lifecycle.computeProfileChecksum(entry.active.profile),
+        lifecycle.computeProfileChecksum(normalized),
+      ]);
+      if (activeChecksum === incomingChecksum) {
+        return {
+          state: 'already_active',
+          store: next,
+          profile: entry.active.profile,
+          revision: Number(entry.active.lifecycle.revision || 0),
+        };
+      }
+    }
+
+    if (entry.pending) {
+      return {
+        state: 'pending',
+        store: next,
+        profile: entry.pending.profile,
+        revision: Number(entry.pending.lifecycle.revision || 0),
+      };
+    }
+
+    const staged = await stageProfile(next, normalized, options);
+    const pending = staged.profiles[profileId]?.pending;
+    return {
+      state: 'staged',
+      store: staged,
+      profile: pending?.profile || normalized,
+      revision: Number(pending?.lifecycle?.revision || 0),
+    };
+  }
+
+  async function adoptSyncedProfile(store, profile, remote = {}) {
+    const lifecycle = requireLifecycle();
+    const contract = requireContract();
+    const normalized = contract.normalizeProfile(profile);
+    const profileId = normalized.profileId;
+    const next = entryFor(store, profileId);
+    const entry = next.profiles[profileId];
+    if (entry.active) fail('profile_active_exists', 'cannot adopt a remote profile over an active profile', { profileId });
+
+    const revision = Number(remote.revision);
+    if (!Number.isInteger(revision) || revision < 1) {
+      fail('profile_revision_invalid', 'remote profile revision must be a positive integer', { revision });
+    }
+    const envelope = await lifecycle.createProfileEnvelope(normalized);
+    if (remote.checksum && String(remote.checksum) !== envelope.lifecycle.checksum) {
+      fail('profile_remote_checksum_mismatch', 'remote profile checksum does not match profile content', { profileId });
+    }
+    const state = String(remote.state || 'synced');
+    if (!['synced', 'verified', 'degraded', 'invalid'].includes(state)) {
+      fail('profile_remote_state_invalid', 'remote profile state is unsupported', { profileId, state });
+    }
+    const remoteHealth = remote.health && typeof remote.health === 'object' ? remote.health : null;
+    const health = remoteHealth ? {
+      profile_id: String(remoteHealth.profile_id || profileId),
+      revision: Number(remoteHealth.revision || revision),
+      state: String(remoteHealth.state || state),
+      checks: Object.fromEntries(['input', 'send', 'response', 'identity', 'streaming']
+        .filter(field => remoteHealth.checks?.[field] !== undefined)
+        .map(field => [field, String(remoteHealth.checks[field])])),
+      reason_codes: Array.isArray(remoteHealth.reason_codes)
+        ? [...new Set(remoteHealth.reason_codes.filter(code => typeof code === 'string' && code.trim()).map(code => code.trim()))]
+        : [],
+    } : null;
+    envelope.lifecycle = {
+      ...envelope.lifecycle,
+      revision,
+      state,
+      lastVerifiedAt: remote.lastVerifiedAt || null,
+    };
+    envelope.health = health;
+    entry.active = envelope;
+    entry.pending = null;
+    entry.lastError = null;
+    return { state: 'adopted', store: next, profile: envelope.profile, revision };
   }
 
   async function promoteProfile(store, profileId, syncAck) {
@@ -226,6 +328,8 @@
     loadProfileStore,
     getActiveProfile,
     stageProfile,
+    bootstrapProfile,
+    adoptSyncedProfile,
     promoteProfile,
     recordProfileHealth,
     recordProfileError,

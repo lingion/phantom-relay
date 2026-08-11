@@ -19,7 +19,9 @@
     INPUT_UNAVAILABLE: 'profile_input_unavailable',
     SEND_UNAVAILABLE: 'profile_send_unavailable',
     RESPONSE_UNAVAILABLE: 'profile_response_unavailable',
+    RESPONSE_SCOPE_TOO_BROAD: 'profile_response_scope_too_broad',
     IDENTITY_UNAVAILABLE: 'profile_identity_unavailable',
+    IDENTITY_EVIDENCE_MISSING: 'profile_identity_evidence_missing',
     STREAMING_UNAVAILABLE: 'profile_streaming_unavailable'
   });
   const HEALTH_FIELDS = Object.freeze(['input', 'send', 'response', 'identity', 'streaming']);
@@ -170,6 +172,11 @@
 
   async function createProfileEnvelope(profile, previous) {
     const normalized = profileContract().normalizeProfile(profile);
+    if (!profileContract().hasRecordedIdentityVerification(normalized)) {
+      fail('profile_identity_evidence_missing', 'DOM profile lacks recorded identity verification evidence', {
+        profileId: normalized.profileId
+      });
+    }
     const revision = previous?.lifecycle?.revision ? Number(previous.lifecycle.revision) + 1 : 1;
     if (!Number.isInteger(revision) || revision < 1) {
       fail('profile_revision_invalid', 'previous profile revision is invalid');

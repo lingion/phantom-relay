@@ -53,11 +53,15 @@ _JOB_TRANSITIONS: Final[dict[JobState, dict[str, JobState]]] = {
     },
     JobState.QUEUED: {
         "claim": JobState.CLAIMED,
+        "fail": JobState.FAILED,
         "cancel": JobState.CANCELLED,
         "expire": JobState.EXPIRED,
     },
     JobState.CLAIMED: {
         "submission_confirmed": JobState.SUBMITTED,
+        # The browser can submit a complete snapshot without an intermediate
+        # submission-confirmation event. Treat that as a valid fast path.
+        "complete": JobState.COMPLETED,
         "fail": JobState.FAILED,
         "cancel": JobState.CANCELLED,
     },
@@ -145,7 +149,7 @@ def next_job_state(
 ) -> JobState:
     """Return the next job state, including lease-expiry recovery."""
     current = _state_value(state, JobState)
-    if event == "lease_expired" and current is JobState.CLAIMED:
+    if event in {"lease_expired", "browser_stale"} and current is JobState.CLAIMED:
         return (
             JobState.FAILED
             if int(claim_attempt) >= int(max_claim_attempts)
@@ -178,7 +182,7 @@ def recovery_action(
 ) -> str:
     """Return the side-effect action the API layer should perform."""
     current = _state_value(state, JobState)
-    if event == "lease_expired" and current is JobState.CLAIMED:
+    if event in {"lease_expired", "browser_stale"} and current is JobState.CLAIMED:
         return (
             "fail_max_claim_attempts"
             if int(claim_attempt) >= int(max_claim_attempts)

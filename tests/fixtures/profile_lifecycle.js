@@ -5,8 +5,9 @@ const BASE_PROFILE = {
   input: { selector: '#prompt', kind: 'textarea' },
   send: { kind: 'button', selector: '#send' },
   response: {
-    selector: '[data-message-id]',
-    identity: { attributes: ['data-message-id'] },
+      selector: '[data-message-id]',
+      identity: { attributes: ['data-message-id'] },
+      identityVerification: { status: 'verified', method: 'fixture-dom-unique', attributes: ['data-message-id'] },
     role: { assistant: ['assistant'] },
     streamingIndicators: [{ field: 'busy', equals: true }],
     excludedSelectors: [],
@@ -16,7 +17,7 @@ const BASE_PROFILE = {
 };
 
 function validProfile(overrides = {}) {
-  return { ...BASE_PROFILE, ...overrides };
+  return JSON.parse(JSON.stringify({ ...BASE_PROFILE, ...overrides }));
 }
 
 module.exports = { BASE_PROFILE, validProfile };

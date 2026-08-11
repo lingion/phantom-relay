@@ -11,6 +11,8 @@ const {
   loadProfileStore,
   getActiveProfile,
   stageProfile,
+  bootstrapProfile,
+  adoptSyncedProfile,
   promoteProfile,
   recordProfileHealth,
   recordProfileError,
@@ -40,6 +42,67 @@ test('staging a new revision preserves active last-known-good profile', async ()
   assert.equal(next.profiles[oldEnvelope.profile.profileId].active.profile.input.selector.css, '#old');
   assert.equal(next.profiles[oldEnvelope.profile.profileId].pending.profile.input.selector.css, '#new');
   assert.equal(next.profiles[oldEnvelope.profile.profileId].pending.lifecycle.state, 'sync_pending');
+});
+
+test('staging against a remote revision advances a profile with no local active envelope', async () => {
+  const staged = await stageProfile(
+    { version: 1, profiles: {}, diagnostics: [], legacyHints: [] },
+    validProfile(),
+    { remoteRevision: 4 },
+  );
+  const id = validProfile().profileId;
+  assert.equal(staged.profiles[id].pending.lifecycle.revision, 5);
+  assert.equal(staged.profiles[id].pending.lifecycle.state, 'sync_pending');
+});
+
+test('bootstrapping a complete legacy profile creates one pending lifecycle envelope', async () => {
+  const result = await bootstrapProfile(
+    { version: 1, profiles: {}, diagnostics: [], legacyHints: [] },
+    validProfile(),
+    { remoteRevision: 0 },
+  );
+  const id = validProfile().profileId;
+  assert.equal(result.state, 'staged');
+  assert.equal(result.store.profiles[id].pending.lifecycle.revision, 1);
+  assert.equal(result.store.profiles[id].pending.lifecycle.state, 'sync_pending');
+});
+
+test('bootstrapping an identical active profile is idempotent', async () => {
+  const staged = await stageProfile({ version: 1, profiles: {}, diagnostics: [], legacyHints: [] }, validProfile());
+  const id = validProfile().profileId;
+  const pending = staged.profiles[id].pending;
+  const synced = await promoteProfile(staged, id, {
+    ok: true, revision: pending.lifecycle.revision, checksum: pending.lifecycle.checksum, state: 'synced'
+  });
+  const result = await bootstrapProfile(synced, validProfile(), { remoteRevision: 1 });
+  assert.equal(result.state, 'already_active');
+  assert.equal(result.store.profiles[id].active.lifecycle.revision, 1);
+  assert.equal(result.store.profiles[id].pending, null);
+});
+
+test('adopting a matching remote profile preserves its persisted revision', async () => {
+  const recorded = await createProfileEnvelope(validProfile());
+  const result = await adoptSyncedProfile(
+    { version: 1, profiles: {}, diagnostics: [], legacyHints: [] },
+    validProfile(),
+    { revision: 4, checksum: recorded.lifecycle.checksum, state: 'synced' },
+  );
+  const id = validProfile().profileId;
+  assert.equal(result.state, 'adopted');
+  assert.equal(result.store.profiles[id].active.lifecycle.revision, 4);
+  assert.equal(result.store.profiles[id].active.lifecycle.state, 'synced');
+  assert.equal(result.store.profiles[id].pending, null);
+});
+
+test('adopting a remote profile with a different checksum fails closed', async () => {
+  await assert.rejects(
+    adoptSyncedProfile(
+      { version: 1, profiles: {}, diagnostics: [], legacyHints: [] },
+      validProfile(),
+      { revision: 4, checksum: 'sha256:' + '0'.repeat(64), state: 'synced' },
+    ),
+    error => error.code === 'profile_remote_checksum_mismatch'
+  );
 });
 
 test('promotion requires matching backend acknowledgement and clears only pending', async () => {

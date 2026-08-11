@@ -2,13 +2,34 @@
 server/page-trace.jsonl
 server/conversations.json
 server/model_routes.json
+server/user_bindings.json
 server/selector_templates.json
+server/browser_jobs.sqlite3
+server/browser_jobs.sqlite3-shm
+server/browser_jobs.sqlite3-wal
 server/launchd.out.log
 server/launchd.err.log
 server/__pycache__/
+server/*.log
+server/*.png
+server/*.bak
 *.pyc
+.pytest_cache/
+__pycache__/
 .DS_Store
 .ext_id
+
+# Local browsers, test harnesses, and agent state
+.chrome-debug-*/
+.chrome-e2e-*/
+.extension-debug-*/
+.hermes/
+.tools/
+tasks/
+
+# Local regression output
+tests/*.json
+docs/regression/rounds/*.log
 
 # Generated extension package
 phantom-relay.zip
