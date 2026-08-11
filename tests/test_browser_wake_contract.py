@@ -190,6 +190,9 @@ def test_ready_same_domain_client_does_not_start_a_second_browser(monkeypatch):
         "ready": True,
         "input_ready": True,
         "send_ready": True,
+        "state": "ready",
+        "source": "content-ready",
+        "url": "https://example.test/chat",
         "capabilities": {"can_execute": True, "can_observe": True},
     }
     wake_calls = []
@@ -218,6 +221,9 @@ def test_recently_stale_ready_client_is_woken_before_its_long_lease_expires(monk
         "ready": True,
         "input_ready": True,
         "send_ready": True,
+        "state": "ready",
+        "source": "content-ready",
+        "url": "https://example.test/chat",
         "capabilities": {"can_execute": True, "can_observe": True},
     }
     wake_calls = []
@@ -323,10 +329,14 @@ def test_ready_client_releases_pending_wake_for_the_next_job(monkeypatch):
 
     api.BROWSER_CLIENTS["tab-1"] = {
         "domain": "wenxin.baidu.com",
+        "tab_id": 1,
         "last_seen": time.time(),
         "ready": True,
         "input_ready": True,
         "send_ready": True,
+        "state": "ready",
+        "source": "content-ready",
+        "url": "https://wenxin.baidu.com/search/one",
         "capabilities": {"can_execute": True, "can_observe": True},
     }
     assert api.request_browser_wake(
@@ -347,7 +357,7 @@ def test_ready_client_releases_pending_wake_for_the_next_job(monkeypatch):
     ]
 
 
-def test_live_registered_same_domain_tab_does_not_open_another_browser(monkeypatch):
+def test_registered_same_domain_tab_cannot_suppress_request_path_wake(monkeypatch):
     _reset_browser_state()
     wake_calls = []
     monkeypatch.setattr(api, "wake_browser_host", lambda target_url="": wake_calls.append(target_url) or True)
@@ -366,8 +376,8 @@ def test_live_registered_same_domain_tab_does_not_open_another_browser(monkeypat
     assert api.request_browser_wake(
         domain="wenxin.baidu.com",
         target_url="https://wenxin.baidu.com/search/one",
-    ) is False
-    assert wake_calls == []
+    ) is True
+    assert wake_calls == ["https://wenxin.baidu.com/search/one"]
 
 
 def test_wake_browser_host_uses_default_browser_with_job_target_when_no_command(monkeypatch):
@@ -395,7 +405,7 @@ def test_wake_browser_host_never_creates_about_blank_without_a_target(monkeypatc
     assert calls == []
 
 
-def test_page_trace_keeps_an_incomplete_live_page_from_triggering_another_wake(monkeypatch, tmp_path):
+def test_page_trace_presence_cannot_suppress_request_path_wake(monkeypatch, tmp_path):
     _reset_browser_state()
     monkeypatch.setattr(api, "TRACE_FILE", str(tmp_path / "trace.jsonl"))
     wake_calls = []
@@ -416,8 +426,99 @@ def test_page_trace_keeps_an_incomplete_live_page_from_triggering_another_wake(m
     assert api.request_browser_wake(
         domain="wenxin.baidu.com",
         target_url="https://wenxin.baidu.com/search/one",
-    ) is False
-    assert wake_calls == []
+    ) is True
+    assert wake_calls == ["https://wenxin.baidu.com/search/one"]
+
+
+def test_page_trace_does_not_refresh_a_stale_content_ready_execution_lease(monkeypatch, tmp_path):
+    _reset_browser_state()
+    monkeypatch.setattr(api, "TRACE_FILE", str(tmp_path / "trace.jsonl"))
+    stale_last_seen = time.time() - 20
+    api.BROWSER_CLIENTS["42"] = {
+        "domain": "wenxin.baidu.com",
+        "tab_id": 42,
+        "last_seen": stale_last_seen,
+        "ready": True,
+        "input_ready": True,
+        "send_ready": True,
+        "state": "ready",
+        "source": "content-ready",
+        "url": "https://wenxin.baidu.com/search/one",
+        "capabilities": {"can_execute": True, "can_observe": True},
+    }
+
+    response = api.app.test_client().post(
+        "/trace",
+        json={
+            "domain": "wenxin.baidu.com",
+            "tabId": 42,
+            "entry": {"kind": "response_monitor", "url": "https://wenxin.baidu.com/search/one"},
+        },
+    )
+
+    assert response.status_code == 200
+    assert api.BROWSER_CLIENTS["42"]["last_seen"] == stale_last_seen
+    assert api.BROWSER_CLIENTS["42"]["page_last_seen"] >= stale_last_seen
+    assert api.browser_extension_recently_ready("wenxin.baidu.com") is False
+
+
+def test_ready_skip_uses_the_exact_target_url_hostname(monkeypatch):
+    _reset_browser_state()
+    api.BROWSER_CLIENTS["7"] = {
+        "domain": "wrong.example",
+        "tab_id": 7,
+        "last_seen": time.time(),
+        "ready": True,
+        "input_ready": True,
+        "send_ready": True,
+        "state": "ready",
+        "source": "content-ready",
+        "url": "https://wrong.example/chat",
+        "capabilities": {"can_execute": True, "can_observe": True},
+    }
+    wake_calls = []
+    monkeypatch.setattr(api, "wake_browser_host", lambda target_url="": wake_calls.append(target_url) or True)
+    monkeypatch.setattr(api, "AUTO_WAKE_BROWSER", True)
+
+    assert api.request_browser_wake(
+        domain="wrong.example",
+        target_url="https://target.example/chat",
+    ) is True
+    assert wake_calls == ["https://target.example/chat"]
+
+
+def test_only_complete_content_ready_records_can_suppress_wake():
+    _reset_browser_state()
+    base = {
+        "domain": "example.test",
+        "tab_id": 7,
+        "last_seen": time.time(),
+        "ready": True,
+        "input_ready": True,
+        "send_ready": True,
+        "state": "ready",
+        "source": "content-ready",
+        "url": "https://example.test/chat",
+        "capabilities": {"can_execute": True, "can_observe": True},
+    }
+
+    invalid_records = (
+        dict(base, source="browser-register"),
+        dict(base, state="registered"),
+        dict(base, tab_id=None),
+        dict(base, url="https://other.example/chat"),
+        dict(base, last_seen="not-a-timestamp"),
+        dict(base, last_seen=time.time() + 60),
+        dict(base, capabilities="not-an-object"),
+        dict(base, capabilities={"can_execute": True, "can_observe": False}),
+    )
+    for record in invalid_records:
+        api.BROWSER_CLIENTS.clear()
+        api.BROWSER_CLIENTS["7"] = record
+        assert api.browser_extension_recently_ready("example.test") is False
+
+    api.BROWSER_CLIENTS["7"] = base
+    assert api.browser_extension_recently_ready("example.test") is True
 
 
 def test_configured_bundle_wake_does_not_raise_browser_to_the_foreground(monkeypatch):

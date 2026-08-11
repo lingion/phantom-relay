@@ -120,7 +120,10 @@ def test_browser_extension_available_is_brand_neutral():
     api.BROWSER_CLIENTS.clear()
     assert api.browser_extension_available() is False
     api.BROWSER_CLIENTS['browser-a'] = {
-        'domain': 'example.test', 'last_seen': time.time(), 'ready': True,
+        'domain': 'example.test', 'tab_id': 7, 'last_seen': time.time(),
+        'ready': True, 'input_ready': True, 'send_ready': True,
+        'state': 'ready', 'source': 'content-ready',
+        'url': 'https://example.test/chat',
         'capabilities': {'can_execute': True, 'can_observe': True},
     }
     assert api.browser_extension_available('chat.deepseek.com') is False

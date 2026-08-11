@@ -8,9 +8,10 @@
   // Static content_scripts 与 popup 的 executeScript fallback 可能同时注入。
   // DOM 属性跨 isolated world 共享，用它做真正的单例闸门；否则两个实例会
   // 同时点击发送，日志就会出现两套完全相同的 auto_capture/trace。
-  const CONTENT_SCRIPT_VERSION = '2026-08-11.05'; // canonical recorded boundary for send and response evidence
+  const CONTENT_SCRIPT_VERSION = '2026-08-11.06'; // canonical recorded boundary for send and response evidence
   const INSTANCE_MARKER = 'data-phantom-relay-content-instance';
   const INSTANCE_HEARTBEAT_MARKER = 'data-phantom-relay-content-heartbeat';
+  const INSTANCE_OWNER_MARKER = 'data-phantom-relay-content-owner';
   const INSTANCE_EVENT_NAME = 'phantom-relay:content-instance-ping';
   const root = document.documentElement;
   // The manifest content script and the worker's executeScript fallback can
@@ -21,21 +22,28 @@
   const markerVersion = root?.getAttribute(INSTANCE_MARKER) || '';
   if (markerVersion === CONTENT_SCRIPT_VERSION) {
     const heartbeatBefore = root?.getAttribute(INSTANCE_HEARTBEAT_MARKER) || '';
+    const ownerBefore = root?.getAttribute(INSTANCE_OWNER_MARKER) || '';
     document.dispatchEvent(new Event(INSTANCE_EVENT_NAME));
     const heartbeatAfter = root?.getAttribute(INSTANCE_HEARTBEAT_MARKER) || '';
-    if (heartbeatAfter !== heartbeatBefore && heartbeatAfter.startsWith(`${CONTENT_SCRIPT_VERSION}:`)) return;
+    if (ownerBefore && heartbeatAfter !== heartbeatBefore && heartbeatAfter.startsWith(`${CONTENT_SCRIPT_VERSION}:`)) return;
   }
   root?.removeAttribute(INSTANCE_HEARTBEAT_MARKER);
   root?.setAttribute(INSTANCE_MARKER, CONTENT_SCRIPT_VERSION);
   const instanceHeartbeatNonce = Math.random().toString(16).slice(2);
+  root?.setAttribute(INSTANCE_OWNER_MARKER, instanceHeartbeatNonce);
   const instanceHeartbeat = () => `${CONTENT_SCRIPT_VERSION}:${Date.now()}:${instanceHeartbeatNonce}`;
   const acknowledgeInstance = () => {
-    if (root?.getAttribute(INSTANCE_MARKER) === CONTENT_SCRIPT_VERSION) {
+    if (root?.getAttribute(INSTANCE_MARKER) === CONTENT_SCRIPT_VERSION
+        && root?.getAttribute(INSTANCE_OWNER_MARKER) === instanceHeartbeatNonce) {
       root.setAttribute(INSTANCE_HEARTBEAT_MARKER, instanceHeartbeat());
     }
   };
   document.addEventListener(INSTANCE_EVENT_NAME, acknowledgeInstance, true);
-  const touchInstanceHeartbeat = () => root?.setAttribute(INSTANCE_HEARTBEAT_MARKER, instanceHeartbeat());
+  const touchInstanceHeartbeat = () => {
+    if (root?.getAttribute(INSTANCE_OWNER_MARKER) === instanceHeartbeatNonce) {
+      root.setAttribute(INSTANCE_HEARTBEAT_MARKER, instanceHeartbeat());
+    }
+  };
   touchInstanceHeartbeat();
 
   // 每次重新注入时让旧实例失效，避免 popup 收到两份响应/日志

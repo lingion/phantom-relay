@@ -4,9 +4,11 @@
 
 [中文说明](README-zh-CN.md) | **English**
 
-Current extension version: **2.5.7**
+Current extension version: **2.5.8**
 
-Current browser runtime protocol: **2026-08-11.05**
+Current content handshake: **2026-08-11.06**
+
+Current background runtime: **2026-08-11.10-content-ready-inventory**
 
 Phantom Relay is a local browser-session gateway. You install the unpacked extension in your own Chromium-based browser, run the Python backend, record a page's input, send action, and completed response, then call that recorded site through `POST /v1/chat/completions`.
 
@@ -63,7 +65,7 @@ The runtime follows several deliberate boundaries:
 | Network response interception | Disabled |
 | Unified tools, vision, files, audio, or structured output | Not yet provided |
 
-The current runtime has been exercised with real backend requests against user-recorded Mimo and Doubao pages, including repeated Mimo requests, a long-input user-echo regression, and a cross-site switchback. Those are test targets, not bundled integrations or a promise that every revision of those sites will continue to work.
+The 2.5.8 runtime has been exercised from a fully stopped browser with real backend requests against user-recorded Mimo and Doubao pages: the first API call launched Chrome Canary, then the same terminal switched Mimo -> Doubao -> Mimo. Every request returned its unique marker, dispatched exactly one browser send, and left the backend queue empty. Those sites are test targets, not bundled integrations or a promise that every revision of them will continue to work.
 
 ## Requirements
 
@@ -72,7 +74,7 @@ The current runtime has been exercised with real backend requests against user-r
 - An existing login to the AI website you want to record.
 - The browser profile in which Phantom Relay is installed must be the profile that opens the recorded target URL.
 
-The primary development and live-test environment is macOS with Chrome for Testing. Chrome, Edge, Brave, and other Chromium-based browsers are intended targets, but browser-specific behavior must be verified on the target installation.
+The primary development and live-test environment is macOS with Chrome Canary. Chrome, Edge, Brave, and other Chromium-based browsers are intended targets, but browser activation and extension behavior must be verified on the target installation.
 
 ## Quick Start
 
@@ -154,8 +156,10 @@ Send a non-streaming request:
 ```bash
 curl -sS http://127.0.0.1:8765/v1/chat/completions \
   -H 'Content-Type: application/json' \
+  -H 'Idempotency-Key: relay-check-001' \
   -d '{
     "model": "my-chat",
+    "conversation_id": "relay-check-001",
     "messages": [
       {"role": "user", "content": "Reply with exactly: relay-ok"}
     ]
@@ -177,6 +181,22 @@ curl -N -sS http://127.0.0.1:8765/v1/chat/completions \
 ```
 
 SSE describes the caller-facing transport, not guaranteed provider-native streaming. Some pages expose growing DOM snapshots; others expose only one qualified terminal snapshot. Phantom Relay must not be described as token-streaming unless the recorded page actually produces qualified incremental snapshots.
+
+### 5. Verify cold start and model switching
+
+After recording at least two models, verify the installed system through the API rather than the popup's manual capture button:
+
+1. Fully quit the browser profile that contains Phantom Relay.
+2. Send a `curl` request with a unique marker to the first recorded model. The backend must launch the browser and return that marker.
+3. Send a second unique marker to another recorded model without touching the browser.
+4. Switch back to the first model with a third marker.
+5. Confirm the queue is empty:
+
+```bash
+curl -sS http://127.0.0.1:8765/browser/status
+```
+
+For every request, require HTTP 200 and a response containing only the current marker. A timeout, an earlier assistant reply, the user's prompt, or a non-empty final `jobs`/`queue_depth` means the installation has not passed the real browser relay check.
 
 ## Request Behavior
 
@@ -247,7 +267,7 @@ A timeout means the job did not produce a qualified terminal response within the
 
 ### Old response or user text appears as output
 
-Runtime `2026-08-11.05` rejects known user echoes and compares send evidence through the same canonical recorded boundary used for final capture. If a site redesign invalidates the recorded identity, rerecord a completed assistant message instead of broadening the selector to a page or conversation container.
+Runtime `2026-08-11.06` rejects known user echoes and compares send evidence through the same canonical recorded boundary used for final capture. Background runtime `2026-08-11.10-content-ready-inventory` accepts only an exact-domain, fresh `content-ready` execution lease when deciding whether a browser page can be reused. If a site redesign invalidates the recorded identity, rerecord a completed assistant message instead of broadening the selector to a page or conversation container.
 
 ### Extension was updated but the page uses an older runtime
 

@@ -802,7 +802,7 @@ def wake_browser_host(target_url=""):
 
 
 def request_browser_wake(domain="", target_url=""):
-    """Wake once per domain lease until the extension becomes ready or the lease expires.
+    """Wake once per domain lease unless an executable target tab is ready.
 
     The OS browser opener is not an idempotent operation: calling it again can
     create another tab and briefly expose ``about:blank`` while the target
@@ -813,18 +813,12 @@ def request_browser_wake(domain="", target_url=""):
     failed queue job for a bounded interval because the browser may still be
     navigating after the caller has stopped waiting.
     """
-    key = str(domain or "").strip().lower()
-    if not key:
-        key = str(urlparse(str(target_url or "")).hostname or "").strip().lower()
-    if browser_extension_recently_ready(domain):
+    target_domain = str(urlparse(str(target_url or "")).hostname or "").strip().lower()
+    key = target_domain or str(domain or "").strip().lower()
+    if browser_extension_recently_ready(key):
         with _BROWSER_WAKE_PENDING_LOCK:
             _BROWSER_WAKE_PENDING.pop(key, None)
-        trace_api_event("browser_wake_skipped", {"mode": "ready_extension", "domain": domain})
-        return False
-    if browser_extension_recently_present(domain):
-        with _BROWSER_WAKE_PENDING_LOCK:
-            _BROWSER_WAKE_PENDING.pop(key, None)
-        trace_api_event("browser_wake_skipped", {"mode": "registered_extension", "domain": domain})
+        trace_api_event("browser_wake_skipped", {"mode": "ready_extension", "domain": key})
         return False
     if BROWSER_ACTIVATION_OWNER != "api":
         trace_api_event("browser_wake_skipped", {
@@ -989,16 +983,55 @@ def openai_error(message, error_type, *, code=None, param=None):
 def browser_unavailable_response(model, detail="No registered Phantom Relay browser extension is available"):
     return {"error": {"message": str(detail), "type": "browser_unavailable", "model": model, "retryable": True}}
 
+
+def _browser_client_has_execution_readiness(client, domain="", *, now=None, max_age=CLIENT_TTL):
+    if not isinstance(client, dict):
+        return False
+    try:
+        current = time.time() if now is None else float(now)
+        age = current - float(client.get("last_seen") or 0)
+        age_limit = float(max_age)
+    except (TypeError, ValueError):
+        return False
+    wanted = str(domain or "").strip().lower()
+    client_domain = str(client.get("domain") or "").strip().lower()
+    try:
+        url_domain = str(urlparse(str(client.get("url") or "")).hostname or "").strip().lower()
+    except (TypeError, ValueError):
+        return False
+    tab_id = client.get("tab_id")
+    if isinstance(tab_id, bool):
+        return False
+    try:
+        tab_id = int(tab_id)
+    except (TypeError, ValueError):
+        return False
+    capabilities = client.get("capabilities") or {}
+    if not isinstance(capabilities, dict):
+        return False
+    return bool(
+        tab_id >= 0
+        and client_domain
+        and url_domain == client_domain
+        and (not wanted or client_domain == wanted)
+        and 0 <= age <= age_limit
+        and str(client.get("source") or "").strip().lower() == "content-ready"
+        and str(client.get("state") or "").strip().lower() == BrowserClientState.READY.value
+        and client.get("ready") is True
+        and client.get("input_ready") is True
+        and client.get("send_ready") is True
+        and capabilities.get("can_execute") is True
+        and capabilities.get("can_observe") is True
+    )
+
+
 def browser_extension_available(domain=""):
     now = time.time()
-    wanted = str(domain or "").strip().lower()
     with BROWSER_LOCK:
         return any(
-            now - float(client.get("last_seen") or 0) <= CLIENT_TTL
-            and (not wanted or str(client.get("domain") or "").strip().lower() == wanted)
-            and client.get("ready")
-            and (client.get("capabilities") or {}).get("can_execute") is True
-            and (client.get("capabilities") or {}).get("can_observe") is True
+            _browser_client_has_execution_readiness(
+                client, domain, now=now, max_age=CLIENT_TTL,
+            )
             for client in BROWSER_CLIENTS.values()
         )
 
@@ -1012,41 +1045,11 @@ def browser_extension_recently_ready(domain="", window=_BROWSER_WAKE_RECENT_WIND
     it instead of trusting that stale lease record.
     """
     now = time.time()
-    wanted = str(domain or "").strip().lower()
     with BROWSER_LOCK:
         return any(
-            now - float(client.get("last_seen") or 0) <= float(window)
-            and (not wanted or str(client.get("domain") or "").strip().lower() == wanted)
-            and client.get("ready")
-            and client.get("input_ready")
-            and client.get("send_ready")
-            and (client.get("capabilities") or {}).get("can_execute") is True
-            and (client.get("capabilities") or {}).get("can_observe") is True
-            for client in BROWSER_CLIENTS.values()
-        )
-
-
-def browser_extension_recently_present(domain="", window=CLIENT_TTL):
-    """Return true when a live extension tab already owns this origin.
-
-    A registered-but-not-ready page is still a stronger signal than opening a
-    second browser tab. In particular, an incomplete profile cannot be
-    repaired by navigating another tab to the same site; the request must fail
-    closed and ask the user to re-record instead of creating a foreground tab
-    storm.
-    """
-    now = time.time()
-    wanted = str(domain or "").strip().lower()
-    live_states = {
-        BrowserClientState.REGISTERED.value,
-        BrowserClientState.READY.value,
-        BrowserClientState.STALE.value,
-    }
-    with BROWSER_LOCK:
-        return any(
-            now - float(client.get("last_seen") or 0) <= float(window)
-            and (not wanted or str(client.get("domain") or "").strip().lower() == wanted)
-            and str(client.get("state") or "").strip().lower() in live_states
+            _browser_client_has_execution_readiness(
+                client, domain, now=now, max_age=window,
+            )
             for client in BROWSER_CLIENTS.values()
         )
 
@@ -1066,28 +1069,40 @@ def mark_browser_page_presence(domain="", tab_id=None, url=""):
         return False
     with BROWSER_LOCK:
         previous = dict(BROWSER_CLIENTS.get(key) or {})
-        ready = bool(previous.get("ready")) and bool(previous.get("input_ready")) and bool(previous.get("send_ready"))
+        observed_at = time.time()
+        previous_domain = str(previous.get("domain") or "").strip().lower()
+        if (
+            str(previous.get("source") or "").strip().lower() == "content-ready"
+            and previous_domain == wanted
+        ):
+            # A DOM trace proves only that a page script is emitting data. It
+            # cannot renew the separate execution-ready lease or its URL,
+            # readiness bits, capabilities, and ownership source.
+            previous["page_last_seen"] = observed_at
+            previous["page_url"] = str(url or previous.get("page_url") or "")
+            BROWSER_CLIENTS[key] = previous
+            return True
         capabilities = dict(previous.get("capabilities") or {})
-        if not ready:
-            capabilities.update({
-                "can_execute": False,
-                "can_observe": False,
-                "can_snapshot": False,
-                "can_create_tab": False,
-                "can_stream": True,
-            })
+        capabilities.update({
+            "can_execute": False,
+            "can_observe": False,
+            "can_snapshot": False,
+            "can_create_tab": False,
+            "can_stream": True,
+        })
         BROWSER_CLIENTS[key] = dict(
             previous,
             domain=wanted,
             tab_id=tab_id,
             url=str(url or previous.get("url") or ""),
-            last_seen=time.time(),
+            last_seen=observed_at,
+            page_last_seen=observed_at,
             heartbeat=True,
-            ready=ready,
-            input_ready=bool(previous.get("input_ready")) if ready else False,
-            send_ready=bool(previous.get("send_ready")) if ready else False,
-            state=BrowserClientState.READY.value if ready else BrowserClientState.REGISTERED.value,
-            source=previous.get("source") or "page-trace",
+            ready=False,
+            input_ready=False,
+            send_ready=False,
+            state=BrowserClientState.REGISTERED.value,
+            source="page-trace",
             capabilities=capabilities,
         )
     return True

@@ -4,9 +4,11 @@
 
 **中文** | [English](README.md)
 
-当前扩展版本：**2.5.7**
+当前扩展版本：**2.5.8**
 
-当前浏览器运行时协议：**2026-08-11.05**
+当前 content 握手协议：**2026-08-11.06**
+
+当前 background 运行时：**2026-08-11.10-content-ready-inventory**
 
 Phantom Relay 是一个本地浏览器会话网关。用户把未打包扩展安装到自己的 Chromium 系浏览器，运行 Python 后端，然后录制目标网页的输入框、发送动作和一条已完成回复。录制成功后，即可通过 `POST /v1/chat/completions` 调用这个网页会话。
 
@@ -63,7 +65,7 @@ OpenAI-compatible JSON 或 SSE
 | 网络响应拦截 | 已禁用 |
 | 统一工具、视觉、文件、音频或 structured output | 尚未提供 |
 
-当前运行时已经针对用户录制的 Mimo 和豆包页面发过真实后端请求，包括 Mimo 连续请求、长输入防用户回声回归以及跨站切回测试。这些只是测试目标，不是内置集成，也不代表网站未来改版后仍然无需重录。
+2.5.8 已经从浏览器完全退出的状态，对用户录制的 Mimo 和豆包页面执行过真实后端请求：第一条 API 请求自动启动 Chrome Canary，随后在同一个终端完成 Mimo -> 豆包 -> Mimo 切换。三条请求都返回了各自的唯一 marker，每条只派发一次浏览器发送，最终后端队列为空。这些站点只是测试目标，不是内置集成，也不代表网站未来改版后仍然无需重录。
 
 ## 环境要求
 
@@ -72,7 +74,7 @@ OpenAI-compatible JSON 或 SSE
 - 用户已经登录准备录制的 AI 网站；
 - 系统打开录制目标 URL 时，必须进入安装了 Phantom Relay 的同一个浏览器 profile。
 
-目前主要开发和真实测试环境是 macOS + Chrome for Testing。Chrome、Edge、Brave 和其他 Chromium 系浏览器是预期目标，但不同浏览器的行为仍需在目标环境实测。
+目前主要开发和真实测试环境是 macOS + Chrome Canary。Chrome、Edge、Brave 和其他 Chromium 系浏览器是预期目标，但浏览器激活和扩展行为仍需在目标安装环境实测。
 
 ## 快速开始
 
@@ -154,8 +156,10 @@ curl http://127.0.0.1:8765/v1/models
 ```bash
 curl -sS http://127.0.0.1:8765/v1/chat/completions \
   -H 'Content-Type: application/json' \
+  -H 'Idempotency-Key: relay-check-001' \
   -d '{
     "model": "my-chat",
+    "conversation_id": "relay-check-001",
     "messages": [
       {"role": "user", "content": "只回复：relay-ok"}
     ]
@@ -177,6 +181,22 @@ curl -N -sS http://127.0.0.1:8765/v1/chat/completions \
 ```
 
 SSE 只说明调用方使用流式传输格式，不代表网页一定提供 provider 原生 token 流。有些网页会暴露连续增长的 DOM 快照，有些网页只能捕获一次合格的终态快照。没有观察到连续合格快照时，不能把 Phantom Relay 宣称为逐 token 流式。
+
+### 5. 验证冷启动和模型切换
+
+至少录制两个模型后，应通过 API 验证安装结果，而不是只点 popup 里的手动抓取按钮：
+
+1. 完全退出安装了 Phantom Relay 的浏览器 profile；
+2. 使用唯一 marker `curl` 第一个录制模型。后端必须自动启动浏览器并返回本轮 marker；
+3. 不操作浏览器，使用第二个唯一 marker `curl` 另一个录制模型；
+4. 再使用第三个 marker 切回第一个模型；
+5. 确认最终队列为空：
+
+```bash
+curl -sS http://127.0.0.1:8765/browser/status
+```
+
+每条请求都必须是 HTTP 200，并且只返回当前 marker。只要出现超时、上一条助手回复、用户刚发送的内容，或者最终 `jobs`/`queue_depth` 不为空，就不能认为真实浏览器搬运已经通过。
 
 ## 请求行为
 
@@ -247,7 +267,7 @@ API 默认只监听 `127.0.0.1`，并且没有认证层。不要把 `8765` 暴�
 
 ### 返回了旧回复或用户消息
 
-运行时 `2026-08-11.05` 会拒绝已知用户回声，并让发送确认与最终抓取共用同一个规范化录制边界。如果网站改版导致录制身份失效，应重新录制一条完成的助手回复，而不是把 selector 扩大到整个页面或整个对话容器。
+运行时 `2026-08-11.06` 会拒绝已知用户回声，并让发送确认与最终抓取共用同一个规范化录制边界。Background 运行时 `2026-08-11.10-content-ready-inventory` 只接受目标域名精确匹配且新鲜的 `content-ready` 执行租约来决定是否复用浏览器页面。如果网站改版导致录制身份失效，应重新录制一条完成的助手回复，而不是把 selector 扩大到整个页面或整个对话容器。
 
 ### 扩展已更新，但网页仍使用旧运行时
 

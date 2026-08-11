@@ -13,6 +13,16 @@ const manifest = JSON.parse(fs.readFileSync(path.join(root, 'extension', 'manife
 test('browser registration preserves verified content readiness between claims', () => {
   assert.match(source, /const readyTabIds = new Set\(\)/);
   assert.match(source, /const ready = !!activeClaim \|\| readyTabIds\.has\(Number\(tab\?\.id\)\)/);
+  assert.match(
+    source,
+    /function isExecutionInventoryTab\(tab\)[\s\S]{0,320}readyTabIds\.has\(Number\(tab\?\.id\)\)[\s\S]{0,320}isRecordedExecutionTab\(tab\)/,
+    'a content-validated tab must remain in registration inventory when only the local profile cache conflicts',
+  );
+  assert.match(
+    source,
+    /tabs\.filter\(isExecutionInventoryTab\)\.map\(tabRegistrationRecord\)/,
+    'registration must use the content-ready inventory boundary',
+  );
   assert.match(source, /async function publishReadyHeartbeat\(tab\)/);
   assert.match(source, /if \(ready\) await publishReadyHeartbeat\(tab\)/);
   assert.match(source, /markTabReady\(readyTabId, true\)/);
@@ -88,13 +98,40 @@ test('background has one active execution scheduler and no two-second in-process
   );
 });
 
+test('browser scheduler exposes bounded API-visible stall and failure diagnostics', () => {
+  const tickStart = source.indexOf('async function browserBridgeTick()');
+  const tickEnd = source.indexOf('\nlet bridgeWakeTimer', tickStart);
+  const bridge = source.slice(tickStart, tickEnd);
+
+  assert.match(
+    bridge,
+    /let tickStage = ['"]started['"]/,
+    'the scheduler must retain the last completed startup boundary',
+  );
+  assert.match(
+    bridge,
+    /addDebugLog\(['"]browser_scheduler_stalled['"]/,
+    'a blocked scheduler must cross the API diagnostic boundary',
+  );
+  assert.match(
+    bridge,
+    /addDebugLog\(['"]browser_scheduler_failed['"]/,
+    'a thrown startup error must cross the API diagnostic boundary',
+  );
+  assert.match(
+    bridge,
+    /clearTimeout\(stallTimer\)/,
+    'successful and failed ticks must cancel their one-shot watchdog',
+  );
+});
+
 test('startup and tab events prepare only domains with an executable recorded profile', () => {
   assert.match(
     source,
     /function isRecordedExecutionTab\(tab\)/,
     'tab eligibility must have one provider-neutral recorded-profile gate',
   );
-  const startupStart = source.indexOf('async function ensureContentScriptsInOpenTabs()');
+  const startupStart = source.indexOf('async function ensureContentScriptsInOpenTabs(');
   const startupEnd = source.indexOf('\nasync function probeRecordedExecutionContext', startupStart);
   const startup = source.slice(startupStart, startupEnd);
   assert.match(startup, /isRecordedExecutionTab\(tab\)/);
@@ -154,7 +191,7 @@ test('open tabs rehydrate backend-owned recorded profiles before the local execu
   assert.match(prepare, /if \(!isRecordedExecutionTab\(tab\)\) return false;/);
   assert.match(prepare, /return ensureContentScript\(tab\)/);
 
-  const startupStart = source.indexOf('async function ensureContentScriptsInOpenTabs()');
+  const startupStart = source.indexOf('async function ensureContentScriptsInOpenTabs(');
   const startupEnd = source.indexOf('\nasync function probeRecordedExecutionContext', startupStart);
   const startup = source.slice(startupStart, startupEnd);
   assert.match(startup, /await prepareRecordedExecutionTab\(tab\)/);
@@ -165,17 +202,38 @@ test('open tabs rehydrate backend-owned recorded profiles before the local execu
   assert.match(updateHandler, /prepareRecordedExecutionTab\(tab\)/);
 });
 
-test('bridge ticks retry clean-install profile recovery before registration ownership is evaluated', () => {
+test('bridge ticks publish liveness before targeted profile recovery and refresh inventory afterward', () => {
   const tickStart = source.indexOf('async function browserBridgeTick()');
   const tickEnd = source.indexOf('\nlet bridgeWakeTimer', tickStart);
   const bridge = source.slice(tickStart, tickEnd);
-  const recoveryIndex = bridge.indexOf('await ensureContentScriptsInOpenTabs()');
-  const registrationIndex = bridge.indexOf('await registerBrowserClient(');
+  const firstRegistrationIndex = bridge.indexOf('await registerBrowserClient(');
+  const pendingIndex = bridge.indexOf("fetch(`${LOCAL_API}/browser/pending-domains`)");
+  const recoveryIndex = bridge.indexOf('await ensureContentScriptsInOpenTabs(preferredDomain)');
+  const finalRegistrationIndex = bridge.indexOf('await registerBrowserClient(true)', recoveryIndex);
   const noOwnedIndex = bridge.indexOf("tickOutcome = 'no_owned_tabs'");
 
-  assert.ok(recoveryIndex >= 0, 'an alarm tick must retry profile recovery after a startup loading race');
-  assert.ok(registrationIndex > recoveryIndex, 'recovered tabs must be included in the registration payload');
-  assert.ok(noOwnedIndex > registrationIndex, 'ownership may be evaluated only after recovery and registration');
+  assert.ok(firstRegistrationIndex >= 0, 'the worker must report liveness before any slow page probe');
+  assert.ok(pendingIndex > firstRegistrationIndex, 'queued work may be loaded only after liveness registration');
+  assert.ok(recoveryIndex > pendingIndex, 'clean-install recovery must target the selected queued domain');
+  assert.ok(finalRegistrationIndex > recoveryIndex, 'recovered tabs must refresh the registration inventory');
+  assert.ok(noOwnedIndex > finalRegistrationIndex, 'ownership may be evaluated only after final registration');
+});
+
+test('worker startup has one scheduler entry and no concurrent all-tab preparation', () => {
+  const startupStart = source.indexOf('chrome.runtime.onInstalled.addListener');
+  const startupEnd = source.indexOf('\nfunction relayBrowserResult', startupStart);
+  const startup = source.slice(startupStart, startupEnd);
+
+  assert.doesNotMatch(
+    startup,
+    /ensureContentScriptsInOpenTabs\(\)\.then/,
+    'startup must not race a full-tab preparation pass against the scheduler',
+  );
+  assert.equal(
+    [...startup.matchAll(/browserBridgeTick\(\)/g)].length,
+    1,
+    'startup must enter the scheduler exactly once',
+  );
 });
 
 test('repeated page-ready leases reuse validated state instead of reloading selectors every time', () => {
@@ -228,16 +286,64 @@ test('browser submit maps transport failures to a structured backend-unreachable
   assert.match(popupSource, /后端不可达/);
 });
 
-test('content-script preparation retries the version handshake before dynamic injection', () => {
+test('content-script preparation trusts a responsive runtime and takes over an orphaned DOM marker', () => {
   assert.match(
     source,
-    /for\s*\(let attempt = 0; attempt < 12; attempt\+\+\)[\s\S]{0,900}chrome\.tabs\.sendMessage\(tab\.id, \{ action: 'ping' \}\)/,
-    'a transient static-script race must not create a second content-script instance'
+    /for\s*\(let attempt = 0; attempt < 4; attempt\+\+\)[\s\S]{0,900}pingContentRuntime\(\)/,
+    'a transient static-script race must use a bounded handshake before injection'
+  );
+  const preparationStart = source.indexOf('async function ensureContentScriptOnce(');
+  const preparationEnd = source.indexOf('\nasync function ensureContentScript(', preparationStart);
+  const preparation = source.slice(preparationStart, preparationEnd);
+  const liveHandshakeIndex = preparation.indexOf('if (acceptLiveContentScriptPing(ping, hostname))');
+  const markerProbeIndex = preparation.indexOf("preparationStage = 'marker_probe'");
+  assert.ok(liveHandshakeIndex >= 0, 'a responsive content runtime must be recognized before fallback injection');
+  assert.ok(markerProbeIndex > liveHandshakeIndex, 'the DOM marker may be inspected only after the message handshake fails');
+  assert.match(
+    preparation,
+    /if \(acceptLiveContentScriptPing\(ping, hostname\)\) \{[\s\S]{0,320}return ready;/,
+    'a working message channel must finish preparation without injecting a second runtime'
+  );
+  assert.match(
+    preparation,
+    /removeAttribute\('data-phantom-relay-content-instance'\)[\s\S]{0,260}removeAttribute\('data-phantom-relay-content-owner'\)/,
+    'an orphaned marker must be cleared after the bounded message handshake fails'
+  );
+});
+
+test('content-script preparation is single-flight and never waits for document idle', () => {
+  assert.match(
+    source,
+    /const contentScriptPreparationFlights = new Map\(\)/,
+    'tab lifecycle events and the scheduler must share one preparation flight per tab',
   );
   assert.match(
     source,
-    /chrome\.scripting\.executeScript\(\{[\s\S]{0,900}data-phantom-relay-content-instance[\s\S]{0,900}data-phantom-relay-content-heartbeat[\s\S]{0,900}return false/,
-    'an active DOM heartbeat must block the dynamic injection fallback'
+    /contentScriptPreparationFlights\.get\(tabId\)[\s\S]{0,700}contentScriptPreparationFlights\.set\(tabId, flight\)/,
+    'a concurrent preparation must reuse the existing tab flight',
+  );
+  const preparationStart = source.indexOf('async function ensureContentScriptOnce(');
+  const preparationEnd = source.indexOf('\nasync function rehydrateRecordedProfileForTab', preparationStart);
+  const preparation = source.slice(preparationStart, preparationEnd);
+  assert.match(
+    preparation,
+    /addDebugLog\(['"]content_script_preparation_stalled['"]/,
+    'a slow probe or injection must expose its exact stage',
+  );
+  assert.equal(
+    [...preparation.matchAll(/injectImmediately:\s*true/g)].length,
+    2,
+    'both the marker probe and file injection must run immediately in long-lived SPAs',
+  );
+  assert.match(
+    preparation,
+    /content_ping_timeout/,
+    'a detached content runtime must not hold a scheduler tick indefinitely',
+  );
+  assert.match(
+    preparation,
+    /data-phantom-relay-content-owner[\s\S]{0,500}content_script_stale_marker_cleared/,
+    'a fresh worker must clear an orphaned DOM heartbeat before reinjection',
   );
 });
 
@@ -308,7 +414,7 @@ test('live content-script handshake accepts a valid version drift without blocki
   );
   assert.match(
     source,
-    /const injectedPing = await chrome\.tabs\.sendMessage\(tab\.id, \{ action: 'ping' \}\)[\s\S]{0,220}acceptLiveContentScriptPing\(injectedPing, hostname\)/,
+    /const injectedPing = await pingContentRuntime\(\)[\s\S]{0,220}acceptLiveContentScriptPing\(injectedPing, hostname\)/,
     'the dynamically injected runtime must use the same handshake policy'
   );
   assert.doesNotMatch(

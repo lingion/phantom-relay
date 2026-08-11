@@ -13,8 +13,8 @@ importScripts('profile_sync.js');
 importScripts('profile_recovery.js');
 importScripts('claim_recovery.js');
 
-const CONTENT_SCRIPT_VERSION = '2026-08-11.05';
-globalThis.__phantomRelayBackgroundVersion = '2026-08-11.05-canonical-send-response-boundary';
+const CONTENT_SCRIPT_VERSION = '2026-08-11.06';
+globalThis.__phantomRelayBackgroundVersion = '2026-08-11.10-content-ready-inventory';
 const BACKEND_CONFIG = globalThis.PhantomRelayBackendConfig;
 let LOCAL_API = BACKEND_CONFIG.DEFAULT_BACKEND_URL;
 const BROWSER_POLL_ALARM = 'phantom-relay-browser-poll';
@@ -57,7 +57,7 @@ const readyTabIds = new Set();
   let profileRecoveryRetryInFlight = null;
   let lastProfileRecoveryRetryAt = 0;
   const PROFILE_RECOVERY_RETRY_INTERVAL_MS = 5000;
-  const readyFlights = new Map();
+  const contentScriptPreparationFlights = new Map();
 const bridgeWaitStates = new Map();
 
 function bridgeWaitKey(jobId, domain) {
@@ -399,6 +399,13 @@ function tabRegistrationRecord(tab) {
   };
 }
 
+function isExecutionInventoryTab(tab) {
+  if (!isUsableExecutionTab(tab)) return false;
+  return readyTabIds.has(Number(tab?.id))
+    || [...activeClaims.values()].some(claim => Number(claim?.tab_id) === Number(tab?.id))
+    || isRecordedExecutionTab(tab);
+}
+
 async function registerBrowserClient(force = false) {
   await storageReady;
   const now = Date.now();
@@ -412,7 +419,7 @@ async function registerBrowserClient(force = false) {
       extension_version: chrome.runtime.getManifest?.().version || CONTENT_SCRIPT_VERSION,
       browser: { name: 'Chromium', version: '' },
       profile_id: browserClientId,
-      tabs: tabs.filter(isRecordedExecutionTab).map(tabRegistrationRecord),
+      tabs: tabs.filter(isExecutionInventoryTab).map(tabRegistrationRecord),
     };
     const response = await fetch(`${LOCAL_API}/browser/register`, {
       method: 'POST',
@@ -1073,20 +1080,48 @@ async function getExecutionTab(preferredDomain = '') {
   return null;
 }
 
-async function ensureContentScript(tab) {
+async function ensureContentScriptOnce(tab) {
   if (!isUsableExecutionTab(tab)) return false;
   const hostname = (() => { try { return new URL(tab.url).hostname; } catch (_) { return ''; } })();
+  let preparationStage = 'start';
+  const preparationStartedAt = Date.now();
+  const preparationWatchdog = setTimeout(() => {
+    addDebugLog('content_script_preparation_stalled', {
+      tabId: Number(tab.id),
+      stage: preparationStage,
+      elapsedMs: Date.now() - preparationStartedAt,
+      url: String(tab.url || ''),
+    }, hostname);
+  }, 10000);
+
+  try {
+
+    const pingContentRuntime = async () => {
+      let timeoutId = null;
+      try {
+        return await Promise.race([
+          chrome.tabs.sendMessage(tab.id, { action: 'ping' }),
+          new Promise((_, reject) => {
+            timeoutId = setTimeout(() => reject(new Error('content_ping_timeout')), 750);
+          }),
+        ]);
+      } finally {
+        if (timeoutId) clearTimeout(timeoutId);
+      }
+    };
 
     const prime = async () => {
       // Always apply the authoritative recorded template before readiness.
       // This covers pages whose initial content-script handshake races the API.
       try {
+        preparationStage = 'selector_fetch';
         const response = await fetch(`${LOCAL_API}/browser/selectors?domain=${encodeURIComponent(hostname)}`);
         const payload = response.ok ? await response.json() : null;
         if (!payload?.selectors?.input) throw new Error('recorded_input_template_missing');
         let applied = false;
         for (let attempt = 0; attempt < 3 && !applied; attempt++) {
           try {
+            preparationStage = 'selector_apply';
             const result = await chrome.tabs.sendMessage(tab.id, {
               action: 'set_selectors',
               selectors: payload.selectors,
@@ -1098,14 +1133,16 @@ async function ensureContentScript(tab) {
         }
         if (!applied) throw new Error('recorded_selectors_apply_failed');
       } catch (_) {}
+      preparationStage = 'readiness_wait';
       const ready = await chrome.tabs.sendMessage(tab.id, { action: 'wait_until_ready', timeout: 12000 });
       const ok = !!ready?.ready && !!ready?.input_ready && !!ready?.send_ready;
       return ok;
-    };
+  };
   let ping = null;
-  for (let attempt = 0; attempt < 12; attempt++) {
+  preparationStage = 'content_ping';
+  for (let attempt = 0; attempt < 4; attempt++) {
     try {
-      ping = await chrome.tabs.sendMessage(tab.id, { action: 'ping' });
+      ping = await pingContentRuntime();
       if (acceptLiveContentScriptPing(ping, hostname)) {
         const ready = await prime();
         if (ready) await publishReadyHeartbeat(tab);
@@ -1113,37 +1150,56 @@ async function ensureContentScript(tab) {
         return ready;
       }
     } catch (_) {}
-    if (attempt < 11) await new Promise(resolve => setTimeout(resolve, 250));
+    if (attempt < 3) await new Promise(resolve => setTimeout(resolve, 250));
   }
   const pingVersion = String(ping?.content_script_version || '');
   if (pingVersion && pingVersion !== CONTENT_SCRIPT_VERSION) addDebugLog('content_script_version_drift', { tabId: tab.id, expected: CONTENT_SCRIPT_VERSION, actual: pingVersion, action: 'awaiting_valid_handshake' }, hostname);
   try {
+    preparationStage = 'marker_probe';
     const markerProbe = await chrome.scripting.executeScript({
       target: { tabId: tab.id },
+      injectImmediately: true,
       func: (expectedVersion) => {
         const root = document.documentElement;
         const marker = root?.getAttribute('data-phantom-relay-content-instance') || '';
         const heartbeat = root?.getAttribute('data-phantom-relay-content-heartbeat') || '';
         const parts = heartbeat.split(':');
         const heartbeatAt = Number(parts[1] || 0);
+        const active = marker === expectedVersion
+          && parts[0] === expectedVersion
+          && Number.isFinite(heartbeatAt)
+          && Date.now() - heartbeatAt < 10000;
+        const staleMarkerCleared = !!(marker || heartbeat);
+        if (staleMarkerCleared) {
+          root?.removeAttribute('data-phantom-relay-content-instance');
+          root?.removeAttribute('data-phantom-relay-content-heartbeat');
+          root?.removeAttribute('data-phantom-relay-content-owner');
+        }
         return {
           marker,
           heartbeatAt,
-          active: marker === expectedVersion && Number.isFinite(heartbeatAt) && Date.now() - heartbeatAt < 10000
+          active,
+          staleMarkerCleared,
         };
       },
       args: [CONTENT_SCRIPT_VERSION]
     });
     const state = markerProbe?.[0]?.result || null;
-    if (state?.active) {
-      addDebugLog('content_script_marker_active', { tabId: tab.id, heartbeatAt: state.heartbeatAt }, hostname);
-      return false;
+    if (state?.staleMarkerCleared) {
+      addDebugLog('content_script_stale_marker_cleared', {
+        tabId: tab.id,
+        marker: state.marker || '',
+        heartbeatAt: state.heartbeatAt || 0,
+        wasActive: !!state.active,
+      }, hostname);
     }
   } catch (_) {}
   try {
-    await chrome.scripting.executeScript({ target: { tabId: tab.id }, files: ['backend_config.js', 'universal_bridge.js', 'profile_contract.js', 'profile_lifecycle.js', 'profile_health.js', 'selector_recovery.js', 'capture_lock.js', 'send_observation.js', 'response_observation.js', 'content.js'] });
+    preparationStage = 'dynamic_injection';
+    await chrome.scripting.executeScript({ target: { tabId: tab.id }, injectImmediately: true, files: ['backend_config.js', 'universal_bridge.js', 'profile_contract.js', 'profile_lifecycle.js', 'profile_health.js', 'selector_recovery.js', 'capture_lock.js', 'send_observation.js', 'response_observation.js', 'content.js'] });
     await new Promise(resolve => setTimeout(resolve, 250));
-    const injectedPing = await chrome.tabs.sendMessage(tab.id, { action: 'ping' });
+    preparationStage = 'post_injection_ping';
+    const injectedPing = await pingContentRuntime();
     if (!acceptLiveContentScriptPing(injectedPing, hostname)) throw new Error(`content_script_handshake_invalid:${String(injectedPing?.content_script_version || 'missing')}`);
     const ready = await prime();
     if (ready) await publishReadyHeartbeat(tab);
@@ -1154,6 +1210,23 @@ async function ensureContentScript(tab) {
     addDebugLog('content_script_inject_failed', { tabId: tab.id, url: tab.url, error: e?.message || String(e) }, hostname || tab.url || 'unknown');
     return false;
   }
+  } finally {
+    clearTimeout(preparationWatchdog);
+  }
+}
+
+async function ensureContentScript(tab) {
+  const tabId = Number(tab?.id);
+  if (!Number.isInteger(tabId) || tabId < 0) return false;
+  const existing = contentScriptPreparationFlights.get(tabId);
+  if (existing) return existing;
+  const flight = ensureContentScriptOnce(tab).finally(() => {
+    if (contentScriptPreparationFlights.get(tabId) === flight) {
+      contentScriptPreparationFlights.delete(tabId);
+    }
+  });
+  contentScriptPreparationFlights.set(tabId, flight);
+  return flight;
 }
 
 async function rehydrateRecordedProfileForTab(tab) {
@@ -1222,13 +1295,18 @@ async function prepareRecordedExecutionTab(tab) {
   return ensureContentScript(tab);
 }
 
-async function ensureContentScriptsInOpenTabs() {
+async function ensureContentScriptsInOpenTabs(preferredDomain = '') {
   let preparedCount = 0;
   try {
     await storageReady;
     const tabs = await chrome.tabs.query({ windowType: 'normal' });
     for (const tab of tabs) {
       if (tab.status !== 'complete') continue;
+      if (preferredDomain) {
+        let hostname = '';
+        try { hostname = new URL(tab.url || '').hostname; } catch (_) {}
+        if (hostname !== preferredDomain) continue;
+      }
       const prepared = isRecordedExecutionTab(tab)
         ? await ensureContentScript(tab)
         : await prepareRecordedExecutionTab(tab);
@@ -1920,11 +1998,21 @@ async function browserBridgeTick() {
   const tickId = `tick-${Date.now()}-${Math.random().toString(16).slice(2, 8)}`;
   const tickStartedAt = Date.now();
   let tickOutcome = 'in_progress';
+  let tickStage = 'started';
   const tickTrace = (message, details = {}) => addDebugLog(`browser_bridge_${message}`, {
     tickId,
     elapsedMs: Date.now() - tickStartedAt,
     ...details,
   });
+  const stallTimer = setTimeout(() => {
+    addDebugLog('browser_scheduler_stalled', {
+      tickId,
+      stage: tickStage,
+      elapsedMs: Date.now() - tickStartedAt,
+      ownedTabCount: ownedTabIds.size,
+      readyTabCount: readyTabIds.size,
+    });
+  }, 15000);
   let claimedJobId = null;
   let claimedDomain = '';
   let claimedClaimToken = '';
@@ -1932,24 +2020,19 @@ async function browserBridgeTick() {
   let claimedTabId = null;
   tickTrace('start', { ownedTabCount: ownedTabIds.size, readyTabCount: readyTabIds.size });
   try {
+    tickStage = 'storage_wait';
     await storageReady;
     tickTrace('storage_ready');
+    tickStage = 'claim_restore_wait';
     await activeClaimsReady;
     tickTrace('claims_ready', { activeClaimCount: activeClaims.size });
+    tickStage = 'claim_reconciliation';
     await reconcileActiveClaims();
     tickTrace('claims_reconciled', { activeClaimCount: activeClaims.size });
-    const recoveredTabCount = ownedTabIds.size ? 0 : await ensureContentScriptsInOpenTabs();
-    tickTrace('execution_tabs_reconciled', { recoveredTabCount });
-    await registerBrowserClient(recoveredTabCount > 0);
+    tickStage = 'client_liveness_registration';
+    await registerBrowserClient();
     tickTrace('client_registered', { ownedTabCount: ownedTabIds.size, readyTabCount: readyTabIds.size });
-    // A tab returned by chrome.tabs.query() is not necessarily owned by this
-    // extension profile. The registration response is the authoritative
-    // ownership boundary when multiple Phantom Relay clients share a domain.
-    if (!ownedTabIds.size) {
-      tickOutcome = 'no_owned_tabs';
-      tickTrace('return', { reason: tickOutcome });
-      return;
-    }
+    tickStage = 'pending_job_load';
     const pendingResp = await fetch(`${LOCAL_API}/browser/pending-domains`).catch(() => null);
     const pendingData = pendingResp ? await pendingResp.json().catch(() => ({})) : {};
     const pendingJobs = Array.isArray(pendingData?.jobs) ? pendingData.jobs : [];
@@ -1983,6 +2066,25 @@ async function browserBridgeTick() {
     }
     tickTrace('job_selected', { jobId: preferredJob.id || '', domain: preferredDomain, conversationIdPresent: !!preferredJob.conversation_id });
 
+    // Registration is the cheap liveness boundary. Page probing can wait on a
+    // dynamic UI, so perform it only for the queued job's exact domain and
+    // refresh the inventory afterward. A slow unrelated page must never make
+    // the whole extension appear disconnected.
+    tickStage = 'execution_tab_reconciliation';
+    const recoveredTabCount = await ensureContentScriptsInOpenTabs(preferredDomain);
+    tickTrace('execution_tabs_reconciled', { recoveredTabCount, domain: preferredDomain });
+    tickStage = 'client_inventory_registration';
+    await registerBrowserClient(true);
+    tickTrace('client_inventory_refreshed', { ownedTabCount: ownedTabIds.size, readyTabCount: readyTabIds.size });
+    // A tab returned by chrome.tabs.query() is not necessarily owned by this
+    // extension profile. The registration response is the authoritative
+    // ownership boundary when multiple Phantom Relay clients share a domain.
+    if (!ownedTabIds.size) {
+      tickOutcome = 'no_owned_tabs';
+      tickTrace('return', { reason: tickOutcome });
+      return;
+    }
+
     const activeClaimedTabIds = new Set([
       ...(Array.isArray(pendingData?.claimed_tab_ids) ? pendingData.claimed_tab_ids : []),
       ...pendingJobs.filter(job => job?.status === 'claimed' && job.tab_id != null).map(job => Number(job.tab_id)),
@@ -1995,6 +2097,7 @@ async function browserBridgeTick() {
     // the first same-domain tab can reuse a tab that already has an in-flight
     // capture or stale page state, which silently leaves the new job at the
     // user-message stage.
+    tickStage = 'execution_tab_selection';
     const allTabs = await chrome.tabs.query({ windowType: 'normal' });
     tickTrace('tabs_loaded', { tabCount: allTabs.length, usableOwnedTabCount: allTabs.filter(candidate => {
       try { return ownedTabIds.has(Number(candidate.id)) && isUsableExecutionTab(candidate) && new URL(candidate.url).hostname === preferredDomain; }
@@ -2081,6 +2184,7 @@ async function browserBridgeTick() {
     // A tab URL alone is not readiness. Re-inject/ping the content bridge
     // before claiming so reloads and old heartbeat records self-heal.
     tickTrace('ensure_selected_content_start', { tabId: tab.id, domain: preferredDomain });
+    tickStage = 'selected_tab_readiness';
     const selectedTabReady = await ensureContentScript(tab);
     tickTrace('ensure_selected_content_done', { tabId: tab.id, domain: preferredDomain, ready: selectedTabReady });
     if (!selectedTabReady) {
@@ -2100,6 +2204,7 @@ async function browserBridgeTick() {
     // The content script owns the authoritative ready heartbeat. Do not send a
     // background-poll heartbeat here: it can overwrite a real content-ready
     // record and make a healthy tab look unavailable.
+    tickStage = 'job_claim';
     const response = await fetch(`${LOCAL_API}/browser/poll`, {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ client_id: browserClientId, runtime_session_id: browserRuntimeSessionId, domain, tab_id: tab.id, conversation_id: String(preferredJob.conversation_id || '') })
@@ -2123,6 +2228,7 @@ async function browserBridgeTick() {
       domain: claimedDomain,
       claimed_at: Date.now(),
     });
+    tickStage = 'claim_persistence';
     await persistActiveClaims();
     const requestedModel = data.job.model || '';
     // 优先使用后端已解析并验证过的 domain；扩展自身的 modelRoutes 只是加速缓存。
@@ -2164,6 +2270,7 @@ async function browserBridgeTick() {
     // the signed result. CDP is inspection-only and never an execution path.
     addDebugLog('browser_capture_message_attempt', { tabId: executionTab.id, jobId: data.job.id }, domain);
     try {
+      tickStage = 'capture_dispatch';
       await chrome.tabs.sendMessage(executionTab.id, {
         action: 'auto_capture',
         message: data.job.message,
@@ -2187,6 +2294,12 @@ async function browserBridgeTick() {
     return;
   } catch (error) {
   tickOutcome = claimedJobId ? 'claimed_error' : 'tick_error';
+  addDebugLog('browser_scheduler_failed', {
+    tickId,
+    stage: tickStage,
+    elapsedMs: Date.now() - tickStartedAt,
+    error: error?.message || String(error),
+  }, claimedDomain || currentDomain);
   if (claimedJobId) {
     const errMsg = error?.message || String(error);
     // 录制数据本身损坏时自动清除旧选择器，下次 re-record 生效。
@@ -2209,6 +2322,7 @@ async function browserBridgeTick() {
     // 服务未启动、页面不可注入时下一次 alarm 重试；不吞掉任务状态。
     console.debug('[Phantom Relay] browser bridge tick:', error.message);
   } finally {
+    clearTimeout(stallTimer);
     tickTrace('finished', { outcome: tickOutcome, claimedJobId: claimedJobId || '', claimedTabId: claimedTabId || null, ownedTabCount: ownedTabIds.size });
     browserPollInFlight = false;
   }
@@ -2264,14 +2378,9 @@ chrome.runtime.onStartup.addListener(ensureBrowserBridgeAlarm);
 loadRoutes();
 // Unpacked extension reload: ensure alarm exists.
 ensureBrowserBridgeAlarm();
-// On worker startup, proactively re-prime every already-open tab so the
-// backend can recover clients after API restarts without requiring manual
-// page refreshes or tab navigation.
-ensureContentScriptsInOpenTabs().then(() => scheduleBrowserBridgeTick(0)).catch(() => {});
-// Immediate first tick — no setTimeout delay. Any queued job from a previous
-// SW incarnation must be picked up now. Wrapped in try-catch to prevent
-// unhandled rejection from killing the SW during startup (error code 5).
-try { setTimeout(() => browserBridgeTick().catch(() => {}), 0); } catch (_) {}
+// Enter the scheduler once. It reports extension liveness before probing only
+// the queued job's domain, so startup cannot race two full-tab injection runs.
+browserBridgeTick().catch(() => {});
 function relayBrowserResult(msg, sender, sendResponse) {
   (async () => {
     await activeClaimsReady;
