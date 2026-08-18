@@ -39,6 +39,7 @@ from server.registry import (
     _profile_is_executable as registry_profile_is_executable,
 )
 from server.job_store import DurableJobStore
+from server.trace_store import TraceStore
 
 PORT = 8765
 BIND_HOST = os.environ.get("PHANTOM_RELAY_BIND_HOST", "127.0.0.1")
@@ -3032,10 +3033,39 @@ def approx_tokens(text):
     cn=sum(1 for c in text if '\\u4e00'<=c<='\\u9fff')
     return int(cn/1.5+(len(text)-cn)/4)
 
+_TRACE_STORE_CACHE = {"db_path": None, "store": None}
+_TRACE_STORE_LOCK = threading.Lock()
+
+
+def trace_store():
+    """SQLite trace event store derived from the configured TRACE_FILE path.
+
+    Tests monkeypatch ``TRACE_FILE`` to a temp directory; the store (and its
+    sqlite database) follows that path and is rebuilt when it changes.  A
+    legacy ``page-trace.jsonl`` next to the database is imported once and
+    archived.
+    """
+    db_path = os.path.splitext(TRACE_FILE)[0] + ".sqlite3"
+    store = _TRACE_STORE_CACHE["store"]
+    if _TRACE_STORE_CACHE["db_path"] == db_path and store is not None:
+        return store
+    with _TRACE_STORE_LOCK:
+        if _TRACE_STORE_CACHE["db_path"] != db_path or _TRACE_STORE_CACHE["store"] is None:
+            previous = _TRACE_STORE_CACHE["store"]
+            if previous is not None:
+                try:
+                    previous.close()
+                except Exception:
+                    pass
+            legacy = TRACE_FILE if os.path.exists(TRACE_FILE) else None
+            _TRACE_STORE_CACHE["db_path"] = db_path
+            _TRACE_STORE_CACHE["store"] = TraceStore(db_path, legacy_jsonl=legacy)
+        return _TRACE_STORE_CACHE["store"]
+
+
 def trace_api_event(kind, data):
     try:
-        with open(TRACE_FILE, 'a', encoding='utf-8') as f:
-            f.write(json.dumps({"source":"api", "kind":kind, "time":time.time(), **data}, ensure_ascii=False) + "\n")
+        trace_store().record({"source":"api", "kind":kind, "time":time.time(), **data})
     except Exception:
         pass
 
@@ -3593,14 +3623,20 @@ def browser_result_token():
 
 @app.route('/trace/tail', methods=['GET'])
 def trace_tail():
-    limit = int(request.args.get("limit", 20))
-    entries = []
-    if os.path.exists(TRACE_FILE):
-        with open(TRACE_FILE,"r") as f:
-            for line in f:
-                try: entries.append(json.loads(line))
-                except: pass
-    return jsonify({"entries":entries[-limit:]})
+    try:
+        limit = int(request.args.get("limit", 20))
+    except ValueError:
+        limit = 20
+    try:
+        entries = trace_store().tail(
+            limit=limit,
+            kind=request.args.get("kind") or None,
+            level=request.args.get("level") or None,
+            job_id=request.args.get("job_id") or None,
+        )
+    except Exception:
+        entries = []
+    return jsonify({"entries": entries})
 
 
 @app.route('/browser/sync-selectors', methods=['POST'])
@@ -3645,8 +3681,10 @@ def trace_post():
         tab_id=entry.get("tabId") if entry.get("tabId") is not None else body.get("tabId"),
         url=(entry.get("entry") or {}).get("url") if isinstance(entry.get("entry"), dict) else body.get("url", ""),
     )
-    with open(TRACE_FILE,"a",encoding="utf-8") as f:
-        f.write(json.dumps(entry,ensure_ascii=False)+"\n")
+    try:
+        trace_store().record(entry)
+    except Exception:
+        pass
     return jsonify({"ok":True})
 
 
@@ -3656,8 +3694,10 @@ def browser_debug():
     entry = {"source":"phantom-relay-background","domain":body.get("domain", ""),
              "tabId":body.get("tabId"),"message":body.get("message", ""),
              "details":body.get("details"),"time":body.get("time", time.time())}
-    with open(TRACE_FILE,"a",encoding="utf-8") as f:
-        f.write(json.dumps(entry,ensure_ascii=False)+"\n")
+    try:
+        trace_store().record(entry)
+    except Exception:
+        pass
     return jsonify({"ok":True})
 
 

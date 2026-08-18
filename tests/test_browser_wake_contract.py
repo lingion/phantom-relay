@@ -974,14 +974,17 @@ def test_concurrent_wake_calls_reserve_one_activation_slot(monkeypatch):
 
 def test_api_trace_events_are_individually_parseable(monkeypatch, tmp_path):
     _reset_browser_state()
-    trace_path = tmp_path / "trace.jsonl"
-    monkeypatch.setattr(api, "TRACE_FILE", str(trace_path))
+    monkeypatch.setattr(api, "TRACE_FILE", str(tmp_path / "trace.jsonl"))
 
     api.trace_api_event("first", {"value": 1})
     api.trace_api_event("second", {"value": 2})
 
-    rows = [__import__("json").loads(line) for line in trace_path.read_text().splitlines()]
-    assert [row["kind"] for row in rows] == ["first", "second"]
+    # tail() decodes every stored event independently; a missing or
+    # interleaved event would break the expected sequence.
+    entries = api.trace_store().tail(limit=10)
+    assert [entry["kind"] for entry in entries] == ["first", "second"]
+    assert [entry["value"] for entry in entries] == [1, 2]
+    assert (tmp_path / "trace.sqlite3").exists()
 
 
 def test_openai_chat_request_wakes_browser_before_waiting_for_result(monkeypatch):

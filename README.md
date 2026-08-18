@@ -240,7 +240,7 @@ server/user_bindings.json       local model aliases and recorded targets
 server/selector_templates.json  local recorded selectors and profiles
 server/conversations.json       local conversation history
 server/browser_jobs.sqlite3     durable browser job state
-server/page-trace.jsonl         metadata-oriented runtime diagnostics
+server/page-trace.sqlite3       metadata-oriented runtime diagnostics (SQLite; auto TTL cleanup)
 ```
 
 User bindings, profiles, conversations, job databases, logs, screenshots, and browser profiles are excluded from Git. A clean clone contains no recorded sites.

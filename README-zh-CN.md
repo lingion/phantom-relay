@@ -240,7 +240,7 @@ server/user_bindings.json       本地模型别名与录制目标
 server/selector_templates.json  本地录制 selector 与 profile
 server/conversations.json       本地对话历史
 server/browser_jobs.sqlite3     持久化浏览器任务状态
-server/page-trace.jsonl         以元数据为主的运行诊断
+server/page-trace.sqlite3       以元数据为主的运行诊断（SQLite，自动 TTL 清理）
 ```
 
 用户绑定、profile、对话、任务数据库、日志、截图和浏览器 profile 都被 Git 排除。全新 clone 不包含任何已录制站点。

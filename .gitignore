@@ -1,5 +1,9 @@
 # Runtime and generated files
 server/page-trace.jsonl
+server/page-trace.jsonl.imported*
+server/page-trace.sqlite3
+server/page-trace.sqlite3-wal
+server/page-trace.sqlite3-shm
 server/conversations.json
 server/model_routes.json
 server/user_bindings.json
