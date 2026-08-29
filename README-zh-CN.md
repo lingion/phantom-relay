@@ -243,6 +243,8 @@ server/browser_jobs.sqlite3     持久化浏览器任务状态
 server/page-trace.sqlite3       以元数据为主的运行诊断（SQLite，自动 TTL 清理）
 ```
 
+设置 `PHANTOM_RELAY_REGISTRY_DIR` 后，模型注册表、profile 注册表和用户绑定会改存到该目录。不设置（默认）时，全部都在上面列出的 `server/` 下。
+
 用户绑定、profile、对话、任务数据库、日志、截图和浏览器 profile 都被 Git 排除。全新 clone 不包含任何已录制站点。
 
 API 默认只监听 `127.0.0.1`，并且没有认证层。不要把 `8765` 暴露到公网或不可信局域网。

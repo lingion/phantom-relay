@@ -243,6 +243,8 @@ server/browser_jobs.sqlite3     durable browser job state
 server/page-trace.sqlite3       metadata-oriented runtime diagnostics (SQLite; auto TTL cleanup)
 ```
 
+Setting `PHANTOM_RELAY_REGISTRY_DIR` moves the model registry, profile registry, and user bindings to that directory. Unset (the default), everything lives under `server/` as listed above.
+
 User bindings, profiles, conversations, job databases, logs, screenshots, and browser profiles are excluded from Git. A clean clone contains no recorded sites.
 
 The API binds to `127.0.0.1` by default and has no authentication layer. Do not expose port `8765` to the public Internet or an untrusted LAN.
