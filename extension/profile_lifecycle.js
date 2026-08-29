@@ -17,6 +17,7 @@
   ]);
   const PROFILE_HEALTH_REASONS = Object.freeze({
     INPUT_UNAVAILABLE: 'profile_input_unavailable',
+    INPUT_NOT_INTERACTABLE: 'recorded_input_not_interactable',
     SEND_UNAVAILABLE: 'profile_send_unavailable',
     RESPONSE_UNAVAILABLE: 'profile_response_unavailable',
     RESPONSE_SCOPE_TOO_BROAD: 'profile_response_scope_too_broad',

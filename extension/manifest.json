@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Phantom Relay",
-  "version": "2.5.8",
+  "version": "2.5.17",
   "description": "\u5355\u6b65\u5f55\u5236 \u00b7 \u5168\u7403 AI \u5bf9\u8bdd\u642c\u8fd0\u5de5 \u2014 \u5f55\u5236 DOM \u4ea4\u4e92 \u2192 \u81ea\u52a8\u6293\u53d6 \u2192 \u5bfc\u51fa OpenAI API",
   "permissions": [
     "activeTab",
@@ -10,7 +10,8 @@
     "clipboardRead",
     "downloads",
     "tabs",
-    "alarms"
+    "alarms",
+    "debugger"
   ],
   "host_permissions": [
     "http://localhost:8765/*",

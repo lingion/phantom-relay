@@ -102,9 +102,7 @@
     }
   }
 
-  async function loadProfileStore(storage) {
-    const data = await storageCall(storage, 'get', [['phantomProfiles']]);
-    const rawStore = data?.phantomProfiles;
+  async function normalizeProfileStoreDocument(rawStore) {
     if (rawStore == null) return emptyStore();
     if (!rawStore || typeof rawStore !== 'object' || Array.isArray(rawStore)) {
       return {
@@ -125,6 +123,11 @@
     }
     if (Array.isArray(rawStore.legacyHints)) store.legacyHints = clone(rawStore.legacyHints);
     return store;
+  }
+
+  async function loadProfileStore(storage) {
+    const data = await storageCall(storage, 'get', [['phantomProfiles']]);
+    return normalizeProfileStoreDocument(data?.phantomProfiles);
   }
 
   function getActiveProfile(store, profileId) {
@@ -298,6 +301,30 @@
     return next;
   }
 
+  function removeProfilesForDomain(store, domain) {
+    const host = String(domain || '').trim().toLowerCase();
+    if (!host) fail('profile_domain_missing', 'profile reset requires an exact domain');
+    if (!store || typeof store !== 'object') fail('profile_store_invalid', 'profile store must be an object');
+
+    const next = clone(store);
+    next.version = STORE_VERSION;
+    next.profiles = next.profiles && typeof next.profiles === 'object' ? next.profiles : {};
+    next.diagnostics = Array.isArray(next.diagnostics) ? next.diagnostics : [];
+    next.legacyHints = Array.isArray(next.legacyHints) ? next.legacyHints : [];
+    const removedProfileIds = [];
+
+    for (const [profileId, entry] of Object.entries(next.profiles)) {
+      const activeDomain = String(entry?.active?.profile?.domain || '').trim().toLowerCase();
+      const pendingDomain = String(entry?.pending?.profile?.domain || '').trim().toLowerCase();
+      if (activeDomain === host || pendingDomain === host) {
+        delete next.profiles[profileId];
+        removedProfileIds.push(profileId);
+      }
+    }
+    next.legacyHints = next.legacyHints.filter(hint => String(hint?.domain || '').trim().toLowerCase() !== host);
+    return { store: next, removedProfileIds };
+  }
+
   function migrateLegacySelectors(raw) {
     const executable = [];
     const hints = [];
@@ -325,6 +352,7 @@
   return {
     ProfileStoreError,
     STORE_VERSION,
+    normalizeProfileStoreDocument,
     loadProfileStore,
     getActiveProfile,
     stageProfile,
@@ -333,6 +361,7 @@
     promoteProfile,
     recordProfileHealth,
     recordProfileError,
+    removeProfilesForDomain,
     migrateLegacySelectors,
     saveProfileStore
   };

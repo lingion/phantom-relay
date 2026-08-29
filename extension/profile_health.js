@@ -17,6 +17,7 @@
   const HEALTH_FIELDS = Object.freeze(['input', 'send', 'response', 'identity', 'streaming']);
   const FALLBACK_REASONS = Object.freeze({
     INPUT_UNAVAILABLE: 'profile_input_unavailable',
+    INPUT_NOT_INTERACTABLE: 'recorded_input_not_interactable',
     SEND_UNAVAILABLE: 'profile_send_unavailable',
     RESPONSE_UNAVAILABLE: 'profile_response_unavailable',
     RESPONSE_SCOPE_TOO_BROAD: 'profile_response_scope_too_broad',
@@ -69,6 +70,81 @@
       return false;
     }
     return true;
+  }
+
+  function isInputInteractable(element, documentLike = element?.ownerDocument || null) {
+    if (!element || element.isConnected === false) return false;
+    if (element.disabled || element.readOnly || element.inert) return false;
+    try {
+      if (element.hasAttribute?.('disabled') || element.hasAttribute?.('readonly') ||
+          element.hasAttribute?.('inert')) return false;
+      if (String(element.getAttribute?.('aria-disabled') || '').toLowerCase() === 'true') return false;
+      if (String(element.getAttribute?.('aria-readonly') || '').toLowerCase() === 'true') return false;
+      if (element.closest?.('[inert]')) return false;
+    } catch (_) {
+      return false;
+    }
+
+    let rects;
+    try {
+      rects = Array.from(element.getClientRects?.() || []).filter(rect => {
+        const width = Number(rect.width ?? (rect.right - rect.left));
+        const height = Number(rect.height ?? (rect.bottom - rect.top));
+        return width > 0 && height > 0;
+      });
+      if (!rects.length) return false;
+      const view = documentLike?.defaultView || element.ownerDocument?.defaultView || root;
+      const style = view?.getComputedStyle?.(element);
+      if (style && (
+        style.visibility === 'hidden' ||
+        style.display === 'none' ||
+        Number(style.opacity) === 0 ||
+        style.pointerEvents === 'none'
+      )) return false;
+    } catch (_) {
+      return false;
+    }
+
+    if (!documentLike || typeof documentLike.elementFromPoint !== 'function') return true;
+    const view = documentLike.defaultView || element.ownerDocument?.defaultView || root;
+    const viewportWidth = Number(view?.innerWidth);
+    const viewportHeight = Number(view?.innerHeight);
+    for (const rect of rects) {
+      const left = Math.max(0, Number(rect.left));
+      const top = Math.max(0, Number(rect.top));
+      const right = Number.isFinite(viewportWidth)
+        ? Math.min(viewportWidth, Number(rect.right))
+        : Number(rect.right);
+      const bottom = Number.isFinite(viewportHeight)
+        ? Math.min(viewportHeight, Number(rect.bottom))
+        : Number(rect.bottom);
+      if (!(right > left && bottom > top)) continue;
+      const points = [
+        [left + (right - left) / 2, top + (bottom - top) / 2],
+        [left + (right - left) / 4, top + (bottom - top) / 2],
+        [left + ((right - left) * 3) / 4, top + (bottom - top) / 2]
+      ];
+      for (const [x, y] of points) {
+        let hit = null;
+        try { hit = documentLike.elementFromPoint(x, y); } catch (_) { return false; }
+        if (hit === element || element.contains?.(hit)) return true;
+      }
+    }
+    return false;
+  }
+
+  function inputCandidates(documentLike, selector) {
+    if (!documentLike || typeof documentLike.querySelectorAll !== 'function') return [];
+    const candidates = [];
+    for (const css of selectorValues(selector)) {
+      let matches;
+      try { matches = Array.from(documentLike.querySelectorAll(css)); } catch (_) { continue; }
+      for (const element of matches) {
+        if (!element.matches?.('textarea,input,[contenteditable="true"],[role="textbox"]')) continue;
+        if (!candidates.includes(element)) candidates.push(element);
+      }
+    }
+    return candidates;
   }
 
   function firstVisible(documentLike, selector, role) {
@@ -175,9 +251,15 @@
 
   function checkInput(profile, documentLike) {
     const selector = profile?.input?.selector || profile?.input;
-    if (!hasSelector(selector) || !selectorIsValid(selector, documentLike)) return false;
-    if (!documentLike) return true;
-    return !!firstVisible(documentLike, selector, 'input');
+    if (!hasSelector(selector) || !selectorIsValid(selector, documentLike)) {
+      return { pass: false, reason: 'unavailable' };
+    }
+    if (!documentLike) return { pass: true, reason: '' };
+    const inputs = inputCandidates(documentLike, selector);
+    if (!inputs.length) return { pass: false, reason: 'unavailable' };
+    return inputs.some(input => isInputInteractable(input, documentLike))
+      ? { pass: true, reason: '' }
+      : { pass: false, reason: 'not_interactable' };
   }
 
   function checkSend(profile, documentLike) {
@@ -231,12 +313,11 @@
         .map(element => declaredIdentityElement(element, attributes))
         .filter((element, index, values) => element && values.indexOf(element) === index)
       : responseElements;
-    // A broad recorded response selector can match visible layout or loading
-    // nodes before the first logical message exists. With an explicitly
-    // allowed missing response, those nodes are not evidence of a malformed
-    // message identity; the capture path still requires a fresh identity
-    // before it can return a response.
-    if (!identityElements.length && options.allowMissingResponse) return true;
+    // `allowMissingResponse` applies only when the recorded selector has no
+    // visible match yet (for example, a genuinely empty new conversation).
+    // Once visible matches exist they are live evidence for this profile. If
+    // none can resolve the declared identity, the selector has drifted or is
+    // too broad and execution must fail closed before a request is sent.
     if (!identityElements.length) return false;
     if (attributes.length && !identityValuesAreUnique(identityElements, attributes)) return false;
     const keys = identityElements.map(element => {
@@ -280,15 +361,20 @@
     const documentLike = options.document || (typeof document !== 'undefined' ? document : null);
     const reason = reasons();
     const scopeTooBroad = responseScopeTooBroad(profile, documentLike);
+    const inputCheck = checkInput(profile, documentLike);
     const checks = {
-      input: checkInput(profile, documentLike) ? 'pass' : 'fail',
+      input: inputCheck.pass ? 'pass' : 'fail',
       send: checkSend(profile, documentLike) ? 'pass' : 'fail',
       response: checkResponse(profile, documentLike, { ...options, responseScopeTooBroad: scopeTooBroad }) ? 'pass' : 'fail',
       identity: checkIdentity(profile, documentLike, options.identityProbe, options) ? 'pass' : 'fail',
       streaming: checkStreaming(profile, documentLike) ? 'pass' : 'fail'
     };
     const reasonCodes = [];
-    if (checks.input !== 'pass') reasonCodes.push(reason.INPUT_UNAVAILABLE);
+    if (checks.input !== 'pass') {
+      reasonCodes.push(inputCheck.reason === 'not_interactable'
+        ? reason.INPUT_NOT_INTERACTABLE
+        : reason.INPUT_UNAVAILABLE);
+    }
     if (checks.send !== 'pass') reasonCodes.push(reason.SEND_UNAVAILABLE);
     if (checks.response !== 'pass') {
       reasonCodes.push(scopeTooBroad ? reason.RESPONSE_SCOPE_TOO_BROAD : reason.RESPONSE_UNAVAILABLE);
@@ -326,5 +412,5 @@
     };
   }
 
-  return { HEALTH_FIELDS, runProfileHealthCheck, profileHealthError };
+  return { HEALTH_FIELDS, isInputInteractable, runProfileHealthCheck, profileHealthError };
 });

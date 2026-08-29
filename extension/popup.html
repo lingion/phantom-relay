@@ -196,7 +196,10 @@
     <section class="recording-route-card" aria-labelledby="recordingRouteTitle">
       <div class="recording-route-heading">
         <div id="recordingRouteTitle" class="recording-route-title">录制页面</div>
-        <button id="btnOpenRecordingPage" class="mini-btn" type="button">打开录制页</button>
+        <div>
+          <button id="btnOpenRecordingWorkspace" class="mini-btn" type="button">独立录制页</button>
+          <button id="btnOpenRecordingPage" class="mini-btn" type="button">转到目标网页</button>
+        </div>
       </div>
       <div id="recordingRouteStatus" class="recording-route-status">正在检查当前页面…</div>
       <div id="recordingRouteTarget" class="recording-route-target"></div>
@@ -319,6 +322,7 @@
   <script src="profile_contract.js"></script>
   <script src="popup_profile_status.js"></script>
   <script src="popup_profile_contract.js"></script>
+  <script src="popup_target.js"></script>
   <script src="popup.js"></script>
 </body>
 </html>

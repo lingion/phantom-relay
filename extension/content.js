@@ -8,7 +8,7 @@
   // Static content_scripts 与 popup 的 executeScript fallback 可能同时注入。
   // DOM 属性跨 isolated world 共享，用它做真正的单例闸门；否则两个实例会
   // 同时点击发送，日志就会出现两套完全相同的 auto_capture/trace。
-  const CONTENT_SCRIPT_VERSION = '2026-08-11.06'; // canonical recorded boundary for send and response evidence
+  const CONTENT_SCRIPT_VERSION = '2026-08-20.09'; // bounded worker-owned extension reload recovery
   const INSTANCE_MARKER = 'data-phantom-relay-content-instance';
   const INSTANCE_HEARTBEAT_MARKER = 'data-phantom-relay-content-heartbeat';
   const INSTANCE_OWNER_MARKER = 'data-phantom-relay-content-owner';
@@ -78,6 +78,16 @@
     profile: null,
   };
 
+  // A locally captured selector is only a candidate until the background
+  // worker acknowledges persistence. The popup uses this gate to avoid
+  // showing a false recorded state while profile sync is still pending.
+  const selectorCaptureStatus = {
+    input: null,
+    send: null,
+    response: null,
+  };
+  const pendingSelectorCaptures = new Map();
+
 // 默认使用 Enter 发送；录制后会被具体策略覆盖。
   let sendStrategy = { kind: 'enter', key: 'Enter', modifiers: [] };
   let shortcutListening = false;
@@ -107,6 +117,71 @@
   function normalizeProfileRevision(value) {
     const revision = Number(value);
     return Number.isInteger(revision) && revision > 0 ? revision : 0;
+  }
+
+  function cloneCaptureValue(value) {
+    if (value == null || typeof value !== 'object') return value;
+    if (typeof structuredClone === 'function') return structuredClone(value);
+    return JSON.parse(JSON.stringify(value));
+  }
+
+  function beginSelectorCapture(role) {
+    const randomPart = globalThis.crypto?.randomUUID?.()
+      || `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+    const captureId = `capture-${role}-${randomPart}`;
+    pendingSelectorCaptures.set(role, {
+      captureId,
+      snapshot: {
+        selectors: cloneCaptureValue(selectors),
+        activeProfile: cloneCaptureValue(activeProfile),
+        activeProfileRevision,
+        sendStrategy: cloneCaptureValue(sendStrategy),
+      },
+    });
+    return captureId;
+  }
+
+  function resolveSelectorCaptureAck(role, captureId, ack, runtimeError = '') {
+    const pending = pendingSelectorCaptures.get(role);
+    const acknowledgedCaptureId = String(ack?.capture_id || '').trim();
+    if (!pending || pending.captureId !== captureId
+        || (acknowledgedCaptureId && acknowledgedCaptureId !== captureId)) {
+      emitPageTrace('selector_capture_ack_stale_ignored', {
+        role,
+        captureId,
+        acknowledgedCaptureId,
+      });
+      return { ignored: true };
+    }
+
+    if (!runtimeError && ack?.ok) {
+      pendingSelectorCaptures.delete(role);
+      selectorCaptureStatus[role] = {
+        state: 'accepted',
+        capture_id: captureId,
+        capturedAt: selectors[role]?.capturedAt || Date.now(),
+        profile_revision: Number(ack.profile_revision || 0),
+        profile_synced: ack.profile_synced !== false,
+      };
+      return { accepted: true };
+    }
+
+    selectors = cloneCaptureValue(pending.snapshot.selectors);
+    activeProfile = cloneCaptureValue(pending.snapshot.activeProfile);
+    activeProfileRevision = pending.snapshot.activeProfileRevision;
+    sendStrategy = cloneCaptureValue(pending.snapshot.sendStrategy);
+    pendingSelectorCaptures.delete(role);
+    const error = runtimeError || ack?.error || 'selector_capture_ack_missing';
+    const detail = ack?.detail || '';
+    selectorCaptureStatus[role] = {
+      state: 'rejected',
+      capture_id: captureId,
+      capturedAt: selectors[role]?.capturedAt || Date.now(),
+      error,
+      detail,
+    };
+    emitPageTrace('selector_capture_ack_failed', { role, captureId, error, detail });
+    return { accepted: false, error, detail };
   }
 
   function refreshActiveProfile(candidate = selectors.profile) {
@@ -169,11 +244,11 @@
         reason_codes: ['profile_health_unavailable']
       };
     }
-        return ProfileHealth.runProfileHealthCheck(profile, {
-          requireRecordedIdentity: options.requireRecordedIdentity !== false,
-          ...options,
-          revision: activeProfileRevision,
-          document,
+    return ProfileHealth.runProfileHealthCheck(profile, {
+      requireRecordedIdentity: options.requireRecordedIdentity !== false,
+      ...options,
+      revision: activeProfileRevision,
+      document: Object.prototype.hasOwnProperty.call(options, 'document') ? options.document : document,
       identityProbe: (element) => {
         if (!profile || !ProfileContract || !element) return false;
         return ProfileContract.messageIdentity(profile, elementRecord(element));
@@ -266,10 +341,61 @@
 
   function responseRegionElements() {
     if (usesRecordedResponseIndexIdentity()) return responseProjectionElements();
-    const elements = responseSelectorSet().flatMap(css => {
+    const projections = responseProjectionElements().filter(isWithinRecordedResponseScope);
+    const containers = recordedResponseContainerSelectors().flatMap(css => {
       try { return Array.from(document.querySelectorAll(css)); } catch (_) { return []; }
     }).filter(isWithinRecordedResponseScope);
-    return Array.from(new Set([...elements, ...recordedResponseScopeElements()]));
+    const fallbacks = Array.from(new Set([...containers, ...recordedResponseScopeElements()]));
+    if (ResponseObservation?.mergeRecordedRegionElements) {
+      return ResponseObservation.mergeRecordedRegionElements(
+        projections,
+        fallbacks,
+        element => messageIdentity(element),
+      );
+    }
+    return projections.length ? projections : fallbacks;
+  }
+
+  function elementDepth(element) {
+    let depth = 0;
+    for (let current = element; current && current !== document.documentElement; current = current.parentElement) {
+      depth += 1;
+    }
+    return depth;
+  }
+
+  function recordedProjectionSpecificity(element) {
+    const selectors = responseProjectionSelectorSet();
+    for (let index = 0; index < selectors.length; index += 1) {
+      if (matchesProfileSelector(element, selectors[index])) return selectors.length - index + 1;
+    }
+    return 0;
+  }
+
+  function recordedResponseActivityScope(element) {
+    if (!element) return null;
+    for (let current = element; current && current !== document.documentElement; current = current.parentElement) {
+      if (recordedResponseContainerSelectors().some(selector => matchesProfileSelector(current, selector))) {
+        return current;
+      }
+    }
+    return declaredIdentityElement(element) || element;
+  }
+
+  function recordedResponseActivityToken(snapshot) {
+    if (!snapshot?.region) return '';
+    const scope = recordedResponseActivityScope(snapshot.region);
+    if (!scope) return '';
+    const scopeText = ProfileContract.normalizeText(activeProfile, extractMessageText(scope));
+    let elementCount = 0;
+    try { elementCount = scope.querySelectorAll?.('*')?.length || 0; } catch (_) {}
+    return JSON.stringify({
+      key: snapshot.key || '',
+      selectedTextLength: String(snapshot.text || '').length,
+      scopeTextLength: scopeText.length,
+      elementCount,
+      streaming: !!snapshot.streaming,
+    });
   }
 
   function declaredIdentityElement(element) {
@@ -299,6 +425,12 @@
       if (matchesProfileSelector(current, selector)) return true;
     }
     return false;
+  }
+
+  function matchesElementOrDescendant(node, selector) {
+    if (!node || !selector) return false;
+    if (matchesProfileSelector(node, selector)) return true;
+    try { return !!node.querySelector?.(selector); } catch (_) { return false; }
   }
 
   function selectorStateAttribute(selector) {
@@ -337,7 +469,9 @@
     const indicatorStates = (response?.streamingIndicators || [])
       .filter(indicator => indicator.selector)
       .map(indicator => {
-        const matched = matchesElementOrAncestor(el, indicator.selector) ||
+        const matched = matchesElementOrDescendant(el, indicator.selector) ||
+          matchesElementOrDescendant(identityElement, indicator.selector) ||
+          matchesElementOrAncestor(el, indicator.selector) ||
           matchesElementOrAncestor(identityElement, indicator.selector);
         const attribute = selectorStateAttribute(indicator.selector);
         const attributeElement = attribute
@@ -937,14 +1071,30 @@
   }
 
   function selectorClassTokens(el) {
-    const volatile = /(?:^|[-_])(active|current|last|first|show|hide|loading|streaming|busy|disabled|selected|focus|hover|open|close|transition|animation|enter|leave|visible|hidden|rank|index|position|order)(?:[-_]|$)/i;
+    const volatile = /(?:^|[-_])(active|current|last|first|show|hide|loading|streaming|busy|disabled|selected|focus|focused|hover|open|close|transition|animation|enter|leave|visible|hidden|blank|empty|rank|index|position|order)(?:[-_]|$)/i;
     const generated = /^_?[a-z][\w-]*_[a-z0-9]{4,}_\d+$/i;
     return Array.from(el?.classList || []).filter(token =>
       /^[a-zA-Z_-][\w-]*$/.test(token) && !volatile.test(token) && !generated.test(token)
     );
   }
 
-  function generateStableContainerSelector(el) {
+  function generateStableContainerSelector(el, identityAttributes = []) {
+    const attributeScopes = Array.from(new Set(
+      (Array.isArray(identityAttributes) ? identityAttributes : [])
+        .map(attribute => String(attribute || '').trim().toLowerCase())
+        // `[id]` is a page-wide layout selector on many SPAs. Stable data
+        // identity attributes are safe as presence-only scopes because their
+        // per-message value remains reserved for freshness checks.
+        .filter(attribute => /^data-[a-z][a-z0-9_.:-]*$/.test(attribute))
+        .map(attribute => `[${CSS.escape(attribute)}]`)
+    ));
+    if (attributeScopes.length) {
+      return {
+        css: attributeScopes[0],
+        alternatives: attributeScopes.slice(1),
+        method: 'identity-attribute-presence'
+      };
+    }
     const tag = el?.tagName?.toLowerCase() || '';
     const classes = selectorClassTokens(el);
     if (tag && classes.length) {
@@ -1315,6 +1465,7 @@
         setTimeout(clearHighlight, 1500);
         return;
       }
+      const captureId = beginSelectorCapture(targetRole);
       // Store the selector only after the response profile has passed its
       // identity contract. A failed re-record must leave the last-known-good
       // response/profile untouched.
@@ -1324,6 +1475,11 @@
         elementHTML: actualTarget.outerHTML.substring(0, 500),
         classification: result,
         capturedAt: Date.now(),
+      };
+      selectorCaptureStatus[targetRole] = {
+        state: 'pending',
+        capture_id: captureId,
+        capturedAt: selectors[targetRole].capturedAt,
       };
       if (targetRole === 'response') {
         selectors.profile = recordedProfile;
@@ -1349,6 +1505,31 @@
         elementTag: actualTarget.tagName.toLowerCase(),
         profile: targetRole === 'response' ? recordedProfile : undefined,
         domain,
+        capture_id: captureId,
+      }, (ack) => {
+        const runtimeError = chrome.runtime.lastError?.message || '';
+        const resolution = resolveSelectorCaptureAck(targetRole, captureId, ack, runtimeError);
+        if (resolution.ignored) return;
+        if (resolution.accepted) {
+          // Keep the role-local assignment explicit for diagnostics and older
+          // popup readers that inspect the content source contract directly.
+          selectorCaptureStatus[targetRole] = {
+            state: 'accepted',
+            capture_id: captureId,
+            capturedAt: selectorCaptureStatus[targetRole]?.capturedAt || Date.now(),
+            profile_revision: Number(ack?.profile_revision || 0),
+            profile_synced: ack?.profile_synced !== false,
+          };
+          return;
+        }
+        chrome.runtime.sendMessage({
+          type: 'selector_capture_rejected',
+          role: targetRole,
+          error: resolution.error,
+          detail: resolution.detail || '录制结果未得到后端确认，请重试',
+          domain,
+          capture_id: captureId,
+        }).catch(() => {});
       });
 
       // 1.5 秒后清除高亮
@@ -1426,13 +1607,27 @@
       if (e.shiftKey) modifiers.push('Shift');
       const key = e.key === 'Enter' ? 'Enter' : (e.code?.replace(/^Key/,'') || e.key);
       const strategy = { kind: 'shortcut', key, modifiers, code: e.code };
+      const captureId = beginSelectorCapture('send');
       sendStrategy = strategy;
       selectors.send = strategy;
+      selectorCaptureStatus.send = { state: 'pending', capture_id: captureId, capturedAt: Date.now() };
       document.removeEventListener('keydown', shortcutCaptureHandler, true);
       shortcutCaptureHandler = null;
       shortcutListening = false;
       const domain = window.location.hostname;
-      chrome.runtime.sendMessage({ type: 'selector_captured', role: 'send', selector: JSON.stringify(strategy), confidence: 'manual', elementTag: 'keyboard', domain });
+      chrome.runtime.sendMessage({ type: 'selector_captured', role: 'send', selector: JSON.stringify(strategy), confidence: 'manual', elementTag: 'keyboard', domain, capture_id: captureId }, (ack) => {
+        const runtimeError = chrome.runtime.lastError?.message || '';
+        const resolution = resolveSelectorCaptureAck('send', captureId, ack, runtimeError);
+        if (resolution.ignored || resolution.accepted) return;
+        chrome.runtime.sendMessage({
+          type: 'selector_capture_rejected',
+          role: 'send',
+          error: resolution.error,
+          detail: resolution.detail || '录制结果未得到后端确认，请重试',
+          domain,
+          capture_id: captureId,
+        }).catch(() => {});
+      });
     };
     document.addEventListener('keydown', shortcutCaptureHandler, true);
   }
@@ -1478,37 +1673,69 @@
 
   // Submission is a side effect. Once the recorded keyboard sequence has been
   // dispatched, an absent DOM projection is unknown evidence, never permission
-  // to submit the same prompt through another event path. The extension has no
-  // provider-neutral API for trusted native key input, so this is deliberately
-  // a single DOM event boundary and never retries through a button or CDP.
-  function dispatchRecordedKeyboardOnce(inputEl, options = {}) {
-    if (!inputEl) return { status: 'unknown', error: 'input_not_found', method: 'dom-keyboard' };
+  // to submit the same prompt through another event path. The page owns focus;
+  // the background worker owns the trusted Chromium keyboard dispatch.
+  function recordedInputOwnsFocus(inputEl) {
+    if (!inputEl?.isConnected) return false;
+    const focusOwner = inputEl.matches?.('textarea, input, [contenteditable="true"], [role="textbox"]')
+      ? inputEl
+      : (inputEl.closest?.('textarea, input, [contenteditable="true"], [role="textbox"]') || inputEl);
+    let active = document.activeElement;
+    while (active?.shadowRoot?.activeElement) active = active.shadowRoot.activeElement;
+    return !!active && (active === focusOwner || focusOwner.contains?.(active));
+  }
+
+  async function dispatchRecordedKeyboardOnce(inputEl, options = {}) {
+    if (!inputEl) return { status: 'unknown', error: 'input_not_found', method: 'cdp-input' };
     const key = String(options.key || 'Enter');
     const code = String(options.code || key);
     const modifiers = Array.isArray(options.modifiers) ? options.modifiers : [];
-    const eventOptions = {
-      key,
-      code,
-      keyCode: key === 'Enter' ? 13 : 0,
-      which: key === 'Enter' ? 13 : 0,
-      ctrlKey: modifiers.includes('Control'),
-      altKey: modifiers.includes('Alt'),
-      shiftKey: modifiers.includes('Shift'),
-      metaKey: modifiers.includes('Meta'),
-      bubbles: true,
-      cancelable: true,
-      composed: true,
-    };
     try {
-      inputEl.focus();
-      inputEl.dispatchEvent(new KeyboardEvent('keydown', eventOptions));
-      inputEl.dispatchEvent(new KeyboardEvent('keypress', eventOptions));
-      inputEl.dispatchEvent(new KeyboardEvent('keyup', eventOptions));
-      const result = { status: 'dispatched', method: 'dom-keyboard', key, trusted: false };
+      try { inputEl.focus({ preventScroll: true }); } catch (_) { inputEl.focus(); }
+      await new Promise(resolve => requestAnimationFrame(() => resolve()));
+      if (!recordedInputOwnsFocus(inputEl)) {
+        const focusFailure = {
+          ok: false,
+          status: 'unknown',
+          method: 'cdp-input',
+          trusted: false,
+          error: 'keyboard_focus_not_acquired',
+          kind: 'keyboard_focus_not_acquired',
+          documentHasFocus: document.hasFocus(),
+          activeTag: document.activeElement?.tagName || '',
+        };
+        reportPageEvent('keyboard_focus_not_acquired', focusFailure);
+        return focusFailure;
+      }
+      reportPageEvent('keyboard_focus_acquired', {
+        documentHasFocus: document.hasFocus(),
+        activeTag: document.activeElement?.tagName || '',
+      });
+      const result = await new Promise(resolve => {
+        let settled = false;
+        const finish = value => {
+          if (settled) return;
+          settled = true;
+          resolve(value || { status: 'unknown', method: 'cdp-input', error: 'keyboard_bridge_empty_response' });
+        };
+        try {
+          chrome.runtime.sendMessage({
+            type: 'dispatch_recorded_keyboard',
+            tab_id: options.tabId,
+            job_id: options.jobId,
+            claim_token: options.claimToken,
+            key,
+            code,
+            modifiers,
+          }, finish);
+        } catch (error) {
+          finish({ status: 'unknown', method: 'cdp-input', error: 'keyboard_bridge_unavailable', detail: error?.message || String(error) });
+        }
+      });
       reportPageEvent('send_keyboard_dispatched_once', result);
       return result;
     } catch (error) {
-      const result = { status: 'unknown', method: 'dom-keyboard', key, error: error?.message || String(error) };
+      const result = { status: 'unknown', method: 'cdp-input', key, error: error?.message || String(error) };
       reportPageEvent('send_keyboard_dispatch_unknown', result);
       return result;
     }
@@ -1520,21 +1747,102 @@
     return String(element.innerText || element.textContent || '').trim();
   }
 
+  function resolveRecordedInputOwner(inputSelector, inputElement) {
+    if (inputElement?.isConnected) return inputElement;
+    if (!inputSelector) return null;
+    const selector = typeof inputSelector === 'string'
+      ? inputSelector
+      : (typeof inputSelector?.css === 'string'
+        ? inputSelector.css
+        : (typeof inputSelector?.selector === 'string' ? inputSelector.selector : ''));
+    if (!selector) return null;
+    try { return document.querySelector(selector); } catch (_) { return null; }
+  }
+
+  function recordedInputCandidates(inputSelector, inputElement = null) {
+    const normalized = selectorDescriptor(inputSelector);
+    const selectorsToTry = [normalized?.css, ...(normalized?.alternatives || [])]
+      .filter(Boolean);
+    const candidates = [];
+    const append = (element) => {
+      if (!element || !element.matches?.('textarea,input,[contenteditable="true"],[role="textbox"]')) return;
+      if (!candidates.includes(element)) candidates.push(element);
+    };
+    append(inputElement);
+    for (const css of selectorsToTry) {
+      try {
+        document.querySelectorAll(css).forEach(append);
+      } catch (_) {}
+    }
+    return candidates;
+  }
+
+  function inputCandidateInteractable(element) {
+    if (typeof ProfileHealth !== 'undefined' && ProfileHealth?.isInputInteractable) {
+      return ProfileHealth.isInputInteractable(element, document);
+    }
+    return !!element?.isConnected && !!element?.getClientRects?.().length;
+  }
+
+  function resolveInteractableRecordedInput(inputSelector, inputElement = null) {
+    const candidates = recordedInputCandidates(inputSelector, inputElement);
+    const interactable = candidates.filter(inputCandidateInteractable);
+    if (!interactable.length) return null;
+
+    // Keep the current owner when it is still usable. If a framework replaced
+    // it, prefer the currently focused editor, then the first deterministic
+    // live candidate from the recorded selector order.
+    if (inputElement && interactable.includes(inputElement)) return inputElement;
+    const active = interactable.filter(element => (
+      document.activeElement === element || element.contains?.(document.activeElement)
+    ));
+    if (active.length === 1) return active[0];
+    return interactable.length === 1 ? interactable[0] : null;
+  }
+
+  function recordedInputDiagnostics(inputSelector, inputElement = null) {
+    return recordedInputCandidates(inputSelector, inputElement).map((element, index) => ({
+      index,
+      connected: element.isConnected !== false,
+      interactable: inputCandidateInteractable(element),
+      active: document.activeElement === element,
+      tag: String(element.tagName || '').toLowerCase(),
+      selectorMatch: selectorText(inputSelector),
+    }));
+  }
+
+  async function waitForInteractableRecordedInput(inputSelector, inputElement = null, timeout = 1500) {
+    const started = Date.now();
+    let current = inputElement;
+    while (Date.now() - started < timeout) {
+      throwIfCaptureCancelled();
+      current = resolveInteractableRecordedInput(inputSelector, current);
+      if (current) return current;
+      await sleep(100);
+    }
+    return resolveInteractableRecordedInput(inputSelector, current);
+  }
+
   async function waitForSendObservation({
     userMessage,
     beforeKeys,
     inputSelector,
+    inputElement,
     inputBefore,
     generationStateBefore,
     timeoutMs = 12000,
   }) {
     const started = Date.now();
     let lastInputValue = inputBefore;
+    let weakEvidence = null;
+    const observationWake = createRecordedResponseWake();
+    try {
     while (Date.now() - started < timeoutMs) {
       throwIfCaptureCancelled();
       const userEvidence = findFreshUserMessage(userMessage, beforeKeys);
       const responseEvidence = freshResponseEvidence(userMessage, beforeKeys);
-      const input = document.querySelector(inputSelector);
+      const input = resolveInteractableRecordedInput(inputSelector, inputElement)
+        || resolveRecordedInputOwner(inputSelector, inputElement);
       lastInputValue = recordedInputValue(input);
       const generationAfter = sendActivityState(recordedResponseRegion());
       const generationStarted = (
@@ -1565,15 +1873,28 @@
         });
         return { ...observation, waitedMs: Date.now() - started };
       }
-      await sleep(100);
+      if (observation.weak) {
+        weakEvidence = observation;
+        return {
+          ...observation,
+          waitedMs: Date.now() - started,
+          inputBeforeLength: String(inputBefore || '').length,
+          inputAfterLength: String(lastInputValue || '').length,
+        };
+      }
+      await observationWake.wait(250);
     }
     return {
       observed: false,
-      reason: 'no_effect',
+      weak: !!weakEvidence,
+      reason: weakEvidence?.reason || 'no_effect',
       waitedMs: Date.now() - started,
       inputBeforeLength: String(inputBefore || '').length,
       inputAfterLength: String(lastInputValue || '').length,
     };
+    } finally {
+      observationWake.disconnect();
+    }
   }
 
   // 这里不再依赖 copy 按钮。回复的唯一边界是：发送前快照 → 新用户消息 →
@@ -1582,6 +1903,8 @@
     if (!isCurrentGeneration()) return { error: 'stale_content_script' };
     const expectedConversationId = String(conversationId || '');
     const expectedTabId = tabId == null ? null : Number(tabId);
+    const requestedCaptureTimeoutMs = Math.max(120000, Math.min(900000, Number(captureTimeoutMs) || 240000));
+    const captureDeadlineAt = Date.now() + requestedCaptureTimeoutMs;
     if (autoCaptureInFlight) return { error: 'capture_in_flight', detail: '已有自动抓取正在运行，请等待结束' };
     const profileHealth = runProfileHealthCheck(activeProfile, { allowMissingResponse: true });
     if (profileHealth.state === 'invalid') return profileHealthError(profileHealth);
@@ -1644,6 +1967,8 @@
           conversation_id: expectedConversationId,
           job_id: jobId,
           claim_token: claimToken,
+          page_session_id: pageSessionId,
+          content_script_version: CONTENT_SCRIPT_VERSION,
         }, value => {
           void chrome.runtime.lastError;
           if (value?.claim_valid === false) {
@@ -1653,9 +1978,39 @@
       } catch (_) {}
     }, 5000);
     try {
-      const inputEl = await waitForElement(selectorDescriptor(selectors.input), 120000, 'input');
+      let inputEl = await waitForInteractableRecordedInput(
+        selectorDescriptor(selectors.input),
+        null,
+        Math.min(120000, Math.max(1, captureDeadlineAt - Date.now())),
+      );
       throwIfCaptureCancelled();
-      if (!inputEl) return { error: 'input_not_ready_timeout', detail: '等待输入框 120 秒后仍未就绪' };
+      if (!inputEl) {
+        const diagnostics = recordedInputDiagnostics(selectorDescriptor(selectors.input));
+        emitPageTrace('recorded_input_resolution_failed', {
+          phase: 'before_fill',
+          candidateCount: diagnostics.length,
+          candidates: diagnostics,
+        });
+        return {
+          error: diagnostics.length ? 'recorded_input_not_interactable' : 'input_not_ready_timeout',
+          detail: diagnostics.length
+            ? '录制输入框当前被遮挡、禁用或不可交互'
+            : '等待输入框后仍未找到录制目标',
+          reason_codes: diagnostics.length ? ['recorded_input_not_interactable'] : ['profile_input_unavailable'],
+          recoverable: true
+        };
+      }
+      const identityGapBeforeSend = recordedResponseIdentityGap();
+      if (identityGapBeforeSend) {
+        emitPageTrace('recorded_response_identity_preflight_failed', identityGapBeforeSend);
+        return {
+          error: 'profile_identity_unavailable',
+          detail: '录制回复身份已失效，请重新录制回复区域后再试',
+          reason_codes: ['profile_identity_unavailable'],
+          profile_identity_gap: identityGapBeforeSend,
+          recoverable: true
+        };
+      }
       // Content script owns the single recorded input mutation. The following
       // recorded send action must not inject text a second time.
       setInputValue(inputEl, userMessage);
@@ -1696,7 +2051,26 @@
       const beforeKeys = new Set(beforeEntries.map(n => n.key));
       window.__phantomRelayCaptureBeforeMessages = beforeEntries.map(n => ({ key: n.key, text: n.text }));
       const generationStateBefore = sendActivityState(recordedResponseBefore?.region || null);
-      const preSendInput = document.querySelector(inputSelector);
+      const preSendInput = await waitForInteractableRecordedInput(
+        selectorDescriptor(selectors.input),
+        inputEl,
+        Math.min(3000, Math.max(1, captureDeadlineAt - Date.now())),
+      );
+      if (!preSendInput) {
+        const diagnostics = recordedInputDiagnostics(selectorDescriptor(selectors.input), inputEl);
+        emitPageTrace('recorded_input_resolution_failed', {
+          phase: 'before_send',
+          candidateCount: diagnostics.length,
+          candidates: diagnostics,
+        });
+        return {
+          error: 'recorded_input_not_interactable',
+          detail: '录制输入框在发送前已不可交互',
+          reason_codes: ['recorded_input_not_interactable'],
+          recoverable: true
+        };
+      }
+      inputEl = preSendInput;
       const preSendInputValue = recordedInputValue(preSendInput);
       reportCaptureProgress(`发送前逻辑消息 ${beforeEntries.length} 条`);
       reportPageEvent('capture_boundary', {
@@ -1750,15 +2124,17 @@
         }
       }
 
-      // Enter strategy: one provider-neutral DOM keyboard sequence. There is no
-      // extension API for trusted native keys; do not replace this with CDP input
-      // or a button fallback, because either would violate the recorded contract.
+      // Enter and shortcut strategies use the background's browser-native input
+      // bridge. The page still owns focus, while Chromium owns the trusted key
+      // event that framework editors accept as a real user action.
       if (sendKind === 'enter') {
-        const inputEl = document.querySelector(inputSelector);
-        const dispatch = dispatchRecordedKeyboardOnce(inputEl, {
+        const dispatch = await dispatchRecordedKeyboardOnce(inputEl, {
           key: sendKey,
           code: currentStrategy?.code || sendKey,
           modifiers: sendModifiers,
+          tabId: expectedTabId,
+          jobId,
+          claimToken,
         });
         if (dispatch.status !== 'dispatched') {
           reportPageEvent('send_dispatch_unknown_observe_only', {
@@ -1776,12 +2152,14 @@
         // render only the assistant region and expose no keyed user-message
         // node, so a missing user projection cannot turn a real dispatch into
         // a retry loop that may submit the prompt more than once.
-        const inputEl = document.querySelector(inputSelector);
         throwIfCaptureCancelled();
-        const shortcut = dispatchRecordedKeyboardOnce(inputEl, {
+        const shortcut = await dispatchRecordedKeyboardOnce(inputEl, {
           key: strategy.key || 'Enter',
           code: strategy.code || strategy.key || 'Enter',
           modifiers: strategy.modifiers || [],
+          tabId: expectedTabId,
+          jobId,
+          claimToken,
         });
         const shortcutDispatched = shortcut.status === 'dispatched';
         reportPageEvent('send_recorded_shortcut_dispatched', { key: strategy.key || 'Enter', modifiers: strategy.modifiers || [], dispatched: shortcutDispatched, method: shortcut.method });
@@ -1833,16 +2211,25 @@
       // containers/IDs (for example a row plus an inner message node).  The
       // send action itself is already guarded and executed once; duplicate
       // candidates are diagnostic only and must not block extraction.
-      const sendObservationTimeoutMs = Math.max(2000, Math.min(12000, Number(captureTimeoutMs) || 12000));
+      // Sending and model generation are separate boundaries. A page with no
+      // observable effect must fail inside a bounded window. Input consumption
+      // is intentionally weaker than acceptance proof, but it means the one
+      // recorded action may already be in flight, so continue to the
+      // authoritative fresh-response boundary without submitting again.
+      const sendObservationTimeoutMs = Math.max(
+        2000,
+        Math.min(30000, captureDeadlineAt - Date.now()),
+      );
       const sendObservation = await waitForSendObservation({
         userMessage,
         beforeKeys,
         inputSelector,
+        inputElement: inputEl,
         inputBefore: preSendInputValue,
         generationStateBefore,
         timeoutMs: sendObservationTimeoutMs,
       });
-      if (!sendObservation.observed) {
+      if (!sendObservation.observed && !sendObservation.weak) {
         reportPageEvent('send_not_observed', {
           kind: sendKind,
           waitedMs: sendObservation.waitedMs,
@@ -1851,9 +2238,19 @@
         });
         return {
           error: 'send_not_observed',
-          detail: '发送动作已执行，但页面没有出现输入消费、用户消息、生成状态或新回复',
+          detail: '发送动作已执行一次，但在请求期限内没有出现用户消息、生成状态或新回复',
           recoverable: true,
         };
+      }
+      if (sendObservation.weak) {
+        reportPageEvent('send_observation_pending', {
+          kind: sendKind,
+          reason: sendObservation.reason,
+          waitedMs: sendObservation.waitedMs,
+          inputBeforeLength: sendObservation.inputBeforeLength,
+          inputAfterLength: sendObservation.inputAfterLength,
+          action: 'observe_response_without_retry',
+        });
       }
       await sleep(350);
       const freshUserMessages = logicalMessageSnapshot().filter(n =>
@@ -1868,7 +2265,9 @@
           reason: 'multiple_dom_representations_are_not_proof_of_multiple_submissions'
         });
       }
-      reportCaptureProgress(`发送已确认（${sendObservation.reason}），等待模型回复`);
+      reportCaptureProgress(sendObservation.observed
+        ? `发送已确认（${sendObservation.reason}），等待模型回复`
+        : `输入已消费（${sendObservation.reason}），继续确认模型回复`);
       // A network-only profile deliberately has no DOM response selector. The
       // debugger-backed capture owns the assistant result and will settle the
       // job through /browser/result. Returning here keeps the page action
@@ -1891,8 +2290,7 @@
       // stable recorded snapshot returns immediately; this is only the upper
       // bound for a provider that keeps generating or pauses between DOM
       // updates.
-      const requestedCaptureTimeoutMs = Number(captureTimeoutMs) || 240000;
-      const freshTimeoutMs = Math.max(120000, Math.min(900000, requestedCaptureTimeoutMs));
+      const freshTimeoutMs = Math.max(1, captureDeadlineAt - Date.now());
       // The recorded-region monitor is both the freshness and completion
       // boundary. Waiting for a separate "visible response" phase first used
       // long minimum-generation and quiet windows, delaying every caller even
@@ -1994,13 +2392,51 @@
     }
   }
 
+  function deriveStableSelectorAlternatives(css) {
+    const source = String(css || '').trim();
+    if (!source) return [];
+    const volatile = /(?:^|[-_])(active|current|last|first|show|hide|loading|streaming|busy|disabled|selected|focus|focused|hover|open|close|transition|animation|enter|leave|visible|hidden|blank|empty|rank|index|position|order)(?:[-_]|$)/i;
+    const escapeRegExp = value => String(value).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const volatileClasses = Array.from(source.matchAll(/\.([a-zA-Z_-][\w-]*)/g))
+      .map(match => match[1])
+      .filter((token, index, tokens) => volatile.test(token) && tokens.indexOf(token) === index);
+    if (!volatileClasses.length) return [];
+
+    let candidate = source;
+    for (const token of volatileClasses) {
+      candidate = candidate.replace(
+        new RegExp(`\\.${escapeRegExp(token)}(?=[.#\\[:\\s>+~]|$)`, 'g'),
+        '',
+      );
+    }
+    if (!candidate || candidate === source) return [];
+    try {
+      // A fallback is executable only when it remains an unambiguous page
+      // target. Broadening a recorded selector would be worse than failing
+      // closed and asking for a re-record.
+      if (document.querySelectorAll(candidate).length !== 1) return [];
+    } catch (_) {
+      return [];
+    }
+    return [candidate];
+  }
+
   function normalizeRecordedSelector(value) {
     if (!value) return null;
-    if (typeof value === 'string') return { css: value, alternatives: [] };
-    if (typeof value.css === 'string') return value;
-    if (typeof value.selector === 'string') return { css: value.selector, alternatives: value.alternatives || [] };
-    if (value.selector?.css) return { ...value.selector, alternatives: value.selector.alternatives || [] };
-    return null;
+    let normalized = null;
+    if (typeof value === 'string') normalized = { css: value, alternatives: [] };
+    else if (typeof value.css === 'string') normalized = value;
+    else if (typeof value.selector === 'string') normalized = { css: value.selector, alternatives: value.alternatives || [] };
+    else if (value.selector?.css) normalized = { ...value.selector, alternatives: value.selector.alternatives || [] };
+    if (!normalized) return null;
+    const alternatives = Array.isArray(normalized.alternatives) ? normalized.alternatives : [];
+    return {
+      ...normalized,
+      alternatives: [...new Set([
+        ...alternatives,
+        ...deriveStableSelectorAlternatives(normalized.css),
+      ])],
+    };
   }
 
   function selectorText(value) {
@@ -2127,15 +2563,25 @@
     return { streaming: marker || control, marker, control };
   }
 
-  function responseActivityState(element) {
+  function responseActivityState(element, generationStateBefore = null) {
     const state = element && activeProfile && ProfileContract?.streamingState
       ? ProfileContract.streamingState(activeProfile, elementRecord(element))
       : { active: !!(element && messageIsStreaming(element)), explicitlySettled: false };
     const marker = state.active;
+    // The generic stop/cancel control is evidence only when it appeared after
+    // this request's send boundary. A control already present before send may
+    // belong to another page workflow and cannot own this response.
+    const control = !!activeGenerationControl() && !generationStateBefore?.control;
     const streaming = ResponseObservation
-      ? ResponseObservation.isResponseStreaming({ recordedMarker: marker })
-      : marker;
-    return { streaming, marker, explicitlySettled: state.explicitlySettled, control: false };
+      ? ResponseObservation.isResponseStreaming({ recordedMarker: marker, requestControl: control })
+      : (marker || control);
+    return {
+      streaming,
+      marker,
+      explicitlySettled: state.explicitlySettled,
+      streamingSeen: state.active === true,
+      control,
+    };
   }
 
   function domToMarkdown(root, profile = activeProfile) {
@@ -2205,29 +2651,40 @@
       const logicalKey = messageIdentity(el);
       if (!logicalKey) continue;
 
-      const existing = byLogicalIdentity.get(logicalKey);
-      if (!existing ||
-          visibleText.length > existing.text.length) {
-        byLogicalIdentity.set(logicalKey, { element: el, text: visibleText });
-      }
+      const group = byLogicalIdentity.get(logicalKey) || [];
+      group.push({
+        element: el,
+        text: visibleText,
+        index: candidates.indexOf(el),
+        specificity: recordedProjectionSpecificity(el),
+        depth: elementDepth(el),
+      });
+      byLogicalIdentity.set(logicalKey, group);
     }
-    return Array.from(byLogicalIdentity.values()).map(({ element, text }, index) => ({
+    return Array.from(byLogicalIdentity.values()).map((group, index) => {
+      const chosen = selectRecordedProjection(group);
+      const { element, text } = chosen;
+      return {
       key: messageIdentity(element) || `logical:${index}`,
       element,
       index,
       text,
       role: messageRole(element),
       streaming: messageIsStreaming(element),
-    }));
+      };
+    });
   }
 
-  function selectLongestProjection(group) {
+  function selectRecordedProjection(group) {
+    if (ResponseObservation?.selectRecordedProjection) {
+      return ResponseObservation.selectRecordedProjection(group);
+    }
     return (Array.isArray(group) ? group : []).reduce((best, item) => {
       if (!best) return item;
-      const itemLength = String(item?.text || '').length;
-      const bestLength = String(best?.text || '').length;
-      if (itemLength !== bestLength) return itemLength > bestLength ? item : best;
-      return Number(item?.index || 0) > Number(best?.index || 0) ? item : best;
+      if (Number(item?.specificity || 0) !== Number(best?.specificity || 0)) {
+        return Number(item?.specificity || 0) > Number(best?.specificity || 0) ? item : best;
+      }
+      return Number(item?.depth || 0) > Number(best?.depth || 0) ? item : best;
     }, null);
   }
 
@@ -2331,13 +2788,18 @@
     return !!(pos & Node.DOCUMENT_POSITION_FOLLOWING);
   }
 
-  function isStrictPromptReplyPrefix(candidateText, userMessage) {
-    const candidate = normalizeComparableText(candidateText);
+  function strictRequestedReply(userMessage) {
     const prompt = normalizeComparableText(userMessage);
-    if (!candidate || !prompt) return false;
+    if (!prompt) return '';
     // Common "reply only with X" prompts: compare against the requested
     // payload, not arbitrary page text. This is generic and provider-neutral.
-    const requested = prompt.split(/[:：]/).pop() || '';
+    return prompt.split(/[:：]/).pop() || '';
+  }
+
+  function isStrictPromptReplyPrefix(candidateText, userMessage) {
+    const candidate = normalizeComparableText(candidateText);
+    const requested = strictRequestedReply(userMessage);
+    if (!candidate || !requested) return false;
     return requested.length > candidate.length && requested.startsWith(candidate);
   }
 
@@ -2398,7 +2860,11 @@
     ) {
       return false;
     }
-    if (nextText.length >= oldText.length) return true;
+    // Appending citations, recommendations, or status text to an old assistant
+    // node does not create a new request-owned response. A reused identity must
+    // replace the old body rather than contain it in either direction.
+    if (oldComparable.includes(nextComparable) || nextComparable.includes(oldComparable)) return false;
+    if (nextText.length >= oldText.length) return !responseTextWasPresentBefore(nextText);
     // A reused logical key can represent multiple DOM rows. When the old row
     // is virtualized out of view and the new row is visible, the new response
     // may legitimately be shorter than the historical response.
@@ -2453,15 +2919,16 @@
         key: messageIdentity(region) || (identityConfigured ? '' : region.getAttribute('data-message-id') || region.getAttribute('data-observe-row') || 'recorded-response-region'),
         text: Universal?.responseText ? Universal.responseText(rawText) : rawText,
         streaming: messageIsStreaming(region),
-        role: messageRole(region)
+        role: messageRole(region),
+        specificity: recordedProjectionSpecificity(region),
+        depth: elementDepth(region),
       };
     }).filter(item => item.text && item.key);
     if (!snapshots.length) return null;
-    // A CSS path can match both an inner text projection and its stable message
-    // row. The outer projection is the authoritative rendered snapshot: the
-    // inner node can lag behind it during streaming, as on virtualized pages.
-    // Controls are removed by extractMessageText, while the declared identity
-    // still prevents projections from crossing message rows.
+    // Identity ancestors establish ownership only. The recorded response
+    // selector establishes the body projection, so a longer outer container
+    // cannot pull prompts, citations, recommendations, or page chrome into the
+    // returned assistant text.
     const byIdentity = new Map();
     for (const item of snapshots) {
       const group = byIdentity.get(item.key) || [];
@@ -2470,19 +2937,85 @@
     }
     const projections = [];
     for (const group of byIdentity.values()) {
-      projections.push(selectLongestProjection(group));
+      const selected = selectRecordedProjection(group);
+      if (!selected) continue;
+      const selectedRect = selected.region?.getBoundingClientRect?.();
+      const connected = selected.region?.isConnected === true;
+      const visible = connected && !!selected.region?.getClientRects?.().length &&
+        (!selectedRect || (selectedRect.width > 0 && selectedRect.height > 0));
+      projections.push({
+        ...selected,
+        projectionCount: group.length,
+        selectedIndex: selected.index,
+        selectedSpecificity: selected.specificity,
+        selectedDepth: selected.depth,
+        connected,
+        visible,
+      });
     }
     const normalizedSnapshots = projections.filter(Boolean);
     // Diagnostic only: preserve the recorded selector boundary while exposing
     // which recorded-region identities are visible during a capture.
     if (userMessage && (Date.now() % 5 === 0)) {
-    emitPageTrace('recorded_response_probe', { beforeKeys: Array.from(beforeKeys).slice(-12), snapshots: normalizedSnapshots.slice(-8).map(item => ({ key: item.key, textLength: String(item.text || '').length, streaming: !!item.streaming })) });
+    emitPageTrace('recorded_response_probe', { beforeKeys: Array.from(beforeKeys).slice(-12), snapshots: normalizedSnapshots.map(item => ({ key: item.key, textLength: String(item.text || '').length, streaming: !!item.streaming, projectionCount: item.projectionCount, selectedIndex: item.selectedIndex, selectedSpecificity: item.selectedSpecificity, selectedDepth: item.selectedDepth, connected: item.connected, visible: item.visible })) });
     }
-    const freshAssistant = normalizedSnapshots.filter(item =>
-      isFreshRecordedResponse(item.key, item.text, beforeKeys, item.region) &&
-      (!userMessage || !likelyUserEcho(item.text, userMessage, item.role)) &&
-      isNodeAfterFreshUser(item.region, userMessage, beforeKeys)
-    );
+    const requestedReply = strictRequestedReply(userMessage);
+    const evaluatedCandidates = normalizedSnapshots.map(item => {
+      const freshIdentity = !beforeKeys.has(item.key);
+      const freshResponse = isFreshRecordedResponse(item.key, item.text, beforeKeys, item.region);
+      const userEcho = !!userMessage && likelyUserEcho(item.text, userMessage, item.role);
+      const afterFreshUser = isNodeAfterFreshUser(item.region, userMessage, beforeKeys);
+      const promptPrefix = !!userMessage && isStrictPromptReplyPrefix(item.text, userMessage);
+      const domText = normalizeComparableText(item.region?.innerText || item.region?.textContent || '');
+      const identityElement = declaredIdentityElement(item.region);
+      const identityText = normalizeComparableText(
+        identityElement?.innerText || identityElement?.textContent || '',
+      );
+      return {
+        item,
+        freshIdentity,
+        freshResponse,
+        userEcho,
+        afterFreshUser,
+        promptPrefix,
+        requestedLength: requestedReply.length,
+        domLength: domText.length,
+        identityLength: identityText.length,
+        domContainsRequested: !!requestedReply && domText.includes(requestedReply),
+        identityContainsRequested: !!requestedReply && identityText.includes(requestedReply),
+        eligible: freshResponse && !userEcho && !promptPrefix && afterFreshUser,
+      };
+    });
+    if (userMessage && (Date.now() % 5 === 0)) {
+      emitPageTrace('recorded_response_candidate_evaluated', {
+        candidateCount: evaluatedCandidates.length,
+        candidates: evaluatedCandidates.map(candidate => ({
+          key: candidate.item.key,
+          textLength: String(candidate.item.text || '').length,
+          role: candidate.item.role,
+          projectionCount: candidate.item.projectionCount,
+          selectedIndex: candidate.item.selectedIndex,
+          selectedSpecificity: candidate.item.selectedSpecificity,
+          selectedDepth: candidate.item.selectedDepth,
+          connected: candidate.item.connected,
+          visible: candidate.item.visible,
+          freshIdentity: candidate.freshIdentity,
+          freshResponse: candidate.freshResponse,
+          userEcho: candidate.userEcho,
+          afterFreshUser: candidate.afterFreshUser,
+          promptPrefix: candidate.promptPrefix,
+          requestedLength: candidate.requestedLength,
+          domLength: candidate.domLength,
+          identityLength: candidate.identityLength,
+          domContainsRequested: candidate.domContainsRequested,
+          identityContainsRequested: candidate.identityContainsRequested,
+          eligible: candidate.eligible,
+        })),
+      });
+    }
+    const freshAssistant = evaluatedCandidates
+      .filter(candidate => candidate.eligible)
+      .map(candidate => candidate.item);
     // A pre-send key is not sufficient evidence of a stale response when a
     // page reuses a logical node. Freshness is the key+text contract above.
     if (beforeKeys.size && !freshAssistant.length) return null;
@@ -2495,7 +3028,14 @@
     const orderedPool = assistantPool.length ? assistantPool : pool;
     const chosen = orderedPool[orderedPool.length - 1] || null;
     if (!chosen) return null;
-    return { key: chosen.key, text: chosen.text, streaming: chosen.streaming, role: chosen.role, region: chosen.region };
+    return {
+      key: chosen.key,
+      text: chosen.text,
+      streaming: chosen.streaming,
+      role: chosen.role,
+      region: chosen.region,
+      activityToken: recordedResponseActivityToken(chosen),
+    };
   }
 
   function recordedResponseIdentityGap() {
@@ -2518,181 +3058,6 @@
       identityAttributes: Array.isArray(identity.attributes) ? identity.attributes.slice() : [],
       identityPath: String(identity.path || ''),
     };
-  }
-
-  function findDirectCandidate(userMessage, beforeKeys, responseAnchorBefore = null) {
-    const recorded = recordedResponseSnapshot(userMessage, beforeKeys);
-    // The recorded response region narrows the candidate set, but must prove
-    // that this request produced a new identity or changed text.
-    if (recorded?.text && responseAnchorBefore) {
-      const beforeKey = responseAnchorBefore.key || '';
-      const beforeText = responseAnchorBefore.text || '';
-      const isFresh = recorded.key !== beforeKey || !sameUserMessage(recorded.text, beforeText);
-      if (isFresh && !sameUserMessage(recorded.text, userMessage)) return recorded;
-    }
-    const anchor = responseContract() ? recordedResponseRegion() : null;
-    const currentAnchorKey = anchor ? messageIdentity(anchor) : '';
-    const anchorKey = responseAnchorBefore?.key || currentAnchorKey;
-    const nodes = logicalMessageSnapshot();
-    const fresh = nodes.filter(n => {
-      if (!beforeKeys.has(n.key)) return true;
-      if (!anchorKey || n.key !== anchorKey || !responseAnchorBefore) return false;
-      return !sameUserMessage(n.text, responseAnchorBefore.text || '');
-    });
-    const pool = anchorKey
-      ? fresh.sort((a, b) => (a.key === anchorKey ? 1 : 0) - (b.key === anchorKey ? 1 : 0))
-      : fresh;
-    const user = userMessage.trim();
-    const assistantFresh = pool.map(n => ({ ...n, text: Universal?.responseText ? Universal.responseText(n.text) : n.text }))
-        .filter(n => n.text && !sameUserMessage(n.text, user) && n.role !== 'user');
-    if (assistantFresh.length) return assistantFresh[assistantFresh.length - 1];
-    // Some sites expose response rows without a stable role attribute. When
-    // the pre-send snapshot was empty, the newest non-user logical node is
-    // still strong evidence of the answer and must be returned to the API.
-    if (!beforeKeys.size) {
-      const unclassified = pool.map(n => ({ ...n, text: Universal?.responseText ? Universal.responseText(n.text) : n.text }))
-        .filter(n => n.text && !sameUserMessage(n.text, user) && !Universal?.isStatusLine?.(n.text));
-      if (unclassified.length) return unclassified[unclassified.length - 1];
-    }
-    const fallbackCandidates = pool.map(n => ({ ...n, text: Universal?.responseText ? Universal.responseText(n.text) : n.text }))
-      .filter(n => n.text && !sameUserMessage(n.text, user));
-    if (fallbackCandidates.length) return fallbackCandidates[fallbackCandidates.length - 1];
-    const userIndex = pool.findIndex(n => sameUserMessage(n.text, user));
-    if (userIndex >= 0) {
-      const after = pool.slice(userIndex + 1).map(n => ({ ...n, text: Universal?.responseText ? Universal.responseText(n.text) : n.text }))
-        .filter(n => n.text && !sameUserMessage(n.text, user));
-      if (after.length) return after[after.length - 1];
-    }
-    return null;
-  }
-
-  async function waitForDirectResponse(userMessage, beforeKeys, timeout, responseAnchorBefore = null, conversationId = '', tabId = null) {
-    const started = Date.now();
-    let lastKey = '';
-    let lastText = '';
-    let stable = 0;
-    let lastDebug = 0;
-    let bestResult = null; // 流式过程中最长文本
-    let universalTracker = Universal ? Universal.createResponseTracker() : null;
-    let lastHeartbeat = 0;
-    emitPageTrace('direct_response_wait_started', { userMessageLength: String(userMessage || '').length, beforeKeysCount: beforeKeys?.size || 0, timeout });
-    const directStarted = Date.now();
-    while (Date.now() - directStarted < timeout) {
-      throwIfCaptureCancelled();
-      const latestIsFresh = !!latestObservedResponse?.key && !beforeKeys.has(latestObservedResponse.key)
-        && (!responseAnchorBefore || latestObservedResponse.key !== responseAnchorBefore.key);
-      let candidate = latestIsFresh && latestObservedResponse.text && !sameUserMessage(latestObservedResponse.text, userMessage)
-        ? { key: latestObservedResponse.key, text: latestObservedResponse.text, streaming: latestObservedResponse.streaming }
-        : findDirectCandidate(userMessage, beforeKeys, responseAnchorBefore);
-      if (!candidate) {
-        // Use the same innerText-based node reader as response_monitor. Some
-        // virtualized providers expose the assistant row to that reader before
-        // their data-* attributes become visible to logicalMessageSnapshot.
-        const visibleNodes = getMessageNodes();
-        const visibleCandidates = visibleNodes
-          .map((el) => ({
-            key: messageNodeKey(el),
-            element: el,
-            text: Universal?.responseText ? Universal.responseText((el.innerText || el.textContent || '').trim()) : (el.innerText || el.textContent || '').trim(),
-            role: messageRole(el),
-            streaming: messageIsStreaming(el)
-          }))
-          .filter((n) => n.text && !sameUserMessage(n.text, userMessage) && !beforeKeys.has(n.key)
-            && (!responseAnchorBefore || n.key !== responseAnchorBefore.key));
-        if (visibleCandidates.length) candidate = visibleCandidates[visibleCandidates.length - 1];
-      }
-      if (!candidate) {
-        const probeNodes = logicalMessageSnapshot();
-        if (probeNodes.length) {
-          reportPageEvent('response_probe', {
-            beforeKeys: Array.from(beforeKeys),
-            nodes: probeNodes.map(debugNode),
-            responseSelector: responseSelectorSet().join(',')
-          });
-        }
-        // DOM-snapshot fallback for pages whose message role attributes are
-        // absent or whose virtualized row changes identity while streaming.
-        const fallback = logicalMessageSnapshot()
-          .map(n => ({ ...n, text: Universal?.responseText ? Universal.responseText(n.text) : n.text }))
-          .filter(n => n.text && !sameUserMessage(n.text, userMessage) && !beforeKeys.has(n.key))
-          .filter(n => !Universal?.isStatusLine?.(n.text));
-        if (fallback.length) candidate = fallback[fallback.length - 1];
-      }
-      if (candidate) {
-        let cleanedCandidateText = Universal?.responseText ? Universal.responseText(candidate.text) : candidate.text;
-        if (!cleanedCandidateText || sameUserMessage(cleanedCandidateText, userMessage)) {
-          const visibleFallback = getMessageNodes()
-            .map((el) => ({
-              key: messageNodeKey(el),
-              element: el,
-              text: Universal?.responseText ? Universal.responseText((el.innerText || el.textContent || '').trim()) : (el.innerText || el.textContent || '').trim(),
-              role: messageRole(el),
-              streaming: messageIsStreaming(el)
-            }))
-            .filter((n) => n.text && !sameUserMessage(n.text, userMessage) && !beforeKeys.has(n.key)
-              && (!responseAnchorBefore || n.key !== responseAnchorBefore.key));
-          const fallback = visibleFallback.length ? visibleFallback : logicalMessageSnapshot()
-            .map(n => ({ ...n, text: Universal?.responseText ? Universal.responseText(n.text) : n.text }))
-            .filter(n => n.text && !sameUserMessage(n.text, userMessage) && !beforeKeys.has(n.key));
-          if (fallback.length) {
-            candidate = fallback[fallback.length - 1];
-            cleanedCandidateText = candidate.text;
-          } else {
-            await sleep(150);
-            continue;
-          }
-        }
-        candidate = { ...candidate, text: cleanedCandidateText };
-        const textContinues = lastText && (cleanedCandidateText.startsWith(lastText) || lastText.startsWith(cleanedCandidateText));
-        const candidateChanged = candidate.key !== lastKey || cleanedCandidateText !== lastText;
-        if ((candidate.key === lastKey || textContinues) && cleanedCandidateText === lastText) stable++;
-        else if (textContinues) { lastKey = candidate.key || lastKey; lastText = cleanedCandidateText; stable += 1; }
-        else { lastKey = candidate.key; lastText = cleanedCandidateText; stable = 1; }
-        if (Universal) {
-          universalTracker.userText = userMessage;
-          universalTracker = Universal.observeResponse(universalTracker, candidate);
-        }
-        if (candidateChanged && currentCaptureJobId) {
-          chrome.runtime.sendMessage({
-            type: 'capture_delta',
-            page_session_id: pageSessionId,
-            job_id: currentCaptureJobId,
-            claim_token: claimToken,
-            conversation_id: conversationId,
-            tab_id: tabId,
-            key: candidate.key,
-            text: candidate.text,
-            streaming: !!candidate.streaming,
-            completion_reason: candidate.streaming ? '' : 'region_snapshot'
-          }).catch(() => {});
-        }
-        if (Date.now() - lastDebug > 250) {
-          reportPageEvent('response_candidate', { ...debugNode(candidate), stable, streaming: candidate.streaming });
-          lastDebug = Date.now();
-        }
-        // 始终记录最长候选文本，供流式超时时返回
-        if (candidate.text && candidate.text.length > (bestResult?.text?.length || 0)) {
-          bestResult = { key: candidate.key, text: candidate.text, streaming: candidate.streaming };
-        }
-        // 文本不再增长且流式已停止 → 稳定结束
-        if (stable >= 3 && !candidate.streaming && !sameUserMessage(candidate.text, userMessage)) {
-          emitPageTrace('direct_response_wait_ended', { elapsed: Date.now() - started, result: { textLen: candidate.text.length, key: candidate.key, streaming: !!candidate.streaming }, completion_reason: 'stable_snapshot' });
-          return { key: candidate.key, text: candidate.text, completion_reason: 'stable_snapshot' };
-        }
-      }
-      if (Date.now() - lastHeartbeat >= 5000) {
-        lastHeartbeat = Date.now();
-          emitPageTrace('direct_response_wait_heartbeat', { elapsed: lastHeartbeat - started, candidateFound: !!candidate, bestTextLen: bestResult?.text?.length || 0, stable, latestObservedTextLength: latestObservedResponse?.text?.length || 0, latestObservedKey: latestObservedResponse?.key || '' });
-      }
-      await sleep(150);
-    }
-    // 超时了但可能有流式结果 → 返回最长的非用户消息
-    if (bestResult && !sameUserMessage(bestResult.text, userMessage)) {
-      emitPageTrace('direct_response_wait_ended', { elapsed: Date.now() - started, result: { textLen: bestResult.text.length, key: bestResult.key, streaming: !!bestResult.streaming }, completion_reason: 'idle_timeout' });
-      return { ...bestResult, completion_reason: 'idle_timeout' };
-    }
-    emitPageTrace('direct_response_wait_ended', { elapsed: Date.now() - started, result: null, completion_reason: 'no_content_timeout' });
-    return null;
   }
 
   function findElement(sel, role = null) {
@@ -2772,7 +3137,7 @@
 
   function stableIdentityElement(element) {
     const stableIdentityAttributes = ['data-message-id', 'data-lid', 'data-observe-row', 'data-virtual-list-item-key', 'data-row-key', 'data-id', 'data-key'];
-    const genericIdentityExcluded = /(?:^|[-_:])(app|root|role|status|state|streaming|loading|busy|typing|generating|thinking|processing|pending|complete|completed|finished|active|current|selected|disabled|expanded|pressed|checked|open|closed|visible|hidden|focus|hover|animation|transition|test|qa|click|show|hide|base|share|delete|session|query|conversation|chat|content|text|html|style|log|rank|index|position|order|offset|page|count|sort|spm|track|trace|analytics|telemetry|event|anchor|source|panel|layout|container|wrapper|scroll|flow|history|header|footer|aside|nav|toolbar|viewport|main|body|input|tool|login)(?:[-_:]|$)/i;
+    const genericIdentityExcluded = /(?:^|[-_:])(app|root|role|status|state|streaming|loading|busy|typing|generating|thinking|processing|pending|complete|completed|finished|active|current|selected|disabled|expanded|pressed|checked|open|closed|visible|hidden|focus|hover|animation|transition|test|qa|click|show|hide|base|share|delete|session|query|conversation|chat|content|text|html|style|log|rank|index|position|order|offset|page|count|sort|spm|track|trace|analytics|telemetry|event|anchor|source|exposure|exposed|exposured|impression|intersection|observer|panel|layout|container|wrapper|scroll|flow|history|header|footer|aside|nav|toolbar|viewport|main|body|input|tool|login)(?:[-_:]|$)/i;
     const volatilePlainId = (value) => {
       const normalized = String(value || '').trim();
       if (!normalized || /^\d{1,4}$/.test(normalized)) return true;
@@ -2867,12 +3232,13 @@
       ? recordedProjectionElements(responseSelector).indexOf(responseElement)
       : -1;
     if (structuralIdentity && projectionIndex < 0) return null;
-    const containerSelector = !structuralIdentity && identity.element !== responseElement
+    const containerSelector = !structuralIdentity
       // Never persist the recorded identity value as the scope selector. The
       // value is expected to change for every new assistant message; it is
-      // used only by messageIdentity() to prove freshness. The scope must be
-      // structural so replay can discover the next message on a new page.
-      ? generateStableContainerSelector(identity.element)
+      // used only by messageIdentity() to prove freshness. The reusable scope
+      // may therefore describe stable structure or safe data-* attribute
+      // presence, but never the recorded message's concrete identity value.
+      ? generateStableContainerSelector(identity.element, identity.attributes)
       : null;
     const inputEl = selectorText(selectors.input) ? findElement(normalizeRecordedSelector(selectors.input), 'input') : null;
     const inputKind = inputEl?.matches?.('[contenteditable="true"]') ? 'contenteditable' : 'textarea';
@@ -3251,45 +3617,27 @@
   async function waitForFreshAssistantResponse(userMessage, beforeKeys, timeout = 90000, responseAnchorBefore = null, captureContext = {}) {
     const started = Date.now();
     let best = null;
-    let lastSignature = '';
-    let stable = 0;
     let pendingIdentityGap = null;
     let lastIdentityPendingTraceAt = 0;
-    let generationSignalSeen = false;
+    let lastCompletionTraceAt = 0;
+    let lastCompletionTraceSignature = '';
     let responseIdentityState = ResponseObservation
       ? ResponseObservation.createIdentityState()
       : { key: '', observations: 0, qualified: false };
-    const generationStateBefore = captureContext?.generationStateBefore || {};
-    const observeSignature = (signature, snapshot) => {
-      const changed = signature !== lastSignature;
-      if (changed) {
-        lastSignature = signature;
-        stable = 1;
-      } else {
-        stable += 1;
-      }
-      if (snapshot?.streaming && (
-        snapshot.activity?.marker || !generationStateBefore.marker || !generationStateBefore.control
-      )) generationSignalSeen = true;
-      return changed;
-    };
+    let responseCompletionState = ResponseObservation?.createCompletionState
+      ? ResponseObservation.createCompletionState()
+      : null;
     const withActivityState = (snapshot) => {
       if (!snapshot) return null;
-      const activity = responseActivityState(snapshot.region);
+      const activity = responseActivityState(snapshot.region, captureContext.generationStateBefore);
       return { ...snapshot, streaming: activity.streaming, activity };
     };
-    const completionReason = (snapshot) => snapshot?.activity?.explicitlySettled
-      ? 'recorded_activity_settled'
-      : (generationSignalSeen ? 'page_activity_stopped' : 'stable_response_snapshot');
     const responseWake = createRecordedResponseWake();
     try {
     while (Date.now() - started < timeout) {
       throwIfCaptureCancelled();
       const identityGap = recordedResponseIdentityGap();
       if (identityGap) {
-        responseIdentityState = ResponseObservation
-          ? ResponseObservation.createIdentityState()
-          : { key: '', observations: 0, qualified: false };
         pendingIdentityGap = identityGap;
         if (Date.now() - lastIdentityPendingTraceAt >= 1000) {
           lastIdentityPendingTraceAt = Date.now();
@@ -3309,9 +3657,15 @@
       const isPromptPrefix = isStrictPromptReplyPrefix(snapshot?.text || '', userMessage);
       if (snapshot?.key && snapshot.text && !likelyUserEcho(snapshot.text, userMessage, snapshot.role) && !isPromptPrefix &&
           (!beforeKeys.has(snapshot.key) || responseChangedSinceBefore(snapshot.key, snapshot.text, snapshot.region))) {
+        const observedAt = Date.now();
+        const requestStreamingSeen = responseCompletionState?.streamingSeen === true || snapshot.streaming === true;
+        const requestActivity = {
+          ...snapshot.activity,
+          streamingSeen: requestStreamingSeen,
+        };
         const identityMinimum = ResponseObservation?.identityQualificationMinimum
-          ? ResponseObservation.identityQualificationMinimum(snapshot.activity)
-          : (snapshot.activity?.explicitlySettled ? 1 : 3);
+          ? ResponseObservation.identityQualificationMinimum(requestActivity)
+          : (requestActivity.explicitlySettled && requestActivity.streamingSeen ? 1 : 3);
         const identityObservation = ResponseObservation
           ? ResponseObservation.observeIdentity(responseIdentityState, snapshot.key, identityMinimum)
           : {
@@ -3320,27 +3674,78 @@
               becameQualified: true,
             };
         responseIdentityState = identityObservation.state;
-        const signature = `${snapshot.key}:${snapshot.text}`;
-        const snapshotChanged = observeSignature(signature, snapshot);
-        if (identityObservation.qualified && (snapshotChanged || identityObservation.becameQualified)) {
+        const completionObservation = ResponseObservation?.observeCompletion
+          ? ResponseObservation.observeCompletion(responseCompletionState, {
+              key: snapshot.key,
+              text: snapshot.text,
+              identityQualified: identityObservation.qualified,
+              streaming: snapshot.streaming,
+              explicitlySettled: requestActivity.explicitlySettled,
+              streamingSeen: requestActivity.streamingSeen,
+              activityToken: snapshot.activityToken,
+            }, observedAt)
+          : {
+              state: responseCompletionState,
+              complete: identityObservation.qualified && snapshot.activity?.explicitlySettled && !snapshot.streaming,
+              changed: identityObservation.becameQualified,
+              reason: 'recorded_activity_settled',
+            };
+        responseCompletionState = completionObservation.state;
+        const completionTraceSignature = JSON.stringify({
+          key: snapshot.key,
+          textLength: snapshot.text.length,
+          identityObservations: identityObservation.state.observations,
+          identityQualified: identityObservation.qualified,
+          streaming: snapshot.streaming,
+          marker: requestActivity.marker,
+          control: requestActivity.control,
+          explicitlySettled: requestActivity.explicitlySettled,
+          streamingSeen: completionObservation.state?.streamingSeen === true,
+          complete: completionObservation.complete,
+          reason: completionObservation.reason,
+          projectionRegressed: completionObservation.projectionRegressed === true,
+          discontinuous: completionObservation.state?.discontinuous === true,
+        });
+        if (completionTraceSignature !== lastCompletionTraceSignature || observedAt - lastCompletionTraceAt >= 1000) {
+          lastCompletionTraceSignature = completionTraceSignature;
+          lastCompletionTraceAt = observedAt;
+          emitPageTrace('recorded_response_completion_state', {
+            key: snapshot.key,
+            textLength: snapshot.text.length,
+            elapsed: observedAt - started,
+            identityObservations: identityObservation.state.observations,
+            identityMinimum,
+            identityQualified: identityObservation.qualified,
+            streaming: snapshot.streaming,
+            marker: !!requestActivity.marker,
+            control: !!requestActivity.control,
+            explicitlySettled: !!requestActivity.explicitlySettled,
+            streamingSeen: completionObservation.state?.streamingSeen === true,
+            textQuietMs: Math.max(0, observedAt - Number(completionObservation.state?.lastTextChangeAt || observedAt)),
+            activityQuietMs: Math.max(0, observedAt - Number(completionObservation.state?.lastActivityChangeAt || observedAt)),
+            complete: completionObservation.complete,
+            projectionRegressed: completionObservation.projectionRegressed === true,
+            discontinuous: completionObservation.state?.discontinuous === true,
+            retainedTextLength: String(completionObservation.state?.text || '').length,
+            completion_reason: completionObservation.reason,
+          });
+        }
+        if (completionObservation.projectionRegressed) {
+          await responseWake.wait(250);
+          continue;
+        }
+        if (identityObservation.qualified && (completionObservation.changed || identityObservation.becameQualified)) {
           relayCaptureSnapshot(snapshot, captureContext);
         }
         if (identityObservation.qualified) best = snapshot;
-        // Completion is based on the page activity boundary and repeated
-        // identity-checked snapshots, never on a model-duration or a fixed
-        // silence timer. A page without an exposed activity signal can still
-        // complete after its fresh DOM projection stops changing.
-        if (identityObservation.qualified && (snapshot.activity?.explicitlySettled || stable >= 3) && !snapshot.streaming && snapshot.text.length >= 1) {
-          const reason = completionReason(snapshot);
+        if (completionObservation.complete && snapshot.text.length >= 1) {
+          const reason = completionObservation.reason;
           emitPageTrace('fresh_response_complete', { key: snapshot.key, textLength: snapshot.text.length, completion_reason: reason });
           return { ...snapshot, completion_reason: reason };
         }
         await responseWake.wait(250);
         continue;
       }
-      responseIdentityState = ResponseObservation
-        ? ResponseObservation.createIdentityState()
-        : { key: '', observations: 0, qualified: false };
       if (Date.now() - started < timeout) {
         const elapsed = Date.now() - started;
         if (elapsed === 0 || Math.floor(elapsed / 5000) !== Math.floor((elapsed - 200) / 5000)) {
@@ -3749,7 +4154,7 @@
         break;
 
       case 'get_selectors':
-        sendResponse({ selectors });
+        sendResponse({ selectors, selector_capture_status: selectorCaptureStatus });
         break;
 
           case 'set_selectors':
@@ -3797,7 +4202,7 @@
         break;
 
       case 'ping':
-        sendResponse({ pong: true, content_script_version: CONTENT_SCRIPT_VERSION });
+        sendResponse({ pong: true, page_session_id: pageSessionId, content_script_version: CONTENT_SCRIPT_VERSION });
         break;
 
       case 'discover_selectors':
@@ -3808,12 +4213,24 @@
         const timeout = Math.min(120000, Math.max(1000, Number(msg.timeout) || 30000));
         (async () => {
           const started = Date.now();
-          const profileHealth = runProfileHealthCheck(activeProfile, { allowMissingResponse: true, requireRecordedIdentity: true });
-          if (profileHealth.state === 'invalid') {
+          // DOM-backed health is eventually consistent: SPA pages can load the
+          // recorded profile before the composer exists. Validate the static
+          // profile contract immediately, then let the bounded readiness loop
+          // wait for live elements instead of turning a render race into a
+          // permanent profile_input_unavailable state.
+          const profileHealth = activeProfile
+            ? runProfileHealthCheck(activeProfile, {
+              allowMissingResponse: true,
+              requireRecordedIdentity: true,
+              document: null,
+            })
+            : null;
+          if (profileHealth?.state === 'invalid') {
             sendResponse({
               ready: false,
               input_ready: profileHealth.checks.input === 'pass',
               send_ready: profileHealth.checks.send === 'pass',
+              content_script_version: CONTENT_SCRIPT_VERSION,
               profile_health: profileHealth,
               reason_codes: profileHealth.reason_codes,
               waited_ms: 0
@@ -3821,29 +4238,56 @@
             return;
           }
           let inputEl = null;
+          let inputReady = false;
           let sendReady = false;
+          let liveHealth = null;
           while (Date.now() - started < timeout) {
             // The selector init is async (fetch from API). Wait until the
             // input selector is populated before testing readiness.
             if (!selectorText(selectors.input)) {
               await sleep(200); continue;
             }
-            inputEl = await waitForElement(selectorDescriptor(selectors.input), 250, 'input');
+            inputEl = await waitForInteractableRecordedInput(
+              selectorDescriptor(selectors.input),
+              inputEl,
+              250,
+            );
             const recordedButtonSelector = selectors.send && typeof selectors.send === 'object' && selectors.send.selector
               ? selectorText(selectors.send.selector)
               : (typeof selectors.send === 'string' ? selectorText(selectors.send) : '');
-            const inputReady = !!inputEl && !!inputEl.getClientRects().length;
+            inputReady = !!inputEl;
             // A recorded button or explicit keyboard strategy both satisfy the
             // readiness contract; replay chooses the exact strategy later.
             sendReady = inputReady;
             if (inputReady && sendReady) {
+              liveHealth = activeProfile
+                ? runProfileHealthCheck(activeProfile, {
+                  allowMissingResponse: true,
+                  requireRecordedIdentity: true,
+                })
+                : null;
+              if (liveHealth?.state === 'invalid') {
+                await sleep(100);
+                continue;
+              }
               reportPageEvent('recorded_elements_ready', { content_script_version: CONTENT_SCRIPT_VERSION, waitedMs: Date.now() - started, input: selectorText(selectors.input), send: recordedButtonSelector || null, sendKind: selectors.send?.kind || (recordedButtonSelector ? 'button' : 'enter') });
-              sendResponse({ ready: true, input_ready: true, send_ready: true, waited_ms: Date.now() - started });
+              sendResponse({ ready: true, input_ready: true, send_ready: true, content_script_version: CONTENT_SCRIPT_VERSION, waited_ms: Date.now() - started });
               return;
             }
-            await sleep(100);
+              await sleep(100);
           }
-          sendResponse({ ready: false, input_ready: !!inputEl, send_ready: sendReady, waited_ms: Date.now() - started });
+          const finalHealth = liveHealth || (activeProfile
+            ? runProfileHealthCheck(activeProfile, { allowMissingResponse: true, requireRecordedIdentity: true })
+            : null);
+          sendResponse({
+            ready: false,
+            input_ready: inputReady,
+            send_ready: sendReady,
+            content_script_version: CONTENT_SCRIPT_VERSION,
+            profile_health: finalHealth,
+            reason_codes: finalHealth?.reason_codes || [],
+            waited_ms: Date.now() - started,
+          });
         })();
         return true;
       }
@@ -3858,9 +4302,17 @@
       case 'auto_capture': {
         startResponseMonitor();
         relayClientId = String(msg.client_id || relayClientId || '');
-        Promise.resolve()
+        const capturePromise = Promise.resolve()
           .then(() => autoCapture(msg.message, msg.job_id || '', msg.conversation_id || '', msg.tab_id, msg.claim_token || '', !!msg.allow_tool_calls, Number(msg.capture_timeout_ms) || 240000))
-          .then(async (result) => {
+        // The production action is deliberately one-way: the browser result is
+        // relayed independently of the runtime message acknowledgement. The
+        // handle is exposed only to the repository's isolated DOM harness so it
+        // can await the same capture completion without changing production
+        // messaging semantics.
+        if (window.__phantomRelayDomTest && typeof window.__phantomRelayDomTest === 'object') {
+          window.__phantomRelayDomTest.capturePromise = capturePromise;
+        }
+        capturePromise.then(async (result) => {
             // A failed capture must settle the claimed job immediately. Leaving
             // it claimed turns a local send failure into an opaque API timeout.
             if (result?.error && msg.job_id) {
@@ -3931,6 +4383,68 @@
     return true;
   }
 
+  const RUNTIME_RELOAD_MARKER = 'data-phantom-relay-runtime-reload';
+  const RUNTIME_RELOAD_THROTTLE_MS = 30000;
+
+  async function recoverRuntimeVersionMismatch(response) {
+    if (response?.error !== 'content_script_version_mismatch') return false;
+    stopReadyLease();
+    const requestedAt = Date.now();
+    try {
+      const previous = root?.getAttribute(RUNTIME_RELOAD_MARKER) || '';
+      const [previousVersion, previousRequestedAt] = previous.split(':');
+      if (previousVersion === CONTENT_SCRIPT_VERSION
+          && requestedAt - Number(previousRequestedAt || 0) < RUNTIME_RELOAD_THROTTLE_MS) {
+        emitPageTrace('runtime_reload_suppressed', {
+          reason: 'reload_throttled',
+          content_script_version: CONTENT_SCRIPT_VERSION,
+        });
+        return false;
+      }
+      if (!root) throw new Error('document_root_unavailable');
+          root?.setAttribute(RUNTIME_RELOAD_MARKER, `${CONTENT_SCRIPT_VERSION}:${requestedAt}`);
+      emitPageTrace('runtime_reload_requested', {
+        reason: 'content_script_version_mismatch',
+        content_script_version: CONTENT_SCRIPT_VERSION,
+      });
+      await new Promise((resolve) => {
+        let settled = false;
+        const finish = () => {
+          if (settled) return;
+          settled = true;
+          resolve();
+        };
+        try {
+          chrome.runtime.sendMessage({
+            type: 'reload_extension_runtime',
+            reason: 'content_script_version_mismatch',
+            content_script_version: CONTENT_SCRIPT_VERSION,
+          }, (value) => {
+            const runtimeError = chrome.runtime.lastError?.message || '';
+            if (runtimeError || value?.ok === false || value?.error) {
+              emitPageTrace('runtime_reload_failed', {
+                error: runtimeError || value?.error || 'runtime_reload_rejected',
+              });
+            }
+            finish();
+          });
+          setTimeout(finish, 1500);
+        } catch (error) {
+          emitPageTrace('runtime_reload_failed', {
+            error: error?.message || String(error),
+          });
+          finish();
+        }
+      });
+      return true;
+    } catch (error) {
+      emitPageTrace('runtime_reload_failed', {
+        error: error?.message || String(error),
+      });
+      return false;
+    }
+  }
+
       async function requestReadyLease() {
         touchInstanceHeartbeat();
         if (readyLeaseInFlight || !isCurrentGeneration()) return;
@@ -3940,8 +4454,12 @@
         let settled = false;
         const finish = () => { if (!settled) { settled = true; resolve(); } };
         try {
-          chrome.runtime.sendMessage({ type: 'page_ready', page_session_id: pageSessionId }, (value) => {
+          chrome.runtime.sendMessage({ type: 'page_ready', page_session_id: pageSessionId, content_script_version: CONTENT_SCRIPT_VERSION }, (value) => {
             void chrome.runtime.lastError;
+            if (value?.error === 'content_script_version_mismatch') {
+              recoverRuntimeVersionMismatch(value).finally(finish);
+              return;
+            }
             if (value?.suppressed === 'older_same_domain_tab' && readyLeaseIntervalId) {
               clearInterval(readyLeaseIntervalId);
               readyLeaseIntervalId = null;

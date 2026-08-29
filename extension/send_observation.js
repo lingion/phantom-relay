@@ -16,7 +16,9 @@
     if (observation.generationStarted) return { observed: true, reason: 'generation_started' };
     const inputBefore = text(observation.inputBefore);
     const inputAfter = text(observation.inputAfter);
-    if (inputBefore && !inputAfter) return { observed: true, reason: 'input_consumed' };
+    if (inputBefore && !inputAfter) {
+      return { observed: false, weak: true, reason: 'input_consumed_only' };
+    }
     return { observed: false, reason: 'no_effect' };
   }
 

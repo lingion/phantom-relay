@@ -110,6 +110,21 @@
     };
   }
 
+  function reconcileProfileInputSelector(profile, input, profileContract = root?.PhantomRelayProfile) {
+    if (!profile || !profileContract?.normalizeProfile || !profileContract?.withInputSelector) {
+      throw new Error('profile_reconciliation_contract_unavailable');
+    }
+    const normalizedProfile = profileContract.normalizeProfile(profile);
+    const normalizedInput = normalizeSelector(input);
+    if (!normalizedInput) throw new Error('input_selector_invalid');
+    const changed = selectorFingerprint(normalizedProfile.input?.selector) !== selectorFingerprint(normalizedInput);
+    return {
+      changed,
+      input: normalizedInput,
+      profile: changed ? profileContract.withInputSelector(normalizedProfile, normalizedInput) : normalizedProfile,
+    };
+  }
+
   function mergeReconciledSelectorBundle(incoming, result, profile) {
     const bundle = {
       ...(incoming || {}),
@@ -143,6 +158,7 @@
     selectorFingerprint,
     reconcileProfileSelectors,
     reconcileProfileSendStrategy,
+    reconcileProfileInputSelector,
     mergeReconciledSelectorBundle,
     projectProfileSelectorBundle,
   };

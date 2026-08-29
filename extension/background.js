@@ -5,6 +5,7 @@
 
 importScripts('backend_config.js');
 importScripts('route_target.js');
+importScripts('startup_storage.js');
 importScripts('profile_contract.js');
 importScripts('profile_selector_reconciliation.js');
 importScripts('profile_lifecycle.js');
@@ -13,8 +14,8 @@ importScripts('profile_sync.js');
 importScripts('profile_recovery.js');
 importScripts('claim_recovery.js');
 
-const CONTENT_SCRIPT_VERSION = '2026-08-11.06';
-globalThis.__phantomRelayBackgroundVersion = '2026-08-11.10-content-ready-inventory';
+const CONTENT_SCRIPT_VERSION = '2026-08-20.09';
+globalThis.__phantomRelayBackgroundVersion = '2026-08-20.09-heartbeat-business-ack';
 const BACKEND_CONFIG = globalThis.PhantomRelayBackendConfig;
 let LOCAL_API = BACKEND_CONFIG.DEFAULT_BACKEND_URL;
 const BROWSER_POLL_ALARM = 'phantom-relay-browser-poll';
@@ -41,8 +42,14 @@ let debugLogs = [];
 let modelRoutes = {};      // 用户录制后绑定：模型名 -> 官网 hostname
 let storageReadyResolve;
 const storageReady = new Promise(resolve => { storageReadyResolve = resolve; });
+let storageInitializationStage = 'critical_read_pending';
+let storageCriticalAvailable = false;
+let storageInitializationInFlight = null;
 let profileStore = { version: 1, profiles: {}, diagnostics: [], legacyHints: [] };
-let profileRecoveryPromise = Promise.resolve();
+let profileInitializationReadyResolve;
+const profileInitializationReady = new Promise(resolve => { profileInitializationReadyResolve = resolve; });
+let profileRecoveryInFlight = null;
+let profileRecoveryPromise = null;
 let browserClientId = '';
 const browserRuntimeSessionId = (() => {
   const randomPart = globalThis.crypto?.randomUUID?.() || `${Date.now()}-${Math.random().toString(16).slice(2)}`;
@@ -54,11 +61,13 @@ const readyTabIds = new Set();
   let lastRegistrationAt = 0;
   const CLIENT_REGISTRATION_INTERVAL_MS = 30000;
   let backendReconciliationCompleted = false;
+  let backendReconciliationInFlight = null;
   let profileRecoveryRetryInFlight = null;
   let lastProfileRecoveryRetryAt = 0;
   const PROFILE_RECOVERY_RETRY_INTERVAL_MS = 5000;
-  const contentScriptPreparationFlights = new Map();
+const contentScriptPreparationFlights = new Map();
 const bridgeWaitStates = new Map();
+const selectorCaptureTransactions = new Map();
 
 function bridgeWaitKey(jobId, domain) {
   return `${String(jobId || '')}:${String(domain || '').trim().toLowerCase()}`;
@@ -266,46 +275,108 @@ function acceptLiveContentScriptPing(ping, hostname = '') {
   const actualVersion = String(ping?.content_script_version || '').trim();
   if (ping?.pong !== true || !actualVersion) return false;
 
-  // A live page can outlive an MV3 worker restart or extension reload. The
-  // pong proves that the page runtime is present and speaking the protocol;
-  // a diagnostic version drift must not strand a queued job before readiness.
+  // A live page can outlive an MV3 worker restart or extension reload. A pong
+  // proves presence, but only the current protocol is eligible for execution.
   if (actualVersion !== CONTENT_SCRIPT_VERSION) {
     addDebugLog('content_script_version_drift', {
       expected: CONTENT_SCRIPT_VERSION,
       actual: actualVersion,
-      action: 'accept_live_handshake'
+      action: 'reject_stale_handshake'
     }, hostname);
+    return false;
   }
   return true;
 }
 
 // ── 持久化 ────────────────────────────────────────────────
-chrome.storage.local.get(['phantomBackendUrl', 'phantomBrowserClientId', 'phantomSelectors', 'phantomDomainState', 'phantomConversations', 'phantomDebugLogs', 'phantomModelRoutes'], async (data) => {
-  LOCAL_API = BACKEND_CONFIG.backendUrlOrDefault(data.phantomBackendUrl);
-  browserClientId = String(data.phantomBrowserClientId || '').trim();
-  if (!browserClientId) {
-    const randomPart = globalThis.crypto?.randomUUID?.() || `${Date.now()}-${Math.random().toString(16).slice(2)}`;
-    browserClientId = `client-${randomPart}`;
-    chrome.storage.local.set({ phantomBrowserClientId: browserClientId });
-  }
-  if (data.phantomSelectors) {
-    selectors = Object.fromEntries(Object.entries(data.phantomSelectors).map(([domain, value]) => {
-      const normalized = normalizeSelectors(value);
-      return [domain, { ...value, ...normalized }];
-    }));
-  }
-  if (data.phantomDomainState) domainState = data.phantomDomainState;
-  if (data.phantomConversations) conversations = data.phantomConversations;
-  if (data.phantomDebugLogs) debugLogs = data.phantomDebugLogs;
-  if (data.phantomModelRoutes) modelRoutes = data.phantomModelRoutes;
+function runPendingProfileRecoverySingleFlight() {
+  if (profileRecoveryInFlight) return profileRecoveryInFlight;
+  profileRecoveryInFlight = (async () => {
+    await profileInitializationReady;
+    if (!storageCriticalAvailable) {
+      return {
+        recovered: [],
+        failed: ['startup_storage_unavailable'],
+        skipped: true,
+      };
+    }
+    return recoverPendingProfiles();
+  })().catch(error => {
+    addDebugLog('profile_startup_recovery_failed', { error: error?.message || String(error) });
+    return {
+      recovered: [],
+      failed: ['profile_recovery_failed'],
+      error: error?.message || String(error),
+    };
+  }).finally(() => {
+    profileRecoveryInFlight = null;
+  });
+  profileRecoveryPromise = profileRecoveryInFlight;
+  return profileRecoveryInFlight;
+}
+
+async function initializeStorage() {
+  let data = {};
   try {
-    profileStore = await PhantomRelayProfileStore.loadProfileStore(chrome.storage.local);
+    storageInitializationStage = 'critical_read';
+    data = await PhantomRelayStartupStorage.loadCritical(chrome.storage.local);
+    storageInitializationStage = 'critical_apply';
+    LOCAL_API = BACKEND_CONFIG.backendUrlOrDefault(data.phantomBackendUrl);
+    browserClientId = String(data.phantomBrowserClientId || '').trim();
+    if (!browserClientId) {
+      const randomPart = globalThis.crypto?.randomUUID?.() || `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+      browserClientId = `client-${randomPart}`;
+      chrome.storage.local.set({ phantomBrowserClientId: browserClientId });
+    }
+    if (data.phantomSelectors) {
+      selectors = Object.fromEntries(Object.entries(data.phantomSelectors).map(([domain, value]) => {
+        const normalized = normalizeSelectors(value);
+        return [domain, { ...value, ...normalized }];
+      }));
+    }
+    if (data.phantomDomainState) domainState = data.phantomDomainState;
+    if (data.phantomModelRoutes) modelRoutes = data.phantomModelRoutes;
+    storageInitializationStage = 'profile_normalization';
+    profileStore = await PhantomRelayProfileStore.normalizeProfileStoreDocument(data.phantomProfiles);
     const migration = PhantomRelayProfileStore.migrateLegacySelectors(data.phantomSelectors || {});
     profileStore.legacyHints = migration.hints;
+    storageCriticalAvailable = true;
+    storageInitializationStage = 'ready';
   } catch (error) {
-    profileStore.diagnostics.push({ slot: 'store', code: error?.code || 'profile_store_load_failed', message: error?.message || String(error) });
+    storageInitializationStage = 'degraded';
+    profileStore.diagnostics.push({
+      slot: 'store',
+      code: error?.code || 'startup_storage_load_failed',
+      message: error?.message || String(error),
+    });
+    if (!browserClientId) {
+      const randomPart = globalThis.crypto?.randomUUID?.() || `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+      browserClientId = `client-${randomPart}`;
+    }
+  } finally {
+    storageReadyResolve();
   }
-  storageReadyResolve();
+
+  if (!storageCriticalAvailable) {
+    profileInitializationReadyResolve();
+    addDebugLog('startup_storage_degraded', {
+      stage: storageInitializationStage,
+      executionEnabled: false,
+    });
+    return;
+  }
+
+  setTimeout(() => {
+    PhantomRelayStartupStorage.loadOptional(chrome.storage.local).then(optional => {
+      if (Array.isArray(optional.phantomConversations)) conversations = optional.phantomConversations;
+      if (Array.isArray(optional.phantomDebugLogs)) debugLogs = optional.phantomDebugLogs.slice(-500);
+    }).catch(error => {
+      addDebugLog('startup_optional_storage_load_failed', {
+        error: error?.message || String(error),
+      });
+    });
+  }, 5000);
+
   await reconcileRestoredSendStrategies().catch(error => {
     addDebugLog('send_strategy_profile_startup_reconcile_failed', {
       code: error?.code || 'profile_reconcile_failed',
@@ -326,17 +397,77 @@ chrome.storage.local.get(['phantomBackendUrl', 'phantomBrowserClientId', 'phanto
       body: JSON.stringify({ domain, selectors: restored })
     }).catch(() => {});
   }
-  profileRecoveryPromise = recoverPendingProfiles().catch(error => {
-    addDebugLog('profile_startup_recovery_failed', { error: error?.message || String(error) });
-    return { recovered: [], failed: [], error: error?.message || String(error) };
+  profileInitializationReadyResolve();
+  profileRecoveryPromise = runPendingProfileRecoverySingleFlight();
+}
+
+function startStorageInitialization() {
+  if (storageInitializationInFlight) return storageInitializationInFlight;
+  storageInitializationInFlight = initializeStorage().catch(error => {
+    storageInitializationStage = 'failed';
+    storageReadyResolve();
+    addDebugLog('startup_storage_initialization_failed', { error: error?.message || String(error) });
+  }).finally(() => {
+    storageInitializationInFlight = null;
   });
-});
+  return storageInitializationInFlight;
+}
+
+profileRecoveryPromise = runPendingProfileRecoverySingleFlight();
+startStorageInitialization();
 
 function markTabReady(tabId, ready = true) {
   const numericTabId = Number(tabId);
   if (!Number.isFinite(numericTabId) || numericTabId < 0) return;
   if (ready) readyTabIds.add(numericTabId);
   else readyTabIds.delete(numericTabId);
+}
+
+async function readBrowserHeartbeatAcknowledgement(response) {
+  const payload = response?.ok
+    ? await response.json().catch(() => ({}))
+    : {};
+  const accepted = response?.ok === true
+    && payload?.ok === true
+    && payload?.ready !== false
+    && !payload?.ignored
+    && payload?.claim_valid !== false;
+  return { accepted, payload };
+}
+
+async function postBrowserHeartbeat(body) {
+  const retryStaleRuntime = body?.ready === true;
+  let runtimeRefreshAttempted = false;
+  for (let attempt = 0; attempt < (retryStaleRuntime ? 2 : 1); attempt++) {
+    const response = await fetch(`${LOCAL_API}/browser/heartbeat`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    const acknowledgement = await readBrowserHeartbeatAcknowledgement(response);
+    const ignored = String(acknowledgement.payload?.ignored || '');
+    if (acknowledgement.accepted || ignored !== 'stale_runtime_session' || attempt > 0) {
+      return { response, ...acknowledgement, runtimeRefreshAttempted };
+    }
+    runtimeRefreshAttempted = true;
+    addDebugLog('browser_heartbeat_runtime_refresh', {
+      domain: body?.domain || '',
+      tabId: body?.tab_id ?? null,
+      reason: ignored,
+      attempt: attempt + 1,
+    }, body?.domain || '');
+    await registerBrowserClient(true).catch(error => {
+      addDebugLog('browser_registration_refresh_failed', {
+        error: error?.message || String(error),
+        reason: ignored,
+      }, body?.domain || '');
+    });
+  }
+  return {
+    response: null,
+    accepted: false,
+    payload: { ignored: 'heartbeat_retry_exhausted' },
+    runtimeRefreshAttempted,
+  };
 }
 
 async function publishReadyHeartbeat(tab) {
@@ -348,26 +479,34 @@ async function publishReadyHeartbeat(tab) {
   const ready = readyOverride === true;
   const runtime = pageRuntime.get(Number(tab.id));
   try {
-    const response = await fetch(`${LOCAL_API}/browser/heartbeat`, {
-      method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        client_id: browserClientId,
-        runtime_session_id: browserRuntimeSessionId,
-        domain,
-        tab_id: Number(tab.id),
-        url: String(tab.url || ''),
-        source: 'content-ready',
-        transport: 'chrome-extension',
-        page_session_id: runtime?.pageSessionId || '',
-        conversation_id: '',
-        ready,
-        input_ready: ready,
-        send_ready: ready,
-        capabilities: { can_observe: ready, can_execute: ready, can_stream: true, can_create_tab: false, can_close_tab: false, can_snapshot: ready },
-        background_version: globalThis.__phantomRelayBackgroundVersion || ''
-      })
+    const heartbeat = await postBrowserHeartbeat({
+      client_id: browserClientId,
+      runtime_session_id: browserRuntimeSessionId,
+      domain,
+      tab_id: Number(tab.id),
+      url: String(tab.url || ''),
+      source: 'content-ready',
+      transport: 'chrome-extension',
+      page_session_id: runtime?.pageSessionId || '',
+      content_script_version: runtime?.contentScriptVersion || '',
+      conversation_id: '',
+      ready,
+      input_ready: ready,
+      send_ready: ready,
+      capabilities: { can_observe: ready, can_execute: ready, can_stream: true, can_create_tab: false, can_close_tab: false, can_snapshot: ready },
+      background_version: globalThis.__phantomRelayBackgroundVersion || ''
     });
-    if (!response.ok) return false;
+    if (!heartbeat.accepted) {
+      addDebugLog('browser_heartbeat_rejected', {
+        tabId: Number(tab.id),
+        responseStatus: Number(heartbeat.response?.status || 0),
+        ignored: String(heartbeat.payload?.ignored || ''),
+        ready: heartbeat.payload?.ready !== false,
+        claimValid: heartbeat.payload?.claim_valid,
+        runtimeRefreshAttempted: heartbeat.runtimeRefreshAttempted,
+      }, domain);
+      return false;
+    }
     markTabReady(tab.id, ready);
     return true;
   } catch (_) {
@@ -379,22 +518,27 @@ function tabRegistrationRecord(tab) {
   let domain = '';
   try { domain = new URL(tab?.url || '').hostname; } catch (_) {}
   const activeClaim = [...activeClaims.values()].find(claim => Number(claim?.tab_id) === Number(tab?.id));
-  const ready = !!activeClaim || readyTabIds.has(Number(tab?.id));
+  const activeClaimMatchesDomain = !!activeClaim
+    && globalThis.PhantomRelayClaimRecovery.claimMatchesTab(activeClaim, tab?.id, domain);
+  const runtime = pageRuntime.get(Number(tab?.id));
+  const ready = activeClaimMatchesDomain || readyTabIds.has(Number(tab?.id));
+  const currentRuntimeReady = runtime?.contentScriptVersion === CONTENT_SCRIPT_VERSION;
   return {
     tab_id: Number(tab?.id),
     url: String(tab?.url || ''),
     domain,
-    ready,
-    input_ready: ready,
-    send_ready: ready,
-    conversation_id: String(activeClaim?.conversation_id || ''),
+    ready: ready && currentRuntimeReady,
+    input_ready: ready && currentRuntimeReady,
+    send_ready: ready && currentRuntimeReady,
+    content_script_version: runtime?.contentScriptVersion || '',
+    conversation_id: String(activeClaimMatchesDomain ? activeClaim?.conversation_id || '' : ''),
     capabilities: {
-      can_execute: ready,
-      can_observe: ready,
+      can_execute: ready && currentRuntimeReady,
+      can_observe: ready && currentRuntimeReady,
       can_stream: true,
       can_create_tab: false,
       can_close_tab: false,
-      can_snapshot: ready,
+      can_snapshot: ready && currentRuntimeReady,
     },
   };
 }
@@ -429,16 +573,6 @@ async function registerBrowserClient(force = false) {
     if (!response.ok) throw new Error(`browser_registration_failed:${response.status}`);
     lastRegistrationAt = Date.now();
     const payload = await response.json().catch(() => ({}));
-    if (!backendReconciliationCompleted) {
-      try {
-        await retryPendingProfilesAfterBackendReady();
-        backendReconciliationCompleted = true;
-      } catch (error) {
-        addDebugLog('profile_backend_reconciliation_deferred', {
-          error: error?.message || String(error),
-        });
-      }
-    }
     const registeredTabs = Array.isArray(payload?.client?.tabs) ? payload.client.tabs : null;
     if (registeredTabs) {
       ownedTabIds.clear();
@@ -447,6 +581,7 @@ async function registerBrowserClient(force = false) {
         if (Number.isFinite(tabId) && tabId >= 0) ownedTabIds.add(tabId);
       }
     }
+    scheduleBackendReconciliation();
     return payload;
   })().catch(error => {
     addDebugLog('browser_registration_failed', { error: error?.message || String(error) });
@@ -455,6 +590,28 @@ async function registerBrowserClient(force = false) {
     registrationInFlight = null;
   });
   return registrationInFlight;
+}
+
+function scheduleBackendReconciliation() {
+  if (backendReconciliationCompleted || !storageCriticalAvailable) return null;
+  if (backendReconciliationInFlight) return backendReconciliationInFlight;
+  backendReconciliationInFlight = Promise.resolve()
+    .then(() => retryPendingProfilesAfterBackendReady())
+    .then(reconciliation => {
+      backendReconciliationCompleted = PhantomRelayProfileRecovery
+        .isBackendReconciliationComplete(reconciliation);
+      return reconciliation;
+    })
+    .catch(error => {
+      addDebugLog('profile_backend_reconciliation_deferred', {
+        error: error?.message || String(error),
+      });
+      return null;
+    })
+    .finally(() => {
+      backendReconciliationInFlight = null;
+    });
+  return backendReconciliationInFlight;
 }
 
 function syncRoutesToBackend() {
@@ -477,17 +634,44 @@ function loadRoutes() {
   });
 }
 
+function setLocalStorage(value) {
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    const finish = (error) => {
+      if (settled) return;
+      settled = true;
+      if (error) reject(error);
+      else resolve();
+    };
+    try {
+      const returned = chrome.storage.local.set(value, () => {
+        const runtimeError = chrome.runtime?.lastError;
+        finish(runtimeError ? new Error(runtimeError.message) : null);
+      });
+      if (returned && typeof returned.then === 'function') returned.then(() => finish(), finish);
+    } catch (error) {
+      finish(error);
+    }
+  });
+}
+
 function persist() {
-  chrome.storage.local.set({
-    phantomSelectors: selectors,
-    phantomDomainState: domainState,
-    phantomConversations: conversations,
-    phantomModelRoutes: modelRoutes,
-  });
-  PhantomRelayProfileStore.saveProfileStore(chrome.storage.local, profileStore).catch(error => {
+  const task = Promise.all([
+    setLocalStorage({
+      phantomSelectors: selectors,
+      phantomDomainState: domainState,
+      phantomConversations: conversations,
+      phantomModelRoutes: modelRoutes,
+    }),
+    PhantomRelayProfileStore.saveProfileStore(chrome.storage.local, profileStore),
+  ]).then(() => {
+    syncRoutesToBackend();
+    return true;
+  }).catch(error => {
     addDebugLog('profile_store_persist_failed', { error: error?.message || String(error) });
+    return false;
   });
-  syncRoutesToBackend();
+  return task;
 }
 
 async function syncPendingProfile(profileId) {
@@ -495,6 +679,7 @@ async function syncPendingProfile(profileId) {
   try {
     const result = await PhantomRelayProfileSync.syncPendingProfile(profileId, {
       store: profileStore,
+      getStore() { return profileStore; },
       clientId: browserClientId,
       baseUrl: LOCAL_API,
       fetchImpl: fetch,
@@ -514,29 +699,47 @@ async function retryPendingProfilesAfterBackendReady() {
   await storageReady;
   const now = Date.now();
   if (profileRecoveryRetryInFlight) return profileRecoveryRetryInFlight;
-  if (now - lastProfileRecoveryRetryAt < PROFILE_RECOVERY_RETRY_INTERVAL_MS) return null;
+  if (now - lastProfileRecoveryRetryAt < PROFILE_RECOVERY_RETRY_INTERVAL_MS) {
+    return { attempted: false, completed: false, reason: 'throttled' };
+  }
   lastProfileRecoveryRetryAt = now;
   profileRecoveryRetryInFlight = (async () => {
-    await profileRecoveryPromise.catch(() => {});
-    const pending = await recoverPendingProfiles();
+    const pending = await runPendingProfileRecoverySingleFlight();
     const active = await reconcileActiveProfilesAfterBackendReady();
     const failed = [
       ...(Array.isArray(pending?.failed) ? pending.failed : []),
       ...(Array.isArray(active?.failed) ? active.failed : []),
     ];
     if (failed.length) {
-      const error = new Error(`profile_backend_recovery_incomplete:${failed.length}`);
-      error.code = 'profile_backend_recovery_incomplete';
-      error.failed = [...new Set(failed)];
-      throw error;
+      return {
+        attempted: true,
+        completed: false,
+        reason: 'profile_backend_recovery_incomplete',
+        pending,
+        active,
+        failed: [...new Set(failed)],
+      };
     }
     if (pending?.recovered?.length) persist();
-    return { pending, active, failed: [] };
+    return {
+      attempted: true,
+      completed: true,
+      reason: 'completed',
+      pending,
+      active,
+      failed: [],
+    };
   })().catch(error => {
     addDebugLog('profile_backend_recovery_failed', {
       error: error?.message || String(error),
     });
-    throw error;
+    return {
+      attempted: true,
+      completed: false,
+      reason: error?.code || 'profile_backend_recovery_failed',
+      failed: Array.isArray(error?.failed) ? error.failed : [],
+      error: error?.message || String(error),
+    };
   }).finally(() => {
     profileRecoveryRetryInFlight = null;
   });
@@ -698,13 +901,27 @@ async function reconcileFetchedSelectors(domain, payload) {
     const active = profileStore.profiles?.[projected.profile.profileId]?.active;
     const incomingChecksum = await PhantomRelayProfileLifecycle.computeProfileChecksum(projected.profile);
     const activeChecksum = String(active?.lifecycle?.checksum || '');
+    let existingProfileChecksum = '';
+    if (existingSelectors.profile) {
+      try {
+        existingProfileChecksum = await PhantomRelayProfileLifecycle.computeProfileChecksum(
+          existingSelectors.profile,
+        );
+      } catch (_) {}
+    }
     if (active && activeChecksum !== incomingChecksum) {
       throw Object.assign(new Error('profile_remote_checksum_mismatch'), {
         code: 'profile_remote_checksum_mismatch',
       });
     }
-    if (active && activeChecksum === incomingChecksum
-      && selectorBundleFingerprint(existingSelectors) === selectorBundleFingerprint(projected)) {
+    if (active && PhantomRelayProfileRecovery.canReuseRecordedSelectorView({
+      activeChecksum,
+      incomingChecksum,
+      existingChecksum: existingProfileChecksum,
+      selectorBundleMatches: selectorBundleFingerprint(existingSelectors)
+        === selectorBundleFingerprint(projected),
+      existingExecutable: hasExecutableRecordedProfile(existingSelectors),
+    })) {
       return {
         selectors: existingSelectors,
         profile_revision: Number(active.lifecycle.revision || fallbackRevision),
@@ -744,33 +961,103 @@ async function reconcileFetchedSelectors(domain, payload) {
   }
 }
 
-async function applyRecoveredProfile({ profileId, envelope }) {
+async function ensureAuthoritativeProfileForCapture(domain) {
+  await storageReady;
+  const host = String(domain || '').trim().toLowerCase();
+  if (!host) {
+    throw Object.assign(new Error('recording_profile_domain_missing'), {
+      code: 'recording_profile_domain_missing',
+    });
+  }
+
+  const local = normalizeSelectors(selectors[host]);
+  if (local.profile) return local.profile;
+
+  let response;
+  try {
+    response = await fetch(`${LOCAL_API}/browser/selectors?domain=${encodeURIComponent(host)}`);
+  } catch (error) {
+    throw Object.assign(new Error(error?.message || 'recording_profile_lookup_failed'), {
+      code: 'recording_profile_lookup_failed',
+    });
+  }
+  const payload = response.ok ? await response.json().catch(() => ({})) : {};
+  if (!response.ok) {
+    throw Object.assign(new Error(payload?.error?.message || `recording_profile_lookup_failed:${response.status}`), {
+      code: 'recording_profile_lookup_failed',
+    });
+  }
+
+  const reconciled = await reconcileFetchedSelectors(host, payload);
+  const remote = normalizeSelectors(reconciled?.selectors || {});
+  const profile = remote.profile || selectors[host]?.profile || null;
+  if (!profile) {
+    throw Object.assign(new Error('recording_profile_missing'), {
+      code: 'recording_profile_missing',
+    });
+  }
+
+  selectors[host] = {
+    ...local,
+    ...remote,
+    input: local.input || remote.input,
+    profile,
+  };
+  persist();
+  addDebugLog('selector_capture_profile_rehydrated', {
+    profileId: String(profile.profileId || ''),
+    revision: activeProfileRevisionForDomain(host),
+    source: 'backend',
+  }, host);
+  return profile;
+}
+
+function projectRecoveredProfileLocally({ profileId, envelope }) {
   const profile = envelope?.profile;
   const domain = String(profile?.domain || '').trim().toLowerCase();
   if (!profile || !domain) throw new Error(`profile_domain_missing:${profileId}`);
   const existing = normalizeSelectors(selectors[domain]);
-  selectors[domain] = {
+  const selectorView = {
     ...existing,
     input: profile.input || existing.input,
     send: profile.send || existing.send,
     response: profile.response || existing.response,
     profile,
   };
+  selectors[domain] = selectorView;
   domainState[domain] = { current: State.ALL_DONE };
+  return { domain, selectorView };
+}
+
+async function publishRecoveredSelectorProjection({ profileId, domain, selectorView }) {
   try {
     const response = await fetch(`${LOCAL_API}/browser/selectors`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ domain, selectors: selectors[domain] })
+      body: JSON.stringify({ domain, selectors: selectorView })
     });
     if (!response.ok) throw new Error(`selector_republish_failed:${response.status}`);
+    return true;
   } catch (error) {
     addDebugLog('profile_selector_republish_failed', {
       profileId, domain, error: error?.message || String(error)
     }, domain);
-    throw error;
+    return false;
   }
-  addDebugLog('profile_startup_recovered', { profileId, domain }, domain);
+}
+
+async function applyRecoveredProfile({ profileId, envelope }) {
+  const projection = projectRecoveredProfileLocally({ profileId, envelope });
+  await publishRecoveredSelectorProjection({
+    profileId,
+    domain: projection.domain,
+    selectorView: projection.selectorView,
+  });
+  addDebugLog(
+    'profile_startup_recovered',
+    { profileId, domain: projection.domain },
+    projection.domain,
+  );
 }
 
 async function recoverPendingProfiles() {
@@ -795,116 +1082,100 @@ async function reconcileActiveProfilesAfterBackendReady() {
   const failed = [];
   const entries = Object.entries(profileStore.profiles || {});
 
-  for (const [profileId, entry] of entries) {
-    const active = entry?.active;
-    if (!active?.profile || !active?.lifecycle) continue;
+  for (const [profileId, candidateEntry] of entries) {
+    const candidateActive = candidateEntry?.active;
+    if (!candidateActive?.profile || !candidateActive?.lifecycle) continue;
+    const domain = String(candidateActive.profile.domain || '').trim().toLowerCase();
 
-    const domain = String(active.profile.domain || '').trim().toLowerCase();
-    let remoteResponse;
-    let needsSelectorRepair = false;
+    let result;
     try {
-      remoteResponse = await fetch(`${LOCAL_API}/browser/profiles/${encodeURIComponent(profileId)}`);
-    } catch (error) {
-      failed.push(profileId);
-      addDebugLog('profile_backend_repair_failed', {
+      result = await PhantomRelayProfileRecovery.recoverActiveProfileReplica({
+        candidateEntry,
         profileId,
-        code: 'backend_unreachable',
-        error: error?.message || String(error),
-      }, active.profile.domain || currentDomain);
-      continue;
-    }
-
-    if (remoteResponse.status === 404) {
-      // The local active envelope is last-known-good. Re-publish that exact
-      // revision instead of creating an unnecessary revision just because the
-      // backend was reset or its registry was lost.
-      addDebugLog('profile_backend_repair_missing', {
-        profileId,
-        revision: Number(active.lifecycle.revision || 0),
-      }, active.profile.domain || currentDomain);
-      try {
-        const response = await fetch(`${LOCAL_API}/browser/profiles`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify(PhantomRelayProfileSync.buildProfileUpsertPayload(browserClientId, active)),
-        });
-        const payload = await response.json().catch(() => ({}));
-        if (!response.ok) {
-          throw new Error(payload?.error?.message || `profile_backend_repair_failed:${response.status}`);
-        }
-      } catch (error) {
-        failed.push(profileId);
-        addDebugLog('profile_backend_repair_failed', {
-          profileId,
-          code: error?.code || 'profile_backend_repair_failed',
-            error: error?.message || String(error),
-        }, domain || currentDomain);
-        continue;
-      }
-      needsSelectorRepair = true;
-    } else if (!remoteResponse.ok) {
-      failed.push(profileId);
-      addDebugLog('profile_backend_repair_failed', {
-        profileId,
-        code: `profile_lookup_failed:${remoteResponse.status}`,
-      }, domain || currentDomain);
-      continue;
-    } else {
-      const remote = await remoteResponse.json().catch(() => ({}));
-      const remoteChecksum = String(remote?.checksum || remote?.profile?.lifecycle?.checksum || '');
-      const localChecksum = String(active.lifecycle.checksum || '');
-      if (remoteChecksum && localChecksum && remoteChecksum !== localChecksum) {
-        failed.push(profileId);
-        addDebugLog('profile_backend_repair_conflict', {
-          profileId,
-          revision: Number(active.lifecycle.revision || 0),
-        }, domain || currentDomain);
-        continue;
-      }
-
-      // A profile can survive a backend restart while its legacy selector
-      // bundle is missing or stale. Probe the bundle separately and only
-      // republish when the provider-neutral recorded contract differs.
-      try {
-        const selectorResponse = await fetch(
-          `${LOCAL_API}/browser/selectors?domain=${encodeURIComponent(domain)}`,
-        );
-        if (!selectorResponse.ok) {
-          needsSelectorRepair = true;
-        } else {
-          const remoteSelectorPayload = await selectorResponse.json().catch(() => ({}));
+        expectedDomain: domain,
+        getCurrentEntry: () => profileStore.profiles?.[profileId] || null,
+        loadRemote: () => fetch(`${LOCAL_API}/browser/profiles/${encodeURIComponent(profileId)}`),
+        publishActive: async envelope => {
+          const response = await fetch(`${LOCAL_API}/browser/profiles`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(PhantomRelayProfileSync.buildProfileUpsertPayload(browserClientId, envelope)),
+          });
+          const payload = await response.json().catch(() => ({}));
+          if (!response.ok) {
+            throw Object.assign(
+              new Error(payload?.error?.message || `profile_backend_repair_failed:${response.status}`),
+              { code: payload?.error?.code || 'profile_backend_repair_failed' },
+            );
+          }
+          return payload;
+        },
+        inspectSelectors: async envelope => {
+          const selectorResponse = await fetch(
+            `${LOCAL_API}/browser/selectors?domain=${encodeURIComponent(domain)}`,
+          );
+          if (!selectorResponse.ok) {
+            addDebugLog('profile_selector_replica_rejected', {
+              profileId,
+              status: Number(selectorResponse.status || 0),
+            }, domain || currentDomain);
+            return true;
+          }
+          let remoteSelectorPayload;
+          try {
+            remoteSelectorPayload = await selectorResponse.json();
+          } catch (error) {
+            addDebugLog('profile_selector_replica_malformed', {
+              profileId,
+              error: error?.message || String(error),
+            }, domain || currentDomain);
+            return true;
+          }
           const remoteSelectorProfileId = String(
             remoteSelectorPayload?.selectors?.profile?.profileId
               || remoteSelectorPayload?.selectors?.profile?.profile_id
               || '',
           );
-          needsSelectorRepair = remoteSelectorProfileId !== profileId
+          return remoteSelectorProfileId !== profileId
             || selectorBundleFingerprint(remoteSelectorPayload?.selectors)
-              !== selectorBundleFingerprint(active.profile);
-        }
-      } catch (error) {
-        needsSelectorRepair = true;
-        addDebugLog('profile_selector_bundle_probe_failed', {
-          profileId,
-          code: 'backend_unreachable',
-          error: error?.message || String(error),
-        }, domain || currentDomain);
-      }
-    }
-
-    if (!needsSelectorRepair) continue;
-
-    try {
-      await applyRecoveredProfile({ profileId, envelope: active });
-      repaired.push(profileId);
+              !== selectorBundleFingerprint(envelope.profile);
+        },
+            applySelectors: envelope => projectRecoveredProfileLocally({ profileId, envelope }),
+      });
     } catch (error) {
       failed.push(profileId);
       addDebugLog('profile_backend_repair_failed', {
         profileId,
-        code: error?.code || 'profile_selector_republish_failed',
+        code: error?.code || 'profile_backend_repair_failed',
         error: error?.message || String(error),
       }, domain || currentDomain);
+      continue;
     }
+
+    if (result.action === 'conflict') {
+      failed.push(profileId);
+      addDebugLog('profile_backend_repair_conflict', {
+        profileId,
+        reason: result.reason,
+        localRevision: result.localRevision,
+        remoteRevision: result.remoteRevision,
+      }, domain || currentDomain);
+      continue;
+    }
+    if (result.action === 'repaired') {
+      if (result.reason === 'backend_profile_missing') {
+        addDebugLog('profile_backend_repair_missing', {
+          profileId,
+          revision: Number(candidateActive.lifecycle.revision || 0),
+        }, domain || currentDomain);
+      }
+      addDebugLog('profile_backend_active_republished', {
+        profileId,
+        reason: result.reason,
+        revision: Number(candidateActive.lifecycle.revision || 0),
+      }, domain || currentDomain);
+    }
+    if (result.action === 'repaired' || result.selectorsRepaired) repaired.push(profileId);
   }
 
   if (repaired.length) persist();
@@ -971,6 +1242,31 @@ function profileStatusForDomain(domain) {
   };
 }
 
+async function resetRecordedDomain(domain, tabId) {
+  await storageReady;
+  await profileRecoveryPromise;
+  const host = String(domain || '').trim().toLowerCase();
+  if (!host) throw Object.assign(new Error('profile reset requires an exact domain'), { code: 'profile_domain_missing' });
+  const response = await fetch(`${LOCAL_API}/browser/profiles?domain=${encodeURIComponent(host)}`, { method: 'DELETE' });
+  const payload = await response.json().catch(() => ({}));
+  if (!response.ok) throw Object.assign(new Error(payload?.error?.message || `profile_reset_failed:${response.status}`), { code: payload?.error?.code || 'profile_reset_failed' });
+  const removed = PhantomRelayProfileStore.removeProfilesForDomain(profileStore, host);
+  await PhantomRelayProfileStore.saveProfileStore(chrome.storage.local, removed.store);
+  profileStore = removed.store;
+  delete selectors[host];
+  delete domainState[host];
+  clearBridgeWaitForDomain(host);
+  const numericTabId = Number(tabId);
+  if (Number.isFinite(numericTabId) && numericTabId > 0) markTabReady(numericTabId, false);
+  persist();
+  if (Number.isFinite(numericTabId) && numericTabId > 0) {
+    const tab = await chrome.tabs.get(numericTabId).catch(() => null);
+    if (tab) await publishReadyHeartbeat(tab, false).catch(() => false);
+  }
+  addDebugLog('recorded_profile_reset', { deletedProfileIds: payload.deleted_profile_ids || removed.removedProfileIds }, host);
+  return { ok: true, domain: host, deleted_profile_ids: payload.deleted_profile_ids || removed.removedProfileIds };
+}
+
 function profileRoutesForRecording() {
   const routes = {};
   for (const [profileId, entry] of Object.entries(profileStore.profiles || {})) {
@@ -992,6 +1288,57 @@ function profileRoutesForRecording() {
 function activeProfileRevisionForDomain(domain) {
   const status = profileStatusForDomain(domain);
   return Number(status.active?.revision || 0);
+}
+
+function activeProfileEnvelopeForDomain(domain) {
+  const host = String(domain || '').trim().toLowerCase();
+  const profileId = String(selectors[host]?.profile?.profileId || '');
+  const selected = profileId ? profileStore.profiles?.[profileId]?.active || null : null;
+  if (selected) return selected;
+  for (const entry of Object.values(profileStore.profiles || {})) {
+    if (String(entry?.active?.profile?.domain || '').trim().toLowerCase() === host) {
+      return entry.active;
+    }
+  }
+  return null;
+}
+
+function captureTransactionKey(domain, role) {
+  return `${String(domain || '').trim().toLowerCase()}:${String(role || '').trim().toLowerCase()}`;
+}
+
+function captureIdForMessage(msg, domain, role) {
+  const supplied = String(msg?.capture_id || msg?.transaction_id || '').trim();
+  if (supplied) return supplied;
+  const randomPart = globalThis.crypto?.randomUUID?.() || `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+  return `capture-${domain}-${role}-${randomPart}`;
+}
+
+function cloneCaptureState(value) {
+  if (value == null || typeof value !== 'object') return value;
+  if (typeof structuredClone === 'function') return structuredClone(value);
+  return JSON.parse(JSON.stringify(value));
+}
+
+function snapshotSelectorCaptureState(domain) {
+  return {
+    selectors: cloneCaptureState(selectors),
+    domainState: cloneCaptureState(domainState),
+    modelRoutes: cloneCaptureState(modelRoutes),
+    currentDomain,
+  };
+}
+
+function restoreSelectorCaptureState(snapshot) {
+  if (!snapshot) return;
+  selectors = snapshot.selectors;
+  domainState = snapshot.domainState;
+  modelRoutes = snapshot.modelRoutes;
+  currentDomain = snapshot.currentDomain;
+}
+
+function captureTransactionIsCurrent(domain, role, captureId) {
+  return selectorCaptureTransactions.get(captureTransactionKey(domain, role)) === captureId;
 }
 
 function setBadge(domain) {
@@ -1097,17 +1444,27 @@ async function ensureContentScriptOnce(tab) {
   try {
 
     const pingContentRuntime = async () => {
-      let timeoutId = null;
-      try {
-        return await Promise.race([
-          chrome.tabs.sendMessage(tab.id, { action: 'ping' }),
-          new Promise((_, reject) => {
-            timeoutId = setTimeout(() => reject(new Error('content_ping_timeout')), 750);
-          }),
-        ]);
-      } finally {
-        if (timeoutId) clearTimeout(timeoutId);
-      }
+      return await new Promise((resolve) => {
+        let settled = false;
+        const finish = (value) => {
+          if (settled) return;
+          settled = true;
+          resolve(value || null);
+        };
+        const timeoutId = setTimeout(() => finish(null), 750);
+        try {
+          chrome.tabs.sendMessage(tab.id, { action: 'ping' }, (response) => {
+            // Reading lastError is required when a fresh tab has no receiver.
+            const runtimeError = chrome.runtime.lastError;
+            void runtimeError;
+            clearTimeout(timeoutId);
+            finish(response || null);
+          });
+        } catch (_) {
+          clearTimeout(timeoutId);
+          finish(null);
+        }
+      });
     };
 
     const prime = async () => {
@@ -1154,46 +1511,6 @@ async function ensureContentScriptOnce(tab) {
   }
   const pingVersion = String(ping?.content_script_version || '');
   if (pingVersion && pingVersion !== CONTENT_SCRIPT_VERSION) addDebugLog('content_script_version_drift', { tabId: tab.id, expected: CONTENT_SCRIPT_VERSION, actual: pingVersion, action: 'awaiting_valid_handshake' }, hostname);
-  try {
-    preparationStage = 'marker_probe';
-    const markerProbe = await chrome.scripting.executeScript({
-      target: { tabId: tab.id },
-      injectImmediately: true,
-      func: (expectedVersion) => {
-        const root = document.documentElement;
-        const marker = root?.getAttribute('data-phantom-relay-content-instance') || '';
-        const heartbeat = root?.getAttribute('data-phantom-relay-content-heartbeat') || '';
-        const parts = heartbeat.split(':');
-        const heartbeatAt = Number(parts[1] || 0);
-        const active = marker === expectedVersion
-          && parts[0] === expectedVersion
-          && Number.isFinite(heartbeatAt)
-          && Date.now() - heartbeatAt < 10000;
-        const staleMarkerCleared = !!(marker || heartbeat);
-        if (staleMarkerCleared) {
-          root?.removeAttribute('data-phantom-relay-content-instance');
-          root?.removeAttribute('data-phantom-relay-content-heartbeat');
-          root?.removeAttribute('data-phantom-relay-content-owner');
-        }
-        return {
-          marker,
-          heartbeatAt,
-          active,
-          staleMarkerCleared,
-        };
-      },
-      args: [CONTENT_SCRIPT_VERSION]
-    });
-    const state = markerProbe?.[0]?.result || null;
-    if (state?.staleMarkerCleared) {
-      addDebugLog('content_script_stale_marker_cleared', {
-        tabId: tab.id,
-        marker: state.marker || '',
-        heartbeatAt: state.heartbeatAt || 0,
-        wasActive: !!state.active,
-      }, hostname);
-    }
-  } catch (_) {}
   try {
     preparationStage = 'dynamic_injection';
     await chrome.scripting.executeScript({ target: { tabId: tab.id }, injectImmediately: true, files: ['backend_config.js', 'universal_bridge.js', 'profile_contract.js', 'profile_lifecycle.js', 'profile_health.js', 'selector_recovery.js', 'capture_lock.js', 'send_observation.js', 'response_observation.js', 'content.js'] });
@@ -1497,6 +1814,115 @@ async function attachNetworkDebugger(target, tabId, job) {
     await new Promise(resolve => setTimeout(resolve, 150));
     await chrome.debugger.attach(target, '1.3');
     return true;
+  }
+}
+
+const CDP_KEY_MODIFIERS = Object.freeze({
+  Alt: 1,
+  Control: 2,
+  Meta: 4,
+  Shift: 8,
+});
+
+function cdpKeyModifiers(modifiers) {
+  return (Array.isArray(modifiers) ? modifiers : []).reduce(
+    (mask, modifier) => mask | Number(CDP_KEY_MODIFIERS[modifier] || 0),
+    0,
+  );
+}
+
+function cdpVirtualKeyCode(key) {
+  const normalized = String(key || '');
+  if (normalized === 'Enter') return 13;
+  if (normalized === 'Tab') return 9;
+  if (normalized === 'Escape') return 27;
+  if (normalized === 'Backspace') return 8;
+  if (normalized === 'Delete') return 46;
+  if (/^[A-Za-z0-9]$/.test(normalized)) return normalized.toUpperCase().charCodeAt(0);
+  return 0;
+}
+
+function cdpKeyText(key, modifiers) {
+  if (Number(modifiers) & ~CDP_KEY_MODIFIERS.Shift) return '';
+  const normalized = String(key || '');
+  if (normalized === 'Enter') return '\r';
+  if (/^[A-Za-z0-9]$/.test(normalized)) return normalized;
+  return '';
+}
+
+async function dispatchRecordedKeyboardViaDebugger(tabId, options = {}) {
+  const numericTabId = Number(tabId);
+  if (!Number.isFinite(numericTabId) || numericTabId < 0) {
+    return { ok: false, status: 'unknown', error: 'keyboard_tab_invalid' };
+  }
+  const target = { tabId: numericTabId };
+  const key = String(options.key || 'Enter');
+  const code = String(options.code || key);
+  const modifiers = cdpKeyModifiers(options.modifiers);
+  const virtualKeyCode = cdpVirtualKeyCode(key);
+  const keyText = cdpKeyText(key, modifiers);
+  const debuggerAlreadyAttached = activeNetworkCaptures.has(numericTabId);
+  let attachedHere = false;
+  try {
+    if (!debuggerAlreadyAttached) {
+      await chrome.debugger.attach(target, '1.3');
+      attachedHere = true;
+    }
+    const base = {
+      key,
+      code,
+      modifiers,
+      windowsVirtualKeyCode: virtualKeyCode,
+      nativeVirtualKeyCode: virtualKeyCode,
+    };
+    await chrome.debugger.sendCommand(target, 'Input.dispatchKeyEvent', {
+      ...base,
+      type: keyText ? 'keyDown' : 'rawKeyDown',
+      text: keyText,
+      unmodifiedText: keyText,
+    });
+    await chrome.debugger.sendCommand(target, 'Input.dispatchKeyEvent', {
+      ...base,
+      type: 'keyUp',
+    });
+    addDebugLog('trusted_keyboard_dispatched', {
+      tabId: numericTabId,
+      key,
+      code,
+      modifiers,
+      textSemantic: !!keyText,
+      method: 'cdp-input',
+      reusedNetworkDebugger: debuggerAlreadyAttached,
+    });
+    return {
+      ok: true,
+      status: 'dispatched',
+      method: 'cdp-input',
+      trusted: true,
+      key,
+      code,
+      modifiers,
+      textSemantic: !!keyText,
+    };
+  } catch (error) {
+    addDebugLog('trusted_keyboard_dispatch_failed', {
+      tabId: numericTabId,
+      key,
+      code,
+      modifiers,
+      method: 'cdp-input',
+      error: error?.message || String(error),
+    });
+    return {
+      ok: false,
+      status: 'unknown',
+      method: 'cdp-input',
+      trusted: false,
+      error: 'trusted_keyboard_dispatch_failed',
+      detail: error?.message || String(error),
+    };
+  } finally {
+    if (attachedHere) await chrome.debugger.detach(target).catch(() => {});
   }
 }
 
@@ -2008,6 +2434,8 @@ async function browserBridgeTick() {
     addDebugLog('browser_scheduler_stalled', {
       tickId,
       stage: tickStage,
+      storageInitializationStage,
+      storageCriticalAvailable,
       elapsedMs: Date.now() - tickStartedAt,
       ownedTabCount: ownedTabIds.size,
       readyTabCount: readyTabIds.size,
@@ -2026,6 +2454,14 @@ async function browserBridgeTick() {
     tickStage = 'claim_restore_wait';
     await activeClaimsReady;
     tickTrace('claims_ready', { activeClaimCount: activeClaims.size });
+    if (!storageCriticalAvailable) {
+      startStorageInitialization();
+      tickStage = 'client_liveness_registration';
+      await registerBrowserClient();
+      tickOutcome = 'startup_storage_unavailable';
+      tickTrace('return', { reason: tickOutcome, storageInitializationStage });
+      return;
+    }
     tickStage = 'claim_reconciliation';
     await reconcileActiveClaims();
     tickTrace('claims_reconciled', { activeClaimCount: activeClaims.size });
@@ -2346,6 +2782,9 @@ chrome.alarms.onAlarm.addListener((alarm) => {
 
 chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
   if (changeInfo.status === 'loading' || changeInfo.url) markTabReady(tabId, false);
+  if (changeInfo.status === 'loading' || changeInfo.url) {
+    publishReadyHeartbeat(tab, false).catch(() => false);
+  }
   if (changeInfo.status === 'complete' && isRecordedExecutionTab(tab)) {
     ensureContentScript(tab).then(() => scheduleBrowserBridgeTick(0));
   } else if (changeInfo.status === 'complete' && isUsableExecutionTab(tab)) {
@@ -2444,12 +2883,65 @@ function scheduleCaptureObservationTick(msg, sendResponse) {
   setTimeout(() => sendResponse({ ok: true, delay_ms: delayMs }), delayMs);
 }
 
+function isValidExtensionRuntimeReloadRequest(msg, sender) {
+  if (msg?.type !== 'reload_extension_runtime'
+      || msg?.reason !== 'content_script_version_mismatch'
+      || !String(msg.content_script_version || '').trim()) return false;
+  const tabId = Number(sender?.tab?.id);
+  if (!Number.isFinite(tabId) || tabId < 0) return false;
+  if (sender?.id && chrome.runtime?.id && sender.id !== chrome.runtime.id) return false;
+  try {
+    const pageUrl = new URL(String(sender.tab.url || ''));
+    return pageUrl.protocol === 'http:' || pageUrl.protocol === 'https:';
+  } catch (_) {
+    return false;
+  }
+}
+
+function handleExtensionRuntimeReloadRequest(msg, sender, sendResponse) {
+  if (!isValidExtensionRuntimeReloadRequest(msg, sender)) {
+    sendResponse({ ok: false, error: 'runtime_reload_request_invalid' });
+    return;
+  }
+  const tabId = Number(sender.tab.id);
+  const contentScriptVersion = String(msg.content_script_version).trim();
+  let domain = '';
+  try { domain = new URL(String(sender.tab.url || '')).hostname; } catch (_) {}
+  addDebugLog('runtime_reload_requested', {
+    tabId,
+    reason: msg.reason,
+    content_script_version: contentScriptVersion,
+    owner: 'service_worker',
+  }, domain);
+  sendResponse({ ok: true, reloading: true });
+  setTimeout(() => {
+    try {
+      addDebugLog('runtime_reload_started', {
+        tabId,
+        content_script_version: contentScriptVersion,
+        owner: 'service_worker',
+      }, domain);
+      chrome.runtime.reload();
+    } catch (error) {
+      addDebugLog('runtime_reload_failed', {
+        tabId,
+        error: error?.message || String(error),
+        owner: 'service_worker',
+      }, domain);
+    }
+  }, 0);
+}
+
 // Keep all content/runtime messages behind one synchronous MV3 listener. A
 // second listener for browser_result_relay can close the shared response
 // channel even when the relay listener itself returns true.
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   if (msg?.type === 'browser_result_relay') {
     return relayBrowserResult(msg, sender, sendResponse);
+  }
+  if (msg?.type === 'reload_extension_runtime') {
+    handleExtensionRuntimeReloadRequest(msg, sender, sendResponse);
+    return false;
   }
   (async () => {
     const tabId = sender.tab?.id;
@@ -2460,6 +2952,19 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     }
 
     await activeClaimsReady;
+
+    if (msg?.type === 'dispatch_recorded_keyboard') {
+      const requestedTabId = Number(msg.tab_id || tabId);
+      const claim = activeClaims.get(String(msg.job_id || ''));
+      if (!claim || Number(claim.tab_id) !== requestedTabId || Number(sender.tab?.id) !== requestedTabId ||
+          !msg.claim_token || String(claim.claim_token) !== String(msg.claim_token)) {
+        sendResponse({ ok: false, status: 'unknown', error: 'keyboard_claim_invalid' });
+        return;
+      }
+      const result = await dispatchRecordedKeyboardViaDebugger(requestedTabId, msg);
+      sendResponse(result);
+      return;
+    }
 
     if (msg?.type === 'network_calibration_result') {
       sendResponse({ ok: false, error: 'network_capture_disabled' });
@@ -2509,6 +3014,8 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
               conversation_id: conversationId,
               job_id: msg.job_id || '',
               claim_token: msg.claim_token || '',
+              page_session_id: msg.page_session_id || '',
+              content_script_version: msg.content_script_version || '',
               ready: true,
               input_ready: true,
               send_ready: true,
@@ -2562,6 +3069,16 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   const pageDomain = sender.tab?.url ? new URL(sender.tab.url).hostname : '';
   const readyTabId = sender.tab?.id;
   const pageSessionId = String(msg.page_session_id || '');
+  const pageContentScriptVersion = String(msg.content_script_version || '').trim();
+  if (pageContentScriptVersion !== CONTENT_SCRIPT_VERSION) {
+    addDebugLog('content_script_version_drift', {
+      expected: CONTENT_SCRIPT_VERSION,
+      actual: pageContentScriptVersion,
+      action: 'reject_stale_handshake',
+    }, pageDomain);
+    sendResponse({ ok: false, error: 'content_script_version_mismatch' });
+    return true;
+  }
   clearBridgeWaitForDomain(pageDomain);
   const existingClaim = [...activeClaims.values()].find(claim => Number(claim.tab_id) === Number(readyTabId));
   if (existingClaim) {
@@ -2579,6 +3096,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       source: 'content-ready',
       transport: 'chrome-extension',
       page_session_id: pageSessionId,
+      content_script_version: pageContentScriptVersion,
       conversation_id: existingClaim.conversation_id || '',
       ready: true,
       input_ready: true,
@@ -2613,6 +3131,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     if (readyTabId != null && pageSessionId) {
       pageRuntime.set(readyTabId, {
         pageSessionId,
+        contentScriptVersion: pageContentScriptVersion,
         frameId: sender.frameId ?? 0,
         domain: pageDomain,
         lastSeq: 0,
@@ -2645,19 +3164,42 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           if (!applied) throw new Error('recorded_selectors_apply_failed');
         } catch (_) {}
         const ready = await chrome.tabs.sendMessage(readyTabId, { action: 'wait_until_ready', timeout: 30000 });
-        const heartbeatResp = await fetch(`${LOCAL_API}/browser/heartbeat`, {
-          method: 'POST', headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ client_id: browserClientId, runtime_session_id: browserRuntimeSessionId, domain: pageDomain, tab_id: readyTabId, url: sender.tab?.url || '', source: 'content-ready', transport: 'chrome-extension', page_session_id: pageSessionId, conversation_id: ready?.conversation_id || '', ready: !!ready?.ready, input_ready: !!ready?.input_ready, send_ready: !!ready?.send_ready, capabilities: { can_observe: !!ready?.ready, can_execute: !!ready?.input_ready && !!ready?.send_ready, can_stream: true, can_create_tab: false, can_close_tab: false, can_snapshot: !!ready?.ready }, background_version: globalThis.__phantomRelayBackgroundVersion || '' })
-        }).catch(() => null);
+        const contentScriptVersion = String(ready?.content_script_version || pageContentScriptVersion).trim();
+        const heartbeatResp = await postBrowserHeartbeat({
+          client_id: browserClientId,
+          runtime_session_id: browserRuntimeSessionId,
+          domain: pageDomain,
+          tab_id: readyTabId,
+          url: sender.tab?.url || '',
+          source: 'content-ready',
+          transport: 'chrome-extension',
+          page_session_id: pageSessionId,
+          content_script_version: contentScriptVersion,
+          conversation_id: ready?.conversation_id || '',
+          ready: !!ready?.ready && contentScriptVersion === CONTENT_SCRIPT_VERSION,
+          input_ready: !!ready?.input_ready && contentScriptVersion === CONTENT_SCRIPT_VERSION,
+          send_ready: !!ready?.send_ready && contentScriptVersion === CONTENT_SCRIPT_VERSION,
+          capabilities: {
+            can_observe: !!ready?.ready && contentScriptVersion === CONTENT_SCRIPT_VERSION,
+            can_execute: !!ready?.input_ready && !!ready?.send_ready && contentScriptVersion === CONTENT_SCRIPT_VERSION,
+            can_stream: true,
+            can_create_tab: false,
+            can_close_tab: false,
+            can_snapshot: !!ready?.ready && contentScriptVersion === CONTENT_SCRIPT_VERSION,
+          },
+          background_version: globalThis.__phantomRelayBackgroundVersion || '',
+        }).catch(() => ({ accepted: false, payload: {}, response: null, runtimeRefreshAttempted: false }));
         addDebugLog('page_ready_heartbeat_result', {
           tabId: readyTabId,
           ready: !!ready?.ready,
           inputReady: !!ready?.input_ready,
           sendReady: !!ready?.send_ready,
-          responseOk: !!heartbeatResp?.ok,
-          responseStatus: Number(heartbeatResp?.status || 0),
+          responseOk: !!heartbeatResp?.accepted,
+          responseStatus: Number(heartbeatResp?.response?.status || 0),
+          ignored: String(heartbeatResp?.payload?.ignored || ''),
+          runtimeRefreshAttempted: !!heartbeatResp?.runtimeRefreshAttempted,
         }, pageDomain);
-        if (ready?.ready && heartbeatResp?.ok) {
+        if (ready?.ready && heartbeatResp?.accepted) {
           markTabReady(readyTabId, true);
           const runtime = pageRuntime.get(readyTabId);
           if (runtime?.pageSessionId === pageSessionId) runtime.lastValidatedAt = Date.now();
@@ -2666,7 +3208,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           // do not fan one page-ready heartbeat into three extra timers.
           browserBridgeTick().catch(() => {});
         }
-        sendResponse({ ok: true, ready });
+        sendResponse({ ok: !!heartbeatResp?.accepted, ready, heartbeat: heartbeatResp?.payload || {} });
       } catch (e) {
         sendResponse({ ok: false, error: e?.message || String(e) });
       }
@@ -2744,116 +3286,168 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   }
 
   if (msg.type === 'selector_captured') {
+    const domain = String(msg.domain || currentDomain || 'unknown').trim().toLowerCase();
+    const role = msg.role === 'copy' ? 'response' : String(msg.role || '');
+    const captureId = captureIdForMessage(msg, domain, role);
+    const transactionKey = captureTransactionKey(domain, role);
+    selectorCaptureTransactions.set(transactionKey, captureId);
+    let responded = false;
+    const acknowledge = payload => {
+      if (responded) return;
+      responded = true;
+      sendResponse({ ...payload, role, domain, capture_id: captureId });
+    };
+    const requireCurrentTransaction = () => {
+      if (captureTransactionIsCurrent(domain, role, captureId)) return;
+      throw Object.assign(new Error('selector_capture_superseded'), { code: 'selector_capture_superseded' });
+    };
+
     (async () => {
       await storageReady;
-      const domain = msg.domain || currentDomain || 'unknown';
-      const role = msg.role === 'copy' ? 'response' : msg.role;
+      requireCurrentTransaction();
+      const snapshot = snapshotSelectorCaptureState(domain);
       if (!selectors[domain]) selectors[domain] = emptySelectors();
       if (!domainState[domain]) domainState[domain] = { current: State.IDLE };
-      // Detect send-strategy JSON vs legacy CSS selector.
-      let captured;
-      if (role === 'send' && typeof msg.selector === 'string' && /^\s*\{/.test(msg.selector)) {
-        try { captured = JSON.parse(msg.selector); } catch (_) { captured = normalizeRoleSelector({ selector: msg.selector, alternatives: msg.alternatives || [] }); }
-      } else {
-        captured = normalizeRoleSelector({ selector: msg.selector, alternatives: msg.alternatives || [] });
-      }
-      selectors[domain][role] = typeof captured === 'object' && captured.kind
-        ? captured
-        : { ...captured, confidence: msg.confidence, elementTag: msg.elementTag, capturedAt: Date.now() };
+      try {
+        // Detect send-strategy JSON vs legacy CSS selector.
+        let captured;
+        if (role === 'send' && typeof msg.selector === 'string' && /^\s*\{/.test(msg.selector)) {
+          try { captured = JSON.parse(msg.selector); } catch (_) { captured = normalizeRoleSelector({ selector: msg.selector, alternatives: msg.alternatives || [] }); }
+        } else {
+          captured = normalizeRoleSelector({ selector: msg.selector, alternatives: msg.alternatives || [] });
+        }
+        if (!['input', 'send', 'response'].includes(role) || !captured) {
+          throw Object.assign(new Error('selector_capture_invalid'), { code: 'selector_capture_invalid' });
+        }
+        selectors[domain][role] = typeof captured === 'object' && captured.kind
+          ? captured
+          : { ...captured, confidence: msg.confidence, elementTag: msg.elementTag, capturedAt: Date.now() };
 
-      let stagedEnvelope = null;
-      if (role === 'send' && selectors[domain].profile) {
-        try {
-          const updatedProfile = PhantomRelayProfile.withSendStrategy(
-            selectors[domain].profile,
+        let profileCandidate = null;
+        let profileChanged = false;
+        const activeBeforeCapture = activeProfileEnvelopeForDomain(domain)?.profile || null;
+        const locallyRecordedProfile = selectors[domain].profile || null;
+        if (role === 'input' && (activeBeforeCapture || locallyRecordedProfile)) {
+          const authoritativeProfile = activeBeforeCapture || await ensureAuthoritativeProfileForCapture(domain);
+          const reconciled = PhantomRelaySelectorReconciliation.reconcileProfileInputSelector(
+            authoritativeProfile,
+            selectors[domain].input,
+            PhantomRelayProfile,
+          );
+          profileCandidate = reconciled.profile;
+          profileChanged = reconciled.changed;
+        } else if (role === 'send' && (activeBeforeCapture || locallyRecordedProfile)) {
+          profileCandidate = PhantomRelayProfile.withSendStrategy(
+            activeBeforeCapture || await ensureAuthoritativeProfileForCapture(domain),
             selectors[domain].send,
           );
-          profileStore = await PhantomRelayProfileStore.stageProfile(profileStore, updatedProfile);
-          stagedEnvelope = profileStore.profiles[updatedProfile.profileId]?.pending || null;
-          if (stagedEnvelope?.profile) selectors[domain].profile = stagedEnvelope.profile;
-          if (stagedEnvelope) {
-            try {
-              const synced = await syncPendingProfile(updatedProfile.profileId);
-              profileStore = synced.store || profileStore;
-            } catch (error) {
-              addDebugLog('profile_sync_failed', {
-                ...profileStageMetadata(updatedProfile),
-                code: error?.code || 'profile_sync_failed',
-                error: error?.message || String(error),
-              }, domain);
-            }
+          profileChanged = true;
+        } else if (role === 'response') {
+          if (!msg.profile || typeof msg.profile !== 'object') {
+            throw Object.assign(new Error('profile_recording_missing'), { code: 'profile_recording_missing' });
           }
-          addDebugLog('send_strategy_profile_reconciled', {
-            profileId: updatedProfile.profileId,
-            revision: Number(stagedEnvelope?.lifecycle?.revision || 0),
-            kind: String(updatedProfile.send?.kind || ''),
-          }, domain);
-        } catch (error) {
-          // Keep the selector visible for re-recording, but remove the stale
-          // executable profile so replay fails closed instead of mixing the new
-          // send action with an old profile contract.
-          selectors[domain].profile = null;
-          addDebugLog('send_strategy_profile_reconcile_failed', {
+          profileCandidate = msg.profile;
+          profileChanged = true;
+        }
+
+        if (role === 'input') domainState[domain].current = State.INPUT_DONE;
+        else if (role === 'send') domainState[domain].current = State.SEND_DONE;
+        else {
+          domainState[domain].current = State.ALL_DONE;
+          const modelKey = String(msg.model || domain).trim().toLowerCase();
+          const pageUrl = String(sender.tab?.url || '').trim();
+          const previousRoute = modelRoutes[modelKey];
+          const previousTarget = previousRoute && typeof previousRoute === 'object'
+            ? previousRoute.target_url || previousRoute.url || ''
+            : '';
+          modelRoutes[modelKey] = {
             domain,
-            code: error?.code || 'profile_reconcile_failed',
-            error: error?.message || String(error),
-          }, domain);
+            target_url: safeRouteTargetUrl(pageUrl || previousTarget, domain),
+          };
         }
-      }
-      if (role === 'response' && msg.profile && typeof msg.profile === 'object') {
-        try {
-          profileStore = await PhantomRelayProfileStore.stageProfile(profileStore, msg.profile);
-          stagedEnvelope = profileStore.profiles[msg.profile.profileId]?.pending || null;
-          selectors[domain].profile = stagedEnvelope?.profile || null;
-        } catch (error) {
-          selectors[domain].profile = null;
-          profileStore = await PhantomRelayProfileStore.recordProfileError(
-            profileStore,
-            String(msg.profile.profileId || domain),
-            { code: error?.code || 'profile_stage_failed', message: error?.message || String(error), recoverable: true }
-          );
-          await diagnoseProfileStageFailure(msg.profile, profileStore, error);
-          addDebugLog('profile_stage_failed', { domain, error: error?.message || String(error) }, domain);
-        }
+        currentDomain = domain;
+        setBadge(domain);
+        requireCurrentTransaction();
 
-        if (stagedEnvelope) {
-          try {
-            await syncPendingProfile(msg.profile.profileId);
-          } catch (error) {
-            addDebugLog('profile_sync_failed', {
-              ...profileStageMetadata(msg.profile),
-              code: error?.code || 'profile_sync_failed',
-              error: error?.message || String(error),
-            }, domain);
+        let synced = null;
+        if (profileCandidate && profileChanged) {
+          profileStore = await PhantomRelayProfileStore.stageProfile(profileStore, profileCandidate);
+          requireCurrentTransaction();
+          synced = await syncPendingProfile(profileCandidate.profileId);
+          if (synced.state !== 'synced') {
+            if (synced.state === 'superseded') requireCurrentTransaction();
+            throw Object.assign(new Error(String(synced.error?.code || 'profile_sync_failed')), {
+              code: 'profile_sync_failed',
+            });
           }
+          profileStore = synced.store || profileStore;
+          requireCurrentTransaction();
         }
-      }
 
-      if (role === 'input') domainState[domain].current = State.INPUT_DONE;
-      else if (role === 'send') domainState[domain].current = State.SEND_DONE;
-      else if (role === 'response') {
-        domainState[domain].current = State.ALL_DONE;
-        const modelName = msg.model || domain;
-        const modelKey = String(modelName).trim().toLowerCase();
-        const pageUrl = String(sender.tab?.url || '').trim();
-        const previousRoute = modelRoutes[modelKey];
-        const previousTarget = previousRoute && typeof previousRoute === 'object'
-          ? previousRoute.target_url || previousRoute.url || ''
-          : '';
-        const targetUrl = safeRouteTargetUrl(pageUrl || previousTarget, domain);
-        modelRoutes[modelKey] = { domain, target_url: targetUrl };
-      }
+        const activeEnvelope = activeProfileEnvelopeForDomain(domain);
+        if (activeEnvelope?.profile) {
+          selectors[domain] = PhantomRelaySelectorReconciliation.projectProfileSelectorBundle(
+            { ...selectors[domain], profile: activeEnvelope.profile },
+            PhantomRelayProfile,
+          );
+        }
+        if (!await persist()) {
+          throw Object.assign(new Error('local selector persistence failed'), {
+            code: 'selector_capture_local_persist_failed',
+          });
+        }
+        requireCurrentTransaction();
 
-      currentDomain = domain;
-      setBadge(domain);
-      persist();
-      const selectorPayload = { ...selectors[domain], response: selectors[domain].response || selectors[domain].copy || null };
-      if (stagedEnvelope) selectorPayload.profile = stagedEnvelope.profile;
-      fetch(`${LOCAL_API}/browser/selectors`, {
-        method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ domain, selectors: selectorPayload })
-      }).catch(() => {});
-    })().catch(error => addDebugLog('selector_capture_processing_failed', { error: error?.message || String(error) }));
+        const selectorPayload = {
+          ...selectors[domain],
+          response: selectors[domain].response || selectors[domain].copy || null,
+        };
+        const response = await fetch(`${LOCAL_API}/browser/selectors`, {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ domain, selectors: selectorPayload })
+        });
+        if (!response.ok) {
+          throw Object.assign(new Error(`selector_capture_persist_failed:${response.status}`), {
+            code: 'selector_capture_persist_failed',
+          });
+        }
+        requireCurrentTransaction();
+
+        const committedEnvelope = activeProfileEnvelopeForDomain(domain);
+        acknowledge({
+          ok: true,
+          profile_revision: Number(committedEnvelope?.lifecycle?.revision || 0),
+          profile_checksum: String(committedEnvelope?.lifecycle?.checksum || ''),
+          profile_synced: !!committedEnvelope,
+        });
+      } catch (error) {
+        const isCurrent = captureTransactionIsCurrent(domain, role, captureId);
+        const errorCode = isCurrent
+          ? String(error?.code || 'selector_capture_processing_failed')
+          : 'selector_capture_superseded';
+        if (isCurrent) {
+          restoreSelectorCaptureState(snapshot);
+          await persist();
+          try { setBadge(currentDomain); } catch (_) {}
+        }
+        addDebugLog(errorCode, {
+          role,
+          captureId,
+          code: errorCode,
+          error: error?.message || String(error),
+        }, domain);
+        acknowledge({ ok: false, error: errorCode, detail: error?.message || String(error) });
+      }
+    })().catch(error => {
+      const detail = error?.message || String(error);
+      const errorCode = captureTransactionIsCurrent(domain, role, captureId)
+        ? String(error?.code || 'selector_capture_processing_failed')
+        : 'selector_capture_superseded';
+      addDebugLog(errorCode, { role, captureId, error: detail }, domain);
+      acknowledge({ ok: false, error: errorCode, detail });
+    }).finally(() => {
+      if (captureTransactionIsCurrent(domain, role, captureId)) selectorCaptureTransactions.delete(transactionKey);
+    });
     return;
   }
 
@@ -2972,6 +3566,33 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           source: result.source
         }, result.targetDomain);
         sendResponse({ ...result, action: 'created', tab_id: created?.id || null });
+      })().catch(error => sendResponse({ ok: false, error: error?.message || String(error) }));
+      return true;
+    }
+
+    case 'open_recording_workspace': {
+      (async () => {
+        const targetTabId = Number(msg.tab_id);
+        const targetTab = Number.isInteger(targetTabId) && targetTabId > 0
+          ? await chrome.tabs.get(targetTabId).catch(() => null)
+          : null;
+        if (!isUsableExecutionTab(targetTab)) {
+          sendResponse({ ok: false, error: 'recording_target_tab_unavailable' });
+          return;
+        }
+        const workspaceUrl = new URL(chrome.runtime.getURL('popup.html'));
+        workspaceUrl.searchParams.set('tab_id', String(targetTab.id));
+        workspaceUrl.searchParams.set('workspace', '1');
+        const workspaceTab = await chrome.tabs.create({ url: workspaceUrl.toString(), active: true });
+        addDebugLog('recording_workspace_opened', {
+          targetTabId: Number(targetTab.id),
+          workspaceTabId: Number(workspaceTab?.id || 0),
+        });
+        sendResponse({
+          ok: true,
+          target_tab_id: Number(targetTab.id),
+          workspace_tab_id: Number(workspaceTab?.id || 0),
+        });
       })().catch(error => sendResponse({ ok: false, error: error?.message || String(error) }));
       return true;
     }
@@ -3197,14 +3818,17 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 
     case 'reset': {
       const domain = msg.domain || currentDomain;
-      if (domain) {
-        domainState[domain] = { current: State.IDLE };
-        if (selectors[domain]) selectors[domain] = emptySelectors();
-      }
-      setBadge(domain);
-      persist();
-      sendResponse({ ok: true });
-      break;
+      resetRecordedDomain(domain, msg.tab_id).then(result => {
+        setBadge(domain);
+        sendResponse(result);
+      }).catch(error => {
+        addDebugLog('recorded_profile_reset_failed', {
+          code: error?.code || 'profile_reset_failed',
+          error: error?.message || String(error),
+        }, domain);
+        sendResponse({ ok: false, error: error?.message || String(error), code: error?.code || 'profile_reset_failed' });
+      });
+      return true;
     }
 
     case 'list_sites':

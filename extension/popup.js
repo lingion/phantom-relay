@@ -24,14 +24,38 @@ const backendStatus = $('backendStatus');
 const recordingRouteStatus = $('recordingRouteStatus');
 const recordingRouteTarget = $('recordingRouteTarget');
 const btnOpenRecordingPage = $('btnOpenRecordingPage');
+const btnOpenRecordingWorkspace = $('btnOpenRecordingWorkspace');
 const footer = document.querySelector('.footer');
 let expectedContentScriptVersion = '';
+const POPUP_RUNTIME_IDENTITY = Object.freeze({
+  extension_version: '2.5.17',
+  background_version: '2026-08-20.08-worker-owned-runtime-reload',
+  content_script_version: '2026-08-20.08',
+});
 
 function loadRuntimeDiagnostics() {
   return new Promise(resolve => chrome.runtime.sendMessage(
     { from: 'popup', action: 'get_extension_diagnostics' },
     response => resolve(response?.ok ? response : {})
   ));
+}
+
+function reloadIfRuntimeIdentityStale() {
+  const installedVersion = String(chrome.runtime.getManifest?.().version || '');
+  if (installedVersion && installedVersion !== POPUP_RUNTIME_IDENTITY.extension_version) {
+    chrome.runtime.reload();
+    return Promise.resolve(true);
+  }
+  return loadRuntimeDiagnostics().then(diagnostics => {
+    const backgroundVersion = String(diagnostics.background_version || '');
+    const contentVersion = String(diagnostics.content_script_version || '');
+    if ((backgroundVersion && backgroundVersion !== POPUP_RUNTIME_IDENTITY.background_version)
+      || (contentVersion && contentVersion !== POPUP_RUNTIME_IDENTITY.content_script_version)) {
+      chrome.runtime.reload();
+      return true;
+    }
+    return false;
+  });
 }
 
 async function renderRuntimeVersion() {
@@ -134,19 +158,15 @@ function acceptContentScriptPing(ping) {
   const actualVersion = String(ping?.content_script_version || '');
   if (ping?.pong !== true || !actualVersion) return false;
 
-  // The popup and the page can outlive a hot-reloaded MV3 service worker.
-  // In that window the worker diagnostic may report an older build even though
-  // the live page content script is present and answers the recording
-  // protocol. The live handshake is authoritative for popup-owned recording;
-  // keep the drift visible without blocking a valid re-record operation.
   if (expectedContentScriptVersion && actualVersion !== expectedContentScriptVersion) {
     addDebug('content_script_version_drift', {
       expected: expectedContentScriptVersion,
       actual: actualVersion,
-      action: 'accept_live_handshake'
+      action: 'reject_runtime_drift'
     });
+    return false;
   }
-  expectedContentScriptVersion = actualVersion;
+  if (!expectedContentScriptVersion) expectedContentScriptVersion = actualVersion;
   return true;
 }
 
@@ -175,6 +195,41 @@ async function ensureContentScript() {
     addDebug('content_script_injection_failed', { error: e2?.message || String(e2) });
     return false;
   }
+}
+
+async function tabById(tabId) {
+  const numericTabId = Number(tabId);
+  if (!Number.isInteger(numericTabId) || numericTabId <= 0) return null;
+  try {
+    return await chrome.tabs.get(numericTabId);
+  } catch (_) {
+    return null;
+  }
+}
+
+async function resolveRecordingTargetTab() {
+  const explicitTabId = PhantomRelayPopupTarget.explicitTabIdFromSearch(window.location.search);
+  const [activeTab] = await chrome.tabs.query({ active: true, currentWindow: true });
+  const explicitTab = explicitTabId ? await chrome.tabs.get(explicitTabId).catch(() => null) : null;
+  const remembered = await chrome.storage.session.get({ phantomRecordingTarget: null }).catch(() => ({}));
+  const rememberedTabId = Number(remembered?.phantomRecordingTarget?.tab_id);
+  const rememberedTab = rememberedTabId === Number(activeTab?.id)
+    ? activeTab
+    : await tabById(rememberedTabId);
+  const selected = PhantomRelayPopupTarget.selectRecordingTab({
+    explicitTabId,
+    explicitTab,
+    activeTab,
+    rememberedTab,
+  });
+  if (!selected.ok) return selected;
+  await chrome.storage.session.set({
+    phantomRecordingTarget: {
+      tab_id: Number(selected.tab.id),
+      url: String(selected.tab.url || ''),
+    },
+  });
+  return selected;
 }
 
 // ── Model ──────────────────────────────────────────────────
@@ -282,19 +337,51 @@ async function openRecordingPage() {
     setStatus('error', `❌ 无法调出录制页：${response?.error || 'recording_route_missing'}`);
   }
   btnOpenRecordingPage.disabled = false;
-  btnOpenRecordingPage.textContent = '打开录制页';
+  btnOpenRecordingPage.textContent = '转到目标网页';
 }
 
 btnOpenRecordingPage.addEventListener('click', openRecordingPage);
 
+async function openRecordingWorkspace() {
+  if (!currentTabId) {
+    setStatus('error', '❌ 当前没有可锁定的网页标签');
+    return;
+  }
+  btnOpenRecordingWorkspace.disabled = true;
+  const response = await new Promise(resolve => chrome.runtime.sendMessage({
+    from: 'popup',
+    action: 'open_recording_workspace',
+    tab_id: currentTabId,
+  }, resolve));
+  if (!response?.ok) {
+    btnOpenRecordingWorkspace.disabled = false;
+    setStatus('error', `❌ 无法打开独立录制页：${response?.error || 'recording_target_tab_unavailable'}`);
+    return;
+  }
+  setStatus('ready', `独立录制页已锁定标签 ${response.target_tab_id}`);
+}
+
+btnOpenRecordingWorkspace.addEventListener('click', openRecordingWorkspace);
+
 // ── Init ──────────────────────────────────────────────────
 async function init() {
   loadBackendConfig();
-  const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+  const target = await resolveRecordingTargetTab();
+  if (!target.ok) {
+    setStatus('error', `❌ ${target.error}`);
+    renderRecordingRoute(null);
+    btnOpenRecordingWorkspace.disabled = true;
+    return;
+  }
+  const tab = target.tab;
   currentTabId = tab?.id;
   const domain = extractDomain(tab?.url || '');
   appState.domain = domain;
   appState.pageUrl = tab?.url || '';
+  if (new URLSearchParams(window.location.search).get('workspace') === '1') {
+    btnOpenRecordingWorkspace.style.display = 'none';
+    document.title = `Phantom Relay · ${domain || '录制'}`;
+  }
   loadModel();
 
   // 2. 从 background 按域名加载持久模板。
@@ -622,11 +709,25 @@ async function reverifyProfile() {
 
 function startPolling(role) {
   if (pollTimer) clearInterval(pollTimer);
+  const selectorRole = role === 'send_strategy' ? 'send' : role;
+  const startedAt = Date.now();
   pollTimer = setInterval(async () => {
     if (!currentTabId) { clearInterval(pollTimer); pollTimer=null; return; }
     try {
       const r = await chrome.tabs.sendMessage(currentTabId, { action:'get_selectors' });
-      if (r?.selectors?.[role]) {
+      const captureStatus = r?.selector_capture_status?.[selectorRole];
+      if (captureStatus?.state === 'rejected') {
+        clearInterval(pollTimer); pollTimer=null;
+        appState.current = 'idle';
+        setStatus('error', `❌ ${captureStatus.detail || captureStatus.error || '录制未同步'}`);
+        addDebug('selector_capture_rejected', {
+          role: selectorRole,
+          error: captureStatus.error || 'selector_capture_rejected',
+        });
+        render();
+        return;
+      }
+      if (r?.selectors?.[selectorRole] && captureStatus?.state === 'accepted') {
         appState.selectors = r.selectors;
         appState.current = `${role}_done`;
         chrome.runtime.sendMessage({ from:'popup', action:'update_state', state:{current:appState.current,domain:appState.domain} });
@@ -637,7 +738,16 @@ function startPolling(role) {
         }
         if (role === 'response') bindCurrentModelRoute();
       }
-    } catch(e) { clearInterval(pollTimer); pollTimer=null; }
+      if (Date.now() - startedAt > 20000) {
+        clearInterval(pollTimer); pollTimer=null;
+        appState.current = 'idle';
+        setStatus('error', '❌ 录制确认超时：页面候选未得到 background ACK');
+        addDebug('selector_capture_ack_timeout', { role: selectorRole });
+        render();
+      }
+    } catch(e) {
+      addDebug('selector_capture_poll_failed', { role: selectorRole, error: e?.message || String(e) });
+    }
   }, 500);
 }
 
@@ -696,9 +806,24 @@ btnCopy.addEventListener('click', ()=>handleRecord('response'));
 btnExport.addEventListener('click', ()=>{ chrome.runtime.sendMessage({from:'popup',action:'export_json'},()=>window.close()); });
 btnSendServer.addEventListener('click', ()=>{ chrome.runtime.sendMessage({from:'popup',action:'export_to_server'}, r=>{ alert(r?.error?`⚠️ ${r.error}\n\n启动: python3 server/api_server.py`:`✅ 已导入 ${r?.imported||0} 条`); }); });
 btnReset.addEventListener('click', async ()=>{
+  btnReset.disabled = true;
+  setStatus('recording', '正在重置录制…');
+  const result = await new Promise(resolve => chrome.runtime.sendMessage({
+    from:'popup', action:'reset', domain:appState.domain, tab_id:currentTabId
+  }, response => resolve({ response, runtimeError: chrome.runtime.lastError?.message || '' })));
+  const { response, runtimeError } = result;
+  if (runtimeError || !response?.ok) {
+    setStatus('error', `❌ 重置失败：${runtimeError || response?.error || 'background_unavailable'}`);
+    addDebug('recorded_profile_reset_failed', { error: runtimeError || response?.error || 'background_unavailable' });
+    btnReset.disabled = false;
+    return;
+  }
   if(currentTabId){ try{await chrome.tabs.sendMessage(currentTabId,{action:'clear_selectors'});}catch(e){} try{await chrome.tabs.sendMessage(currentTabId,{action:'cancel_record'});}catch(e){} }
-  chrome.runtime.sendMessage({from:'popup',action:'reset',domain:appState.domain});
-  appState.current='idle'; appState.selectors={input:null,send:null,response:null,profile:null}; appState.hasTemplate=false; render();
+  appState.current='idle'; appState.selectors={input:null,send:null,response:null,profile:null}; appState.hasTemplate=false;
+  appState.profileStatus={ state:'unavailable', profileId:'', revision:0, reasonCodes:[] };
+  btnReset.disabled = false;
+  setStatus('idle', '录制已重置，请从输入框开始');
+  render();
 });
 btnClear.addEventListener('click', ()=>{ if(!confirm('清除所有对话？'))return; chrome.runtime.sendMessage({from:'popup',action:'clear_conversations'}); appState.conversations=[]; appState.conversationCount=0; render(); });
 btnCopyLog.addEventListener('click', async ()=>{
@@ -726,5 +851,11 @@ backendUrlInput.addEventListener('keydown', (event) => {
 
 setInterval(()=>{ chrome.runtime.sendMessage({from:'popup',action:'get_state',domain:appState.domain}, r=>{ if(r&&JSON.stringify({c:appState.current,s:appState.selectors,h:appState.hasTemplate,p:appState.profileStatus})!==JSON.stringify({c:r.current,s:r.selectors,h:r.hasTemplate,p:r.profileStatus})){ appState=r;render(); }}); }, 2000);
 window.addEventListener('unload',()=>{ if(pollTimer)clearInterval(pollTimer); });
-renderRuntimeVersion();
-init();
+async function bootstrapPopup() {
+  if (await reloadIfRuntimeIdentityStale()) return;
+  await renderRuntimeVersion();
+  await init();
+}
+bootstrapPopup().catch(error => {
+  setBackendStatus(`扩展启动失败：${error?.message || String(error)}`, true);
+});

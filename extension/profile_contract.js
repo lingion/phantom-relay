@@ -366,6 +366,26 @@
     return normalizeProfile({ ...normalized, send });
   }
 
+  // A recorded input is part of the executable profile contract. When a user
+  // re-records the prompt after the response boundary already exists, update
+  // the embedded profile as one unit instead of leaving the top-level
+  // selector view ahead of the authoritative profile.
+  function withInputSelector(profile, inputSelector) {
+    const normalized = normalizeProfile(profile);
+    const rawSelector = inputSelector && typeof inputSelector === 'object' &&
+      Object.prototype.hasOwnProperty.call(inputSelector, 'selector')
+      ? inputSelector.selector
+      : inputSelector;
+    const nextSelector = selector(rawSelector, 'input', true);
+    return normalizeProfile({
+      ...normalized,
+      input: {
+        ...normalized.input,
+        selector: { css: nextSelector.css, alternatives: nextSelector.alternatives },
+      },
+    });
+  }
+
   // A selector bundle may be refreshed independently from the executable
   // profile. Rebuild the profile through the same contract validator so the
   // response boundary can move without dropping its recorded identity proof.
@@ -505,6 +525,7 @@
     volatileSelectorLiteral,
     normalizeProfile,
     withSendStrategy,
+    withInputSelector,
     withResponseSelector,
     messageIdentity,
     messageRole,
