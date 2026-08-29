@@ -25,7 +25,8 @@ function visibleElement(selector, attributes = {}) {
     disabled: false,
     isConnected: true,
     ownerDocument: { defaultView: { getComputedStyle: () => ({ visibility: 'visible', display: 'block' }) } },
-    getClientRects: () => [{}],
+    getClientRects: () => [{ left: 20, top: 20, right: 220, bottom: 60, width: 200, height: 40 }],
+    getBoundingClientRect: () => ({ left: 20, top: 20, right: 220, bottom: 60, width: 200, height: 40 }),
     matches: (candidate) => candidate === selector || candidate === 'textarea,input,[contenteditable="true"],[role="textbox"]',
     getAttribute: (name) => attributes[name] ?? null
   };
@@ -46,6 +47,64 @@ function blankConversationDocument() {
   };
 }
 
+function interactiveInputDocument(overrides = {}) {
+  const attributes = { ...(overrides.attributes || {}) };
+  const style = {
+    visibility: 'visible',
+    display: 'block',
+    opacity: '1',
+    pointerEvents: 'auto',
+    ...(overrides.style || {})
+  };
+  const rect = overrides.rect || {
+    left: 20,
+    top: 20,
+    right: 220,
+    bottom: 60,
+    width: 200,
+    height: 40
+  };
+  const documentLike = {
+    defaultView: {
+      innerWidth: 1280,
+      innerHeight: 720,
+      getComputedStyle: () => style
+    },
+    querySelectorAll(selector) {
+      if (selector === '#prompt') return [input];
+      if (selector === '#send') return [visibleElement('#send')];
+      if (selector === '[data-message-id]') return [];
+      if (selector === '[data-streaming="true"]') return [];
+      if (selector === '[aria-busy="true"]') return [];
+      return [];
+    },
+    elementFromPoint() {
+      return overrides.hitTarget === 'overlay' ? overlay :
+        overrides.hitTarget === 'child' ? child : input;
+    }
+  };
+  const child = { parentElement: null };
+  const overlay = { parentElement: null };
+  const input = {
+    disabled: !!overrides.disabled,
+    readOnly: !!overrides.readOnly,
+    inert: !!overrides.inert,
+    isConnected: overrides.isConnected !== false,
+    ownerDocument: documentLike,
+    parentElement: null,
+    getClientRects: () => overrides.noRects ? [] : [rect],
+    getBoundingClientRect: () => rect,
+    matches: candidate => candidate === '#prompt' ||
+      candidate === 'textarea,input,[contenteditable="true"],[role="textbox"]',
+    getAttribute: name => attributes[name] ?? null,
+    hasAttribute: name => Object.prototype.hasOwnProperty.call(attributes, name),
+    closest: selector => selector === '[inert]' && overrides.inertAncestor ? {} : null,
+    contains: node => node === child
+  };
+  child.parentElement = input;
+  return { documentLike, input, child, overlay };
+}
+
 test('empty new conversation accepts a valid response contract for execution readiness', () => {
   const documentLike = blankConversationDocument();
   const strict = Health.runProfileHealthCheck(validPageProfile(), { document: documentLike });
@@ -63,7 +122,58 @@ test('empty new conversation accepts a valid response contract for execution rea
   assert.deepEqual(ready.reason_codes, []);
 });
 
-test('execution readiness ignores visible response candidates without message identity when response is absent', () => {
+test('execution readiness rejects a recorded input covered by another page layer', () => {
+  const { documentLike } = interactiveInputDocument({ hitTarget: 'overlay' });
+  const report = Health.runProfileHealthCheck(validPageProfile(), {
+    document: documentLike,
+    allowMissingResponse: true
+  });
+
+  assert.equal(report.state, 'invalid');
+  assert.equal(report.checks.input, 'fail');
+  assert.ok(report.reason_codes.includes('recorded_input_not_interactable'));
+});
+
+test('execution readiness accepts hit testing on the recorded input or its descendant', () => {
+  for (const hitTarget of ['input', 'child']) {
+    const { documentLike } = interactiveInputDocument({ hitTarget });
+    const report = Health.runProfileHealthCheck(validPageProfile(), {
+      document: documentLike,
+      allowMissingResponse: true
+    });
+
+    assert.equal(report.checks.input, 'pass', `expected ${hitTarget} hit target to remain usable`);
+    assert.equal(report.state, 'verified');
+  }
+});
+
+test('execution readiness rejects disconnected, hidden, disabled, readonly, inert, and zero-size inputs', () => {
+  const cases = [
+    ['disconnected', { isConnected: false }],
+    ['hidden', { style: { visibility: 'hidden' } }],
+    ['disabled', { disabled: true }],
+    ['readonly', { readOnly: true }],
+    ['aria-disabled', { attributes: { 'aria-disabled': 'true' } }],
+    ['aria-readonly', { attributes: { 'aria-readonly': 'true' } }],
+    ['inert', { inert: true }],
+    ['inert ancestor', { inertAncestor: true }],
+    ['zero size', { rect: { left: 20, top: 20, right: 20, bottom: 20, width: 0, height: 0 } }],
+    ['no rects', { noRects: true }]
+  ];
+
+  for (const [name, overrides] of cases) {
+    const { documentLike } = interactiveInputDocument(overrides);
+    const report = Health.runProfileHealthCheck(validPageProfile(), {
+      document: documentLike,
+      allowMissingResponse: true
+    });
+
+    assert.equal(report.checks.input, 'fail', `expected ${name} input to fail closed`);
+    assert.ok(report.reason_codes.includes('recorded_input_not_interactable'));
+  }
+});
+
+test('execution readiness rejects visible response candidates without message identity', () => {
   const documentLike = blankConversationDocument();
   const genericCandidates = [
     visibleElement('.layout-node'),
@@ -97,9 +207,9 @@ test('execution readiness ignores visible response candidates without message id
     requireRecordedIdentity: true
   });
 
-  assert.equal(report.state, 'verified');
-  assert.equal(report.checks.identity, 'pass');
-  assert.deepEqual(report.reason_codes, []);
+  assert.equal(report.state, 'invalid');
+  assert.equal(report.checks.identity, 'fail');
+  assert.ok(report.reason_codes.includes(Lifecycle.PROFILE_HEALTH_REASONS.IDENTITY_UNAVAILABLE));
 });
 
 test('empty new conversation rejects a legacy profile without recorded identity evidence', () => {

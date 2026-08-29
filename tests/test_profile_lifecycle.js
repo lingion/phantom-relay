@@ -22,6 +22,7 @@ test('exports the lifecycle schema and complete state set', () => {
     'draft', 'recorded', 'sync_pending', 'synced', 'verified', 'degraded', 'invalid', 'archived'
   ]);
   assert.equal(PROFILE_HEALTH_REASONS.IDENTITY_UNAVAILABLE, 'profile_identity_unavailable');
+  assert.equal(PROFILE_HEALTH_REASONS.INPUT_NOT_INTERACTABLE, 'recorded_input_not_interactable');
 });
 
 test('canonical checksum ignores object key insertion order', async () => {

@@ -26,6 +26,7 @@ def registration_payload():
                 "input_ready": True,
                 "send_ready": True,
                 "conversation_id": "conv-1",
+                "content_script_version": "2026-08-13.02",
                 "capabilities": {"can_execute": True, "can_observe": True},
             },
             {
@@ -56,6 +57,27 @@ def test_registration_normalizes_client_and_tab_fields():
     assert registration.runtime_session_id == "runtime-test"
     assert registration.tabs[0]["tab_id"] == 10
     assert registration.tabs[0]["domain"] == "chat.deepseek.com"
+
+
+def test_registration_preserves_actual_content_script_version_on_each_tab():
+    payload = registration_payload()
+
+    registration = normalize_registration(payload, now=100.0)
+
+    assert registration.tabs[0]["content_script_version"] == "2026-08-13.02"
+
+
+def test_registration_downgrades_ready_tab_without_actual_content_script_version():
+    payload = registration_payload()
+    payload["tabs"][0].pop("content_script_version")
+
+    registration = normalize_registration(payload, now=100.0)
+
+    assert registration.tabs[0]["ready"] is False
+    assert registration.tabs[0]["input_ready"] is False
+    assert registration.tabs[0]["send_ready"] is False
+    assert registration.tabs[0]["capabilities"]["can_execute"] is False
+    assert registration.tabs[0]["capabilities"]["can_observe"] is False
 
 
 def test_registration_cannot_grant_extension_a_tab_activation_owner():
@@ -96,6 +118,7 @@ def test_status_payload_is_safe_and_serializable():
     assert payload["state"] == "ready"
     assert payload["fresh"] is True
     assert payload["tabs"][0]["tab_id"] == 10
+    assert payload["tabs"][0]["content_script_version"] == "2026-08-13.02"
     assert "cookies" not in payload
     assert "conversation_text" not in payload
 
@@ -129,6 +152,35 @@ def test_register_endpoint_accepts_contract_and_indexes_tabs():
     assert api.claim_browser_job(
         "chat.deepseek.com", 10, other_job["conversation_id"], client_id="other-client"
     ) is None
+
+
+def test_registration_domain_change_fails_the_claimed_tab_immediately():
+    api = _load_register_api("phantom_register_api_claim_domain_change")
+    client = api.app.test_client()
+    payload = registration_payload()
+    assert client.post("/browser/register", json=payload).status_code == 200
+
+    job = api.new_browser_job("hello", domain="chat.deepseek.com", model="m")
+    claimed = api.claim_browser_job(
+        "chat.deepseek.com", 10, job["conversation_id"], client_id="client-install-1"
+    )
+    assert claimed["id"] == job["id"]
+
+    redirected = registration_payload()
+    redirected["tabs"] = [{
+        **redirected["tabs"][0],
+        "url": "https://login.example.test/session",
+        "domain": "login.example.test",
+        "ready": False,
+        "input_ready": False,
+        "send_ready": False,
+        "capabilities": {"can_execute": False, "can_observe": False},
+    }]
+    response = client.post("/browser/register", json=redirected)
+
+    assert response.status_code == 200
+    assert job["status"] == "failed"
+    assert job["error"] == "execution_domain_changed"
 
 
 def test_negative_heartbeat_clears_previous_execution_readiness():
@@ -179,8 +231,9 @@ def test_fresh_contract_registration_blocks_legacy_poll_without_client_id():
         "last_seen": __import__("time").time(),
         "ready": True,
         "input_ready": True,
-        "send_ready": True,
-        "source": "content-ready",
+            "send_ready": True,
+            "content_script_version": "2026-08-13.02",
+            "source": "content-ready",
         "capabilities": {"can_observe": True, "can_execute": True},
     }
     job = api.new_browser_job("hello", domain="chat.deepseek.com", model="m")
@@ -254,6 +307,7 @@ def test_registration_refresh_does_not_downgrade_fresh_content_ready_claim():
         "ready": True,
         "input_ready": True,
         "send_ready": True,
+        "content_script_version": "2026-08-13.02",
         "source": "content-ready",
         "capabilities": {"can_execute": True, "can_observe": True},
     })
@@ -286,8 +340,9 @@ def test_same_domain_ready_tabs_are_not_elected_by_numeric_tab_id():
         "source": "content-ready",
         "ready": True,
         "input_ready": True,
-        "send_ready": True,
-        "capabilities": {"can_execute": True, "can_observe": True},
+            "send_ready": True,
+            "content_script_version": "2026-08-13.02",
+            "capabilities": {"can_execute": True, "can_observe": True},
     })
     api.mark_browser_ready({
         "client_id": "client-install-1",
@@ -298,8 +353,9 @@ def test_same_domain_ready_tabs_are_not_elected_by_numeric_tab_id():
         "source": "content-ready",
         "ready": True,
         "input_ready": True,
-        "send_ready": True,
-        "capabilities": {"can_execute": True, "can_observe": True},
+            "send_ready": True,
+            "content_script_version": "2026-08-13.02",
+            "capabilities": {"can_execute": True, "can_observe": True},
     })
 
     assert api.BROWSER_CLIENTS["900"]["ready"] is True
@@ -386,8 +442,9 @@ def test_newer_same_domain_ready_tab_does_not_evict_active_claim():
         "source": "content-ready",
         "ready": True,
         "input_ready": True,
-        "send_ready": True,
-        "capabilities": {"can_execute": True, "can_observe": True},
+            "send_ready": True,
+            "content_script_version": "2026-08-13.02",
+            "capabilities": {"can_execute": True, "can_observe": True},
     })
     api.purge_stale_browser_state()
 

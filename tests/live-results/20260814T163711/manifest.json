@@ -1,0 +1,140 @@
+{
+  "api": "http://127.0.0.1:8765",
+  "browser_app": "/Applications/Google Chrome Canary.app",
+  "browser_binary": "/Applications/Google Chrome Canary.app/Contents/MacOS/Google Chrome Canary",
+  "browser_bundle_id": "com.google.Chrome.canary",
+  "confidence": 0.95,
+  "counts": {
+    "adjacent_distinct_triple_paths": 0,
+    "adjacent_distinct_triple_requests": 0,
+    "alias_route_requests": 2,
+    "all_distinct_triple_paths": 0,
+    "context_requests": 1,
+    "context_requests_per_path_repeat": 1,
+    "context_seed_requests": 1,
+    "directed_pair_paths": 0,
+    "directed_pair_requests": 0,
+    "full_requests": 7,
+    "hard_cold_requests": 1,
+    "immediate_crash_prepare_requests": 1,
+    "immediate_crash_recovery_requests": 1,
+    "models": 1,
+    "path_repeats_per_directed_path": 1,
+    "qualification_requests": 6,
+    "startup_repeats_per_model": 1,
+    "switchback_paths": 0,
+    "warm_qualification_requests": 1
+  },
+  "evidence_level": "coverage",
+  "git_head": "1e0501ac6159620ab68286e318092c3752643cb1",
+  "inventory": {
+    "advertised_without_executable_profile": [
+      {
+        "domain": "tongyi.aliyun.com",
+        "model_ids": [
+          "qwen-turbo"
+        ],
+        "reason": "executable_recorded_profile_missing"
+      },
+      {
+        "domain": "custom.example",
+        "model_ids": [
+          "temporary-model"
+        ],
+        "reason": "executable_recorded_profile_missing"
+      }
+    ],
+    "health": {
+      "browser_activation_owner": "api",
+      "browser_auto_wake": true,
+      "service": "phantom-relay-api",
+      "status": "ok"
+    },
+    "public_route_count": 15,
+    "recorded_domain_count": 6,
+    "recorded_model_count": 6,
+    "recorded_models": [
+      {
+        "aliases": [
+          "doubao"
+        ],
+        "domain": "www.doubao.com",
+        "model_id": "www.doubao.com",
+        "profile_id": "recorded-www.doubao.com-v1",
+        "profile_revision": 5,
+        "target_url": "https://www.doubao.com/chat/38437621893976066"
+      },
+      {
+        "aliases": [
+          "deepseek",
+          "deepseek-chat",
+          "deepseek-reasoner"
+        ],
+        "domain": "chat.deepseek.com",
+        "model_id": "chat.deepseek.com",
+        "profile_id": "recorded-chat.deepseek.com-v1",
+        "profile_revision": 1,
+        "target_url": "https://chat.deepseek.com/a/chat/s/e94093d6-8a10-4fc3-9d56-7466928b206e"
+      },
+      {
+        "aliases": [
+          "qwen"
+        ],
+        "domain": "chat.qwen.ai",
+        "model_id": "chat.qwen.ai",
+        "profile_id": "recorded-chat.qwen.ai-v1",
+        "profile_revision": 1,
+        "target_url": "https://chat.qwen.ai/c/7b461a88-0681-4fc7-9db6-67015035cd58"
+      },
+      {
+        "aliases": [
+          "wenxin",
+          "yiyan"
+        ],
+        "domain": "wenxin.baidu.com",
+        "model_id": "wenxin.baidu.com",
+        "profile_id": "recorded-wenxin.baidu.com-v1",
+        "profile_revision": 1,
+        "target_url": "https://wenxin.baidu.com/search/8783100665589142850"
+      },
+      {
+        "aliases": [],
+        "domain": "yuanbao.tencent.com",
+        "model_id": "yuanbao.tencent.com",
+        "profile_id": "recorded-yuanbao.tencent.com-v1",
+        "profile_revision": 5,
+        "target_url": "https://yuanbao.tencent.com/chat/naQivTmsDa/0PXX9VjauIq"
+      },
+      {
+        "aliases": [],
+        "domain": "aistudio.xiaomimimo.com",
+        "model_id": "aistudio.xiaomimimo.com",
+        "profile_id": "recorded-aistudio.xiaomimimo.com-v1",
+        "profile_revision": 2,
+        "target_url": "https://aistudio.xiaomimimo.com/"
+      }
+    ]
+  },
+  "minimum_perfect_trials": 59,
+  "path_repeats": 1,
+  "run_id": "20260814T163711",
+  "seed": 5550,
+  "selected_models": [
+    {
+      "aliases": [
+        "wenxin",
+        "yiyan"
+      ],
+      "domain": "wenxin.baidu.com",
+      "model_id": "wenxin.baidu.com",
+      "profile_id": "recorded-wenxin.baidu.com-v1",
+      "profile_revision": 1,
+      "target_url": "https://wenxin.baidu.com/search/8783100665589142850"
+    }
+  ],
+  "started_at": "2026-08-14T08:37:11.466+00:00",
+  "startup_repeats": 1,
+  "suite": "qualification",
+  "threshold": 0.95,
+  "trace": "/Users/lingion_k/Desktop/phantom-relay/server/page-trace.jsonl"
+}

@@ -16,6 +16,7 @@ const {
   promoteProfile,
   recordProfileHealth,
   recordProfileError,
+  removeProfilesForDomain,
   migrateLegacySelectors,
   saveProfileStore
 } = Store;
@@ -33,6 +34,19 @@ function memoryStorage(initial = {}) {
 test('loading an empty storage creates a versioned profile store', async () => {
   const store = await loadProfileStore(memoryStorage({}));
   assert.deepEqual(store, { version: 1, profiles: {}, diagnostics: [], legacyHints: [] });
+});
+
+test('an already-read profile registry is normalized without another storage call', async () => {
+  const active = await createProfileEnvelope(validProfile());
+  const store = await Store.normalizeProfileStoreDocument({
+    version: 1,
+    profiles: {
+      [active.profile.profileId]: { active, pending: null, lastError: null },
+    },
+  });
+
+  assert.equal(store.profiles[active.profile.profileId].active.profile.profileId, active.profile.profileId);
+  assert.equal(store.profiles[active.profile.profileId].active.lifecycle.checksum, active.lifecycle.checksum);
 });
 
 test('staging a new revision preserves active last-known-good profile', async () => {
@@ -141,6 +155,42 @@ test('health and errors update diagnostics without replacing active profile', as
   const errored = await recordProfileError(healthy, id, { code: 'profile_sync_failed', recoverable: true });
   assert.equal(errored.profiles[id].active.lifecycle.state, 'verified');
   assert.equal(errored.profiles[id].lastError.code, 'profile_sync_failed');
+});
+
+test('reset removes every active or pending profile for one exact domain only', async () => {
+  const fixtureActive = await createProfileEnvelope(validProfile());
+  const fixturePending = await createProfileEnvelope(validProfile({ profileId: 'fixture-pending' }));
+  const otherActive = await createProfileEnvelope(validProfile({
+    profileId: 'other-profile',
+    domain: 'other.example',
+    origin: 'https://other.example/chat',
+  }));
+  const store = {
+    version: 1,
+    profiles: {
+      [fixtureActive.profile.profileId]: { active: fixtureActive, pending: null, lastError: null },
+      [fixturePending.profile.profileId]: { active: null, pending: fixturePending, lastError: null },
+      [otherActive.profile.profileId]: { active: otherActive, pending: null, lastError: null },
+    },
+    diagnostics: [{ code: 'keep-diagnostic' }],
+    legacyHints: [{ domain: 'fixture.example', reason: 'old-hint' }],
+  };
+
+  const result = removeProfilesForDomain(store, ' FIXTURE.EXAMPLE ');
+
+  assert.deepEqual(result.removedProfileIds.sort(), ['fixture-pending', 'fixture-profile-v1']);
+  assert.deepEqual(Object.keys(result.store.profiles), ['other-profile']);
+  assert.equal(result.store.profiles['other-profile'].active.profile.domain, 'other.example');
+  assert.deepEqual(result.store.diagnostics, [{ code: 'keep-diagnostic' }]);
+  assert.deepEqual(result.store.legacyHints, []);
+  assert.ok(store.profiles['fixture-profile-v1'], 'the input store must remain unchanged');
+});
+
+test('reset rejects an empty domain instead of clearing the whole profile store', () => {
+  assert.throws(
+    () => removeProfilesForDomain({ version: 1, profiles: {} }, '  '),
+    error => error.code === 'profile_domain_missing',
+  );
 });
 
 test('saveProfileStore performs one atomic phantomProfiles write', async () => {

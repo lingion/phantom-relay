@@ -27,7 +27,12 @@ test('browser result relay uses a synchronous MV3 message listener', () => {
   );
   assert.match(
     background,
-    /if \(msg\?\.type === 'browser_result_relay'\) \{\s*return relayBrowserResult\(msg, sender, sendResponse\);\s*\}\s*\(async \(\) => \{/s,
+    /if \(msg\?\.type === 'browser_result_relay'\) \{\s*return relayBrowserResult\(msg, sender, sendResponse\);\s*\}/s,
+  );
+  assert.match(
+    background,
+    /if \(msg\?\.type === 'reload_extension_runtime'\) \{[\s\S]*?handleExtensionRuntimeReloadRequest\(msg, sender, sendResponse\);[\s\S]*?return false;[\s\S]*?\}\s*\(async \(\) => \{/s,
+    'synchronous runtime-reload handling may sit between relay and the general async dispatcher',
   );
 });
 

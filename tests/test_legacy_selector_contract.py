@@ -34,6 +34,28 @@ def _profile(identity_attribute="data-message-id", selector="[data-message-id]")
     }
 
 
+def test_profile_reset_removes_legacy_selector_file_projection(tmp_path, monkeypatch):
+    api = _load_legacy_api("legacy_profile_reset", monkeypatch, tmp_path)
+    profile = _profile()
+    payload = {
+        "client_id": "client-a",
+        "profile": profile,
+        "revision": 1,
+        "checksum": api.profile_checksum(profile),
+    }
+    app_client = api.app.test_client()
+    assert app_client.post("/browser/profiles", json=payload).status_code == 200
+    assert "fixture.example" in api.selector_templates
+
+    response = app_client.delete("/browser/profiles?domain=fixture.example")
+
+    assert response.status_code == 200
+    assert response.get_json()["deleted_profile_ids"] == ["legacy-fixture-v1"]
+    assert api.selector_templates.get("fixture.example") is None
+    persisted = json.loads((tmp_path / "selector_templates.json").read_text(encoding="utf-8"))
+    assert "fixture.example" not in persisted
+
+
 def test_legacy_selector_read_drops_non_executable_profile_but_preserves_recording_inputs(tmp_path, monkeypatch):
     template_path = tmp_path / "selector_templates.json"
     template_path.write_text(json.dumps({

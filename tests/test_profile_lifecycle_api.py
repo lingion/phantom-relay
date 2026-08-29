@@ -1,5 +1,6 @@
 import json
 import sys
+import threading
 from copy import deepcopy
 from pathlib import Path
 
@@ -37,6 +38,59 @@ def test_profile_upsert_rejects_same_revision_with_different_checksum(tmp_path, 
     assert conflict.get_json()["error"]["code"] == "profile_conflict"
 
 
+def test_concurrent_profile_upserts_never_accept_a_revision_after_a_newer_commit(tmp_path, monkeypatch):
+    api = load_api("profile_lifecycle_concurrent_upsert", monkeypatch, tmp_path)
+    baseline = api.app.test_client().post("/browser/profiles", json=profile_payload(revision=1))
+    assert baseline.status_code == 200
+
+    high_payload = profile_payload(revision=3, selector="#revision-three")
+    low_payload = profile_payload(revision=2, selector="#revision-two")
+    original_deepcopy = api.deepcopy
+    high_snapshotted = threading.Event()
+    low_finished = threading.Event()
+    responses = {}
+
+    def coordinated_deepcopy(value):
+        copied = original_deepcopy(value)
+        is_registry_snapshot = value is api._registry_profile_registry.get("profiles")
+        if is_registry_snapshot and threading.current_thread().name == "profile-revision-3":
+            high_snapshotted.set()
+            low_finished.wait(timeout=0.5)
+        return copied
+
+    monkeypatch.setattr(api, "deepcopy", coordinated_deepcopy)
+
+    def post_revision(name, payload):
+        responses[name] = api.app.test_client().post("/browser/profiles", json=payload)
+        if name == "low":
+            low_finished.set()
+
+    high = threading.Thread(
+        target=post_revision,
+        args=("high", high_payload),
+        name="profile-revision-3",
+    )
+    low = threading.Thread(
+        target=post_revision,
+        args=("low", low_payload),
+        name="profile-revision-2",
+    )
+    high.start()
+    assert high_snapshotted.wait(timeout=1)
+    low.start()
+    high.join(timeout=2)
+    low.join(timeout=2)
+
+    assert not high.is_alive()
+    assert not low.is_alive()
+    assert responses["high"].status_code == 200
+    assert responses["low"].status_code == 409
+    assert responses["low"].get_json()["error"]["code"] == "profile_revision_conflict"
+    stored = api.app.test_client().get("/browser/profiles/fixture-profile").get_json()
+    assert stored["revision"] == 3
+    assert stored["checksum"] == high_payload["checksum"]
+
+
 def test_profile_get_returns_the_persisted_revision_and_checksum(tmp_path, monkeypatch):
     api = load_api("profile_lifecycle_get", monkeypatch, tmp_path)
     app_client = api.app.test_client()
@@ -47,6 +101,61 @@ def test_profile_get_returns_the_persisted_revision_and_checksum(tmp_path, monke
     assert fetched.status_code == 200
     assert fetched.get_json()["revision"] == 1
     assert fetched.get_json()["checksum"] == payload["checksum"]
+
+
+def test_profile_reset_removes_profile_selector_projection_and_persisted_registry(tmp_path, monkeypatch):
+    api = load_api("profile_lifecycle_reset", monkeypatch, tmp_path)
+    app_client = api.app.test_client()
+    payload = profile_payload(revision=3)
+    created = app_client.post("/browser/profiles", json=payload)
+    assert created.status_code == 200
+
+    reset = app_client.delete("/browser/profiles?domain=fixture.example")
+
+    assert reset.status_code == 200
+    assert reset.get_json()["deleted_profile_ids"] == ["fixture-profile"]
+    assert app_client.get("/browser/profiles/fixture-profile").status_code == 404
+    selector_payload = app_client.get("/browser/selectors?domain=fixture.example").get_json()
+    assert selector_payload["selectors"] == {}
+    assert selector_payload["profile_revision"] == 0
+    persisted = json.loads((tmp_path / "profile_registry.json").read_text(encoding="utf-8"))
+    assert persisted["profiles"] == {}
+
+
+def test_profile_reset_is_idempotent_and_scoped_to_one_exact_domain(tmp_path, monkeypatch):
+    api = load_api("profile_lifecycle_reset_scope", monkeypatch, tmp_path)
+    app_client = api.app.test_client()
+    fixture_payload = profile_payload()
+    other_profile = valid_profile()
+    other_profile.update({
+        "profileId": "other-profile",
+        "domain": "other.example",
+        "origin": "https://other.example/chat",
+    })
+    other_payload = {
+        "client_id": "client-a",
+        "profile": other_profile,
+        "revision": 1,
+        "checksum": profile_checksum(other_profile),
+    }
+    assert app_client.post("/browser/profiles", json=fixture_payload).status_code == 200
+    assert app_client.post("/browser/profiles", json=other_payload).status_code == 200
+
+    first = app_client.delete("/browser/profiles?domain=fixture.example")
+    second = app_client.delete("/browser/profiles?domain=fixture.example")
+
+    assert first.status_code == 200
+    assert first.get_json()["deleted_profile_ids"] == ["fixture-profile"]
+    assert second.status_code == 200
+    assert second.get_json()["deleted_profile_ids"] == []
+    assert app_client.get("/browser/profiles/other-profile").status_code == 200
+
+
+def test_profile_reset_requires_a_domain(tmp_path, monkeypatch):
+    api = load_api("profile_lifecycle_reset_requires_domain", monkeypatch, tmp_path)
+    response = api.app.test_client().delete("/browser/profiles")
+    assert response.status_code == 400
+    assert response.get_json()["error"]["code"] == "profile_domain_missing"
 
 
 def test_selector_bootstrap_exposes_the_persisted_profile_revision(tmp_path, monkeypatch):

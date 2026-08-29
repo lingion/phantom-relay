@@ -226,6 +226,17 @@ def test_browser_status_snapshot_exposes_capabilities_without_secrets():
     assert snap['jobs'][job['id']]['status'] == 'queued'
 
 
+def test_browser_status_snapshot_preserves_terminal_job_client_identity():
+    api.BROWSER_JOBS.clear(); api.BROWSER_QUEUE.clear(); api.BROWSER_CLIENTS.clear()
+    job = api.new_browser_job('x', domain='example.com', model='m')
+    job.update(status='claimed', tab_id=7, client_id='client-7')
+    api.finish_browser_job(job['id'], 'completed', result={'assistant': 'ok'})
+
+    terminal = api.browser_status_snapshot()['terminal_jobs'][job['id']]
+
+    assert terminal['client_id'] == 'client-7'
+
+
 def test_conversation_binding_prevents_cross_tab_claim():
     api.BROWSER_JOBS.clear(); api.BROWSER_QUEUE.clear(); api.BROWSER_CLIENTS.clear(); api.BROWSER_BINDINGS.clear()
     job = api.new_browser_job('x', domain='example.com', model='m', conversation_id='conv-1')

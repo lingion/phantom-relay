@@ -2,6 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
+import vm from 'node:vm';
 import { fileURLToPath } from 'node:url';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
@@ -10,11 +11,282 @@ const executableContentSource = contentSource
   .replace(/\/\*[\s\S]*?\*\//g, '')
   .replace(/(^|\s)\/\/.*$/gm, '$1');
 
+function loadNamedFunction(source, name, context = {}) {
+  const start = source.indexOf(`function ${name}(`);
+  assert.notEqual(start, -1, `${name} must exist in content runtime`);
+  let depth = 0;
+  let bodyStarted = false;
+  for (let index = start; index < source.length; index += 1) {
+    if (source[index] === '{') {
+      bodyStarted = true;
+      depth += 1;
+    } else if (source[index] === '}') {
+      depth -= 1;
+      if (bodyStarted && depth === 0) {
+        return vm.runInNewContext(`(${source.slice(start, index + 1)})`, context);
+      }
+    }
+  }
+  assert.fail(`${name} function body was not complete`);
+}
+
 test('content capture does not call the removed response helper', () => {
   assert.doesNotMatch(
     executableContentSource,
     /\bfindBestVisibleAssistantResponse\b/,
     'content.js contains a call to an undefined response helper'
+  );
+});
+
+test('recorded input owner survives selector state changes and only re-queries after detach', () => {
+  const connectedInput = { isConnected: true };
+  const replacementInput = { isConnected: true };
+  const queries = [];
+  const resolveRecordedInputOwner = loadNamedFunction(
+    contentSource,
+    'resolveRecordedInputOwner',
+    {
+      document: {
+        querySelector(selector) {
+          queries.push(selector);
+          return replacementInput;
+        },
+      },
+    },
+  );
+
+  assert.equal(
+    resolveRecordedInputOwner('div.editor.empty', connectedInput),
+    connectedInput,
+    'a connected recorded input remains the request owner after its selector stops matching',
+  );
+  assert.deepEqual(queries, [], 'a connected owner must not be replaced by a fresh selector match');
+
+  connectedInput.isConnected = false;
+  assert.equal(
+    resolveRecordedInputOwner('div.editor.empty', connectedInput),
+    replacementInput,
+    'the original recorded selector may be queried only after the captured owner detaches',
+  );
+  assert.deepEqual(queries, ['div.editor.empty']);
+});
+
+test('interactable input resolution replaces a stale connected SPA node', () => {
+  const staleInput = {
+    isConnected: true,
+    interactable: false,
+    matches: () => true,
+  };
+  const liveInput = {
+    isConnected: true,
+    interactable: true,
+    matches: () => true,
+  };
+  const context = {
+    document: {
+      activeElement: null,
+      querySelectorAll() {
+        return [liveInput];
+      },
+    },
+    ProfileHealth: {
+      isInputInteractable(element) {
+        return !!element?.interactable;
+      },
+    },
+    selectorDescriptor(value) {
+      return { css: String(value || ''), alternatives: [] };
+    },
+  };
+  const inputCandidateInteractable = loadNamedFunction(
+    contentSource,
+    'inputCandidateInteractable',
+    context,
+  );
+  const recordedInputCandidates = loadNamedFunction(
+    contentSource,
+    'recordedInputCandidates',
+    { ...context, inputCandidateInteractable },
+  );
+  const resolveInteractableRecordedInput = loadNamedFunction(
+    contentSource,
+    'resolveInteractableRecordedInput',
+    { ...context, recordedInputCandidates, inputCandidateInteractable },
+  );
+
+  assert.equal(
+    resolveInteractableRecordedInput('textarea.message-input-textarea', staleInput),
+    liveInput,
+    'a connected but covered/disabled owner must not block selection of the live replacement',
+  );
+});
+
+test('legacy stateful input selectors derive stable alternatives before readiness checks', () => {
+  const queried = [];
+  const context = {
+    document: {
+      querySelectorAll(selector) {
+        queried.push(selector);
+        return selector === 'div.tiptap.ProseMirror' ? [{}] : [];
+      },
+    },
+  };
+  const deriveStableSelectorAlternatives = loadNamedFunction(
+    contentSource,
+    'deriveStableSelectorAlternatives',
+    context,
+  );
+  const normalizeRecordedSelector = loadNamedFunction(
+    contentSource,
+    'normalizeRecordedSelector',
+    {
+      ...context,
+      deriveStableSelectorAlternatives,
+    },
+  );
+
+  const normalized = normalizeRecordedSelector({
+    css: 'div.tiptap.ProseMirror.ProseMirror-focused',
+    alternatives: [],
+  });
+  assert.equal(normalized.css, 'div.tiptap.ProseMirror.ProseMirror-focused');
+  assert.equal(normalized.alternatives.length, 1);
+  assert.equal(normalized.alternatives[0], 'div.tiptap.ProseMirror');
+  assert.equal(
+    normalized.css,
+    'div.tiptap.ProseMirror.ProseMirror-focused',
+    'a historical focus-state selector must retain its recording value',
+  );
+  assert.ok(queried.includes('div.tiptap.ProseMirror'));
+});
+
+test('auto capture uses the recorded input owner through boundary, keyboard dispatch, and observation', () => {
+  const captureStart = contentSource.indexOf('async function autoCapture(');
+  const captureEnd = contentSource.indexOf('function requestAutoCaptureCancellation(', captureStart);
+  const captureSource = contentSource.slice(captureStart, captureEnd);
+  const observationStart = contentSource.indexOf('async function waitForSendObservation(');
+  const observationEnd = contentSource.indexOf('async function autoCapture(', observationStart);
+  const observationSource = contentSource.slice(observationStart, observationEnd);
+
+  assert.match(captureSource, /const preSendInput\s*=\s*await waitForInteractableRecordedInput\(/);
+  assert.match(
+    captureSource,
+    /dispatchRecordedKeyboardOnce\(inputEl,/,
+    'Enter and shortcut dispatch must target the revalidated recorded input owner',
+  );
+  assert.match(
+    captureSource,
+    /waitForSendObservation\(\{[\s\S]{0,420}inputElement:\s*inputEl/,
+    'send observation must receive the same recorded input owner',
+  );
+  assert.match(
+    observationSource,
+    /const input\s*=\s*resolveInteractableRecordedInput\(inputSelector,\s*inputElement\)/,
+    'send observation must re-resolve the recorded input after a DOM replacement',
+  );
+});
+
+test('readiness and auto capture require the recorded input to remain interactable', () => {
+  const readinessStart = contentSource.indexOf("case 'wait_until_ready':");
+  const readinessEnd = contentSource.indexOf("case 'get_profile_health':", readinessStart);
+  const readinessSource = contentSource.slice(readinessStart, readinessEnd);
+  const captureStart = contentSource.indexOf('async function autoCapture(');
+  const captureEnd = contentSource.indexOf('function requestAutoCaptureCancellation(', captureStart);
+  const captureSource = contentSource.slice(captureStart, captureEnd);
+
+  assert.match(
+    readinessSource,
+    /waitForInteractableRecordedInput\(/,
+    'a covered or disabled recorded input must never publish a ready lease',
+  );
+  assert.match(
+    captureSource,
+    /waitForInteractableRecordedInput\(/,
+    'the recorded owner must be revalidated immediately before the single send action',
+  );
+  assert.match(captureSource, /recorded_input_not_interactable/);
+});
+
+test('readiness waits for dynamic page elements after static profile validation', () => {
+  const readinessStart = contentSource.indexOf("case 'wait_until_ready':");
+  const readinessEnd = contentSource.indexOf("case 'get_profile_health':", readinessStart);
+  const readinessSource = contentSource.slice(readinessStart, readinessEnd);
+  assert.match(
+    readinessSource,
+    /const profileHealth = activeProfile\s*\?\s*runProfileHealthCheck\(activeProfile,\s*\{[\s\S]{0,240}document:\s*null/,
+    'initial readiness validation must not fail because the SPA composer has not rendered yet',
+  );
+  assert.match(
+    readinessSource,
+    /const finalHealth = liveHealth \|\| \(activeProfile\s*\?\s*runProfileHealthCheck\(activeProfile,\s*\{[\s\S]{0,180}\}\)\s*:\s*null\)/,
+    'readiness timeout must return the live metadata-only health report',
+  );
+});
+
+test('readiness revalidates live recorded response identity before publishing a ready lease', () => {
+  const readinessStart = contentSource.indexOf("case 'wait_until_ready':");
+  const readinessEnd = contentSource.indexOf("case 'get_profile_health':", readinessStart);
+  const readinessSource = contentSource.slice(readinessStart, readinessEnd);
+  const liveHealthStart = readinessSource.indexOf('liveHealth = activeProfile');
+  const liveHealthInvalid = readinessSource.indexOf("liveHealth?.state === 'invalid'", liveHealthStart);
+  const readyLease = readinessSource.indexOf('sendResponse({ ready: true', liveHealthInvalid);
+  assert.ok(liveHealthStart >= 0, 'ready must run live profile health after the SPA input exists');
+  assert.match(
+    readinessSource.slice(liveHealthStart, liveHealthInvalid),
+    /runProfileHealthCheck\(activeProfile,\s*\{[\s\S]*allowMissingResponse:\s*true[\s\S]*requireRecordedIdentity:\s*true/,
+    'ready must use the same live recorded-identity requirement that capture relies on',
+  );
+  assert.ok(liveHealthInvalid > liveHealthStart, 'live identity failure must be checked after live health');
+  assert.ok(readyLease > liveHealthInvalid, 'live identity failure must be rejected before publishing ready');
+});
+
+test('auto capture rejects a drifted recorded response identity before mutating the input', () => {
+  const captureStart = contentSource.indexOf('async function autoCapture(');
+  const captureEnd = contentSource.indexOf('function requestAutoCaptureCancellation(', captureStart);
+  const captureSource = contentSource.slice(captureStart, captureEnd);
+  const identityPreflight = captureSource.indexOf('const identityGapBeforeSend = recordedResponseIdentityGap()');
+  const inputMutation = captureSource.indexOf('setInputValue(inputEl, userMessage)');
+
+  assert.ok(identityPreflight >= 0, 'capture must inspect the recorded identity before sending');
+  assert.ok(inputMutation > identityPreflight, 'identity drift must fail before the user prompt reaches the page');
+  assert.match(
+    captureSource.slice(identityPreflight, inputMutation),
+    /profile_identity_unavailable/,
+    'a stale analytics identity must produce an actionable profile error without dispatch',
+  );
+});
+
+test('response identity recording rejects analytics exposure attributes', () => {
+  const documentBody = {};
+  const candidate = {
+    attributes: [{ name: 'data-hy-exposured', value: 'true' }],
+    parentElement: documentBody,
+    getAttribute(name) {
+      return name === 'data-hy-exposured' ? 'true' : null;
+    },
+    contains(node) {
+      return node === this;
+    },
+  };
+  const stableIdentityElement = loadNamedFunction(contentSource, 'stableIdentityElement', {
+    CSS: { escape: value => String(value) },
+    document: {
+      body: documentBody,
+      querySelectorAll(selector) {
+        return selector === '[data-hy-exposured]' ? [candidate] : [];
+      },
+    },
+  });
+
+  assert.deepEqual(
+    Array.from(stableIdentityElement(candidate).attributes),
+    [],
+    'viewport exposure and analytics state cannot become a reusable message identity',
+  );
+  assert.match(
+    contentSource,
+    /exposure\|exposed\|exposured\|impression\|intersection\|observer/,
+    'the provider-neutral exclusion vocabulary must cover common exposure telemetry names',
   );
 });
 
@@ -50,6 +322,62 @@ test('unrecorded pages stay dormant until the user records or a valid profile is
   );
 });
 
+test('content readiness and capture leases identify the actual page build', () => {
+  assert.match(
+    contentSource,
+    /type:\s*['"]page_ready['"][\s\S]{0,160}content_script_version:\s*CONTENT_SCRIPT_VERSION/,
+    'page_ready must identify the content script that emitted the lease',
+  );
+  assert.match(
+    contentSource,
+    /type:\s*['"]capture_heartbeat['"][\s\S]{0,420}content_script_version:\s*CONTENT_SCRIPT_VERSION/,
+    'capture heartbeat must retain the same page build identity during streaming',
+  );
+  assert.match(
+    contentSource,
+    /sendResponse\(\{\s*ready:\s*true,[\s\S]{0,180}content_script_version:\s*CONTENT_SCRIPT_VERSION/,
+    'wait_until_ready must return the actual content build with its readiness result',
+  );
+});
+
+test('content runtime performs one bounded extension reload when an older worker rejects its build', () => {
+  assert.match(
+    contentSource,
+    /async function recoverRuntimeVersionMismatch\(response\)/,
+    'the page runtime must own recovery when it is newer than the in-memory worker',
+  );
+  assert.match(
+    contentSource,
+    /response\?\.error !== ['"]content_script_version_mismatch['"][\s\S]{0,160}return false/,
+    'only an explicit version rejection may trigger extension reload',
+  );
+  assert.match(
+    contentSource,
+    /stopReadyLease\(\)[\s\S]{0,1000}root\?\.getAttribute\(RUNTIME_RELOAD_MARKER\)[\s\S]{0,1000}root\?\.setAttribute\(RUNTIME_RELOAD_MARKER[\s\S]{0,1200}reload_extension_runtime/,
+    'recovery must stop heartbeat churn, persist a DOM throttle, and request reload from the worker',
+  );
+  assert.doesNotMatch(
+    contentSource,
+    /chrome\.storage\.session/,
+    'storage.session is not exposed to content scripts by default and cannot own recovery',
+  );
+  assert.doesNotMatch(
+    contentSource,
+    /chrome\.runtime\.reload\(\)/,
+    'content scripts cannot invoke chrome.runtime.reload; the service worker owns extension reload',
+  );
+  assert.match(
+    contentSource,
+    /RUNTIME_RELOAD_THROTTLE_MS\s*=\s*30000/,
+    'reload recovery must have a fixed anti-loop window',
+  );
+  assert.match(
+    contentSource,
+    /recoverRuntimeVersionMismatch\(value\)\.finally\(finish\)/,
+    'the page-ready callback must invoke recovery from the actual mismatch response',
+  );
+});
+
 test('runtime profile health and replay preserve recorded selector alternatives', () => {
   assert.match(
     executableContentSource,
@@ -58,7 +386,7 @@ test('runtime profile health and replay preserve recorded selector alternatives'
   );
   assert.match(
     executableContentSource,
-    /waitForElement\(selectorDescriptor\(selectors\.input\)/,
+    /waitForInteractableRecordedInput\(\s*selectorDescriptor\(selectors\.input\)/,
     'readiness must probe the primary selector and its recorded alternatives'
   );
   assert.doesNotMatch(
@@ -114,8 +442,8 @@ test('recorded response freshness accepts a visible changed projection when a lo
   );
   assert.match(
     contentSource,
-    /if \(nextText\.length >= oldText\.length\) return true/,
-    'same-key responses must preserve the existing non-shortening freshness rule'
+    /oldComparable\.includes\(nextComparable\)[\s\S]{0,120}nextComparable\.includes\(oldComparable\)/,
+    'same-key growth that retains the old response body must be rejected as stale augmentation'
   );
   assert.match(
     contentSource,
@@ -129,8 +457,8 @@ test('recorded response freshness accepts a visible changed projection when a lo
   );
   assert.match(
     contentSource,
-    /stable >= 3[\s\S]{0,500}snapshot\.text\.length >= 1/,
-    'a stable non-streaming response is allowed to contain one valid character'
+    /completionObservation\.complete[\s\S]{0,180}snapshot\.text\.length >= 1/,
+    'a settled response is allowed to contain one valid character'
   );
   assert.match(
     contentSource,
@@ -139,9 +467,9 @@ test('recorded response freshness accepts a visible changed projection when a lo
   );
 });
 
-test('a fresh logical response may repeat text from an earlier turn', () => {
+test('a fresh-looking identity cannot repeat exact pre-send text without stronger ownership proof', () => {
   const snapshotStart = contentSource.indexOf('function recordedResponseSnapshot(');
-  const snapshotEnd = contentSource.indexOf('function findDirectCandidate(', snapshotStart);
+  const snapshotEnd = contentSource.indexOf('function recordedResponseIdentityGap(', snapshotStart);
   const snapshotSource = snapshotStart >= 0 && snapshotEnd > snapshotStart
     ? contentSource.slice(snapshotStart, snapshotEnd)
     : '';
@@ -150,19 +478,19 @@ test('a fresh logical response may repeat text from an earlier turn', () => {
     /isFreshRecordedResponse\(item\.key, item\.text, beforeKeys, item\.region\)/,
     'fresh identity must remain the authoritative response boundary'
   );
-  assert.doesNotMatch(
+  assert.match(
     snapshotSource,
-    /isFreshRecordedResponse\(item\.key, item\.text, beforeKeys, item\.region\)[\s\S]{0,120}responseTextWasPresentBefore\(item\.text\)/,
-    'a new message identity must not be rejected only because an earlier turn had the same answer text'
+    /likelyUserEcho\(item\.text, userMessage, item\.role\)/,
+    'all recorded candidates must pass request-epoch stale text rejection'
   );
 
   const waitStart = contentSource.indexOf('async function waitForFreshAssistantResponse');
   const waitEnd = contentSource.indexOf('async function waitForVisibleResponse', waitStart);
   const waitSource = waitStart >= 0 && waitEnd > waitStart ? contentSource.slice(waitStart, waitEnd) : '';
-  assert.doesNotMatch(
+  assert.match(
     waitSource,
-    /snapshot\.text[\s\S]{0,120}responseTextWasPresentBefore\(snapshot\.text\)/,
-    'the completion loop must settle a fresh repeated answer instead of waiting for the API deadline'
+    /likelyUserEcho\(snapshot\.text, userMessage, snapshot\.role\)/,
+    'the completion loop must fail closed on pre-send text projected as a new response'
   );
 });
 
@@ -210,6 +538,84 @@ test('fresh user evidence accepts a changed projection when a logical key is reu
   );
 });
 
+test('recorded response candidate diagnostics expose rejection predicates without page text', () => {
+  const snapshotStart = contentSource.indexOf('function recordedResponseSnapshot(');
+  const snapshotEnd = contentSource.indexOf('function recordedResponseIdentityGap(', snapshotStart);
+  const snapshotSource = snapshotStart >= 0 && snapshotEnd > snapshotStart
+    ? contentSource.slice(snapshotStart, snapshotEnd)
+    : '';
+
+  assert.match(snapshotSource, /recorded_response_candidate_evaluated/);
+  assert.match(snapshotSource, /freshIdentity/);
+  assert.match(snapshotSource, /freshResponse/);
+  assert.match(snapshotSource, /userEcho/);
+  assert.match(snapshotSource, /afterFreshUser/);
+  assert.match(snapshotSource, /promptPrefix/);
+  const diagnosticStart = snapshotSource.indexOf("emitPageTrace('recorded_response_candidate_evaluated'");
+  const diagnosticEnd = snapshotSource.indexOf('});', diagnosticStart);
+  const diagnosticSource = diagnosticStart >= 0 && diagnosticEnd > diagnosticStart
+    ? snapshotSource.slice(diagnosticStart, diagnosticEnd)
+    : '';
+  assert.doesNotMatch(
+    diagnosticSource,
+    /\btext\s*:/,
+    'candidate diagnostics must stay metadata-only and never record page text',
+  );
+});
+
+test('recorded response diagnostics expose aggregate projection selection metadata without page text', () => {
+  const start = contentSource.indexOf("emitPageTrace('recorded_response_candidate_evaluated'");
+  const end = contentSource.indexOf('const freshAssistant', start);
+  const diagnosticSource = start >= 0 && end > start ? contentSource.slice(start, end) : '';
+
+  for (const field of [
+    'projectionCount',
+    'selectedIndex',
+    'selectedSpecificity',
+    'selectedDepth',
+    'connected',
+    'visible',
+    'requestedLength',
+    'domLength',
+    'identityLength',
+    'domContainsRequested',
+    'identityContainsRequested',
+  ]) {
+    assert.match(diagnosticSource, new RegExp(`${field}:`), `${field} must be available in metadata-only diagnostics`);
+  }
+  assert.doesNotMatch(diagnosticSource, /text:\s*candidate\.item\.text/);
+  assert.doesNotMatch(
+    diagnosticSource,
+    /projectionMembers/,
+    'temporary per-projection member details must not inflate every response diagnostic sample',
+  );
+});
+
+test('transient recorded-response gaps preserve identity continuity and reject prefix regressions', () => {
+  const start = contentSource.indexOf('async function waitForFreshAssistantResponse(');
+  const end = contentSource.indexOf('async function waitForVisibleResponse(', start);
+  const waitSource = start >= 0 && end > start ? contentSource.slice(start, end) : '';
+  const noSnapshotStart = waitSource.indexOf('if (Date.now() - started < timeout)');
+  const noSnapshotSource = noSnapshotStart >= 0 ? waitSource.slice(Math.max(0, noSnapshotStart - 360), noSnapshotStart) : '';
+
+  assert.doesNotMatch(
+    noSnapshotSource,
+    /responseIdentityState\s*=\s*ResponseObservation[\s\S]{0,180}createIdentityState/,
+    'a temporary projection gap must not erase the identity observations already earned by the same response',
+  );
+  assert.doesNotMatch(
+    noSnapshotSource,
+    /responseCompletionState\s*=\s*ResponseObservation\?\.createCompletionState/,
+    'a temporary projection gap must not restart the response age and quiet clocks',
+  );
+  assert.match(waitSource, /completionObservation\.projectionRegressed/);
+  assert.match(
+    waitSource,
+    /if \(completionObservation\.projectionRegressed\)[\s\S]{0,420}continue;/,
+    'a shorter prefix projection must stay in observation instead of becoming caller-facing best text',
+  );
+});
+
 test('recorded shortcut dispatch is not retried when the page exposes only assistant DOM', () => {
   const dispatched = contentSource.indexOf('send_recorded_shortcut_dispatched');
   const observed = contentSource.indexOf('await waitForSendObservation(', dispatched);
@@ -224,7 +630,7 @@ test('recorded shortcut dispatch is not retried when the page exposes only assis
   );
 });
 
-test('button replay requires bounded provider-neutral send observation before the long response wait', () => {
+test('button replay shares the request deadline with provider-neutral send observation', () => {
   const start = contentSource.indexOf('async function autoCapture(');
   const end = contentSource.indexOf('function normalizeRecordedSelector(', start);
   const autoCaptureSource = start >= 0 && end > start ? contentSource.slice(start, end) : '';
@@ -238,10 +644,60 @@ test('button replay requires bounded provider-neutral send observation before th
     /send_not_observed/,
     'an action with no page effect must return a structured failure'
   );
+  assert.match(
+    autoCaptureSource,
+    /const sendObservationTimeoutMs\s*=\s*Math\.max\(\s*2000,\s*Math\.min\(30000,\s*captureDeadlineAt\s*-\s*Date\.now\(\)\s*\)/,
+    'send observation must allow a bounded cold-page acceptance window while remaining inside the request deadline'
+  );
+  assert.doesNotMatch(
+    autoCaptureSource,
+    /const sendObservationTimeoutMs\s*=\s*Math\.max\(1,\s*captureDeadlineAt\s*-\s*Date\.now\(\)/,
+    'send observation must not consume the entire model response deadline'
+  );
   assert.doesNotMatch(
     autoCaptureSource,
     /Date\.now\(\)\s*-\s*evidenceStarted[\s\S]{0,300}60000/,
     'button replay must not hold the request for a fixed 60-second projection wait'
+  );
+});
+
+test('consumed input keeps the single dispatch alive for authoritative response observation', () => {
+  const observationStart = contentSource.indexOf('async function waitForSendObservation(');
+  const observationEnd = contentSource.indexOf('\n  // 这里不再依赖 copy 按钮', observationStart);
+  const observationSource = observationStart >= 0 && observationEnd > observationStart
+    ? contentSource.slice(observationStart, observationEnd)
+    : '';
+  const weakBranch = observationSource.indexOf('if (observation.weak) {');
+  const weakReturn = observationSource.indexOf('return {', weakBranch);
+  const nextWait = observationSource.indexOf('await observationWake.wait(250)', weakBranch);
+  assert.ok(
+    weakBranch >= 0 && weakReturn > weakBranch && nextWait > weakReturn,
+    'consumed input must move immediately into response observation instead of wasting the send window',
+  );
+  const start = contentSource.indexOf('async function autoCapture(');
+  const end = contentSource.indexOf('function normalizeRecordedSelector(', start);
+  const autoCaptureSource = start >= 0 && end > start ? contentSource.slice(start, end) : '';
+  assert.match(
+    autoCaptureSource,
+    /if \(!sendObservation\.observed && !sendObservation\.weak\)/,
+    'a dispatched action with no page effect must fail, while consumed input remains pending',
+  );
+  assert.match(
+    autoCaptureSource,
+    /send_observation_pending/,
+    'weak input-consumption evidence must remain visible in structured diagnostics',
+  );
+  const pending = autoCaptureSource.indexOf('send_observation_pending');
+  const responseWait = autoCaptureSource.indexOf('await waitForFreshAssistantResponse(', pending);
+  assert.ok(
+    pending >= 0 && responseWait > pending,
+    'weak evidence must proceed to the authoritative fresh-response boundary',
+  );
+  const betweenPendingAndResponse = autoCaptureSource.slice(pending, responseWait);
+  assert.doesNotMatch(
+    betweenPendingAndResponse,
+    /safeClick\(|dispatchRecordedKeyboardOnce\(/,
+    'pending send evidence must never authorize a second submission',
   );
 });
 
@@ -301,7 +757,7 @@ test('send and response observation helpers are loaded before the content runtim
   assert.match(contentSource, /PhantomRelayResponseObservation/);
 });
 
-test('recorded Enter dispatch is provider-neutral and single-shot when outcome is unknown', () => {
+test('recorded Enter dispatch uses the trusted bridge and remains single-shot when outcome is unknown', () => {
   assert.match(
     contentSource,
     /function dispatchRecordedKeyboardOnce\(/,
@@ -310,9 +766,11 @@ test('recorded Enter dispatch is provider-neutral and single-shot when outcome i
   assert.match(
     contentSource,
     /dispatchRecordedKeyboardOnce\(inputEl,\s*\{\s*key:\s*sendKey/,
-    'auto capture must use the single-shot Enter dispatcher'
+    'auto capture must use the revalidated recorded input owner at the single-shot Enter boundary'
   );
-  assert.doesNotMatch(contentSource, /cdp_dispatch_key|Input\.dispatchKeyEvent/);
+  assert.match(contentSource, /type:\s*'dispatch_recorded_keyboard'/);
+  assert.match(contentSource, /await dispatchRecordedKeyboardOnce\(/);
+  assert.doesNotMatch(contentSource, /new KeyboardEvent\(/);
   assert.doesNotMatch(
     contentSource,
     /for \(let attempt = 1; attempt <= 3 && !sendEvidence; attempt\+\+\)/,
@@ -376,6 +834,23 @@ test('stream relay cannot bypass the recorded response identity boundary', () =>
     contentSource,
     /activeStreamDeltaTimer|startStreamDelta|stopStreamDelta/,
     'streaming must use the identity-checked capture loop, not an unchecked side channel'
+  );
+});
+
+test('recorded streaming indicators are observed inside the response region', () => {
+  const start = contentSource.indexOf('function elementRecord(');
+  const end = contentSource.indexOf('\n  function pageNodeInfo(', start);
+  const helper = start >= 0 && end > start ? contentSource.slice(start, end) : '';
+  assert.ok(start >= 0 && end > start, 'elementRecord must remain inspectable');
+  assert.match(
+    helper,
+    /querySelector\?\./,
+    'indicator matching must inspect descendants when a page puts streaming state on a child node',
+  );
+  assert.match(
+    helper,
+    /matchesElementOrDescendant\(/,
+    'response activity must use one provider-neutral descendant-aware matcher',
   );
 });
 
@@ -458,7 +933,7 @@ test('fresh response changes relay snapshots from the authoritative completion l
   );
   assert.match(
     functionSource,
-    /if \(identityObservation\.qualified && \(snapshotChanged \|\| identityObservation\.becameQualified\)\) \{\s*relayCaptureSnapshot\(/,
+    /if \(identityObservation\.qualified && \(completionObservation\.changed \|\| identityObservation\.becameQualified\)\) \{\s*relayCaptureSnapshot\(/,
     'caller-facing streaming must remain inside the qualified recorded-identity branch'
   );
 });
@@ -474,8 +949,8 @@ test('response capture timeout is not reduced to 15 seconds for short prompts', 
   );
   assert.match(
     autoCaptureSource,
-    /const freshTimeoutMs\s*=\s*Math\.max\(\s*120000/,
-    'capture must retain a progress-aware long-running window'
+    /const freshTimeoutMs\s*=\s*Math\.max\(1,\s*captureDeadlineAt\s*-\s*Date\.now\(\)\)/,
+    'response observation must consume only the remaining request deadline'
   );
   assert.match(
     autoCaptureSource,
@@ -484,14 +959,15 @@ test('response capture timeout is not reduced to 15 seconds for short prompts', 
   );
 });
 
-test('DOM completion uses page activity and repeated snapshots instead of fixed silence', () => {
+test('DOM completion uses page activity and body quiet settlement instead of snapshot counts', () => {
   const start = contentSource.indexOf('async function waitForFreshAssistantResponse');
   const end = contentSource.indexOf('async function waitForVisibleResponse', start);
   const waitSource = start >= 0 && end > start ? contentSource.slice(start, end) : '';
   assert.match(waitSource, /responseActivityState\(/, 'completion must inspect provider-neutral page activity');
-  assert.match(waitSource, /generationSignalSeen/, 'completion must remember whether the page exposed an active generation signal');
-  assert.match(waitSource, /stable >= 3[\s\S]{0,180}!snapshot\.streaming/, 'completion must require repeated identity-checked snapshots after activity stops');
-  assert.doesNotMatch(waitSource, /NO_INDICATOR_SETTLE_WINDOW_MS|completionSettleWindowMs|lastChangeAt/, 'completion must not use a fixed silent interval');
+  assert.match(waitSource, /observeCompletion\(/, 'completion must use the request-scoped body settlement state');
+  assert.match(waitSource, /requestStreamingSeen/, 'static inactive indicators must not bypass request-scoped activity history');
+  assert.match(waitSource, /recorded_response_completion_state/, 'completion diagnostics must expose metadata-only state transitions');
+  assert.doesNotMatch(waitSource, /stable\s*>=\s*3/, 'three polling observations must not be terminal evidence');
 
   const autoStart = contentSource.indexOf('async function autoCapture(');
   const autoEnd = contentSource.indexOf('function normalizeRecordedSelector(', autoStart);
@@ -518,7 +994,7 @@ test('recorded response observation is event-driven in hidden provider tabs', ()
   assert.match(contentSource, /capture_observation_tick/, 'the extension worker must supply the fallback stability tick');
 });
 
-test('only recorded response activity controls completion', () => {
+test('only recorded response activity or a request-scoped generation control controls completion', () => {
   assert.match(contentSource, /const GENERATION_CONTROL_PATTERN/);
   assert.match(contentSource, /function activeGenerationControl\(\)/);
   assert.match(contentSource, /button, \[role="button"\], \[aria-label\], \[title\]/);
@@ -527,8 +1003,9 @@ test('only recorded response activity controls completion', () => {
   const responseSource = responseStart >= 0 && responseEnd > responseStart
     ? contentSource.slice(responseStart, responseEnd)
     : '';
-  assert.match(responseSource, /isResponseStreaming\(\{ recordedMarker: marker \}\)/);
-  assert.doesNotMatch(responseSource, /activeGenerationControl/);
+  assert.match(responseSource, /activeGenerationControl\(\)/);
+  assert.match(responseSource, /generationStateBefore\?\.control/);
+  assert.match(responseSource, /isResponseStreaming\(\{ recordedMarker: marker, requestControl: control \}\)/);
   assert.match(contentSource, /function sendActivityState\([\s\S]{0,300}activeGenerationControl/);
   assert.doesNotMatch(contentSource, /Doubao|DeepSeek|Qwen|Wenxin/);
 });
@@ -578,7 +1055,7 @@ test('recorded response snapshot unions primary and derived selector matches', (
 
 test('recorded response snapshots clean generic status lines before freshness decisions', () => {
   const start = contentSource.indexOf('function recordedResponseSnapshot(');
-  const end = contentSource.indexOf('function findDirectCandidate(', start);
+  const end = contentSource.indexOf('function recordedResponseIdentityGap(', start);
   const functionSource = start >= 0 && end > start ? contentSource.slice(start, end) : '';
   assert.match(
     functionSource,
@@ -592,19 +1069,38 @@ test('recorded response snapshots clean generic status lines before freshness de
   );
 });
 
-test('recorded response projections keep the longest text for each declared identity', () => {
+test('recorded response candidates exclude incomplete requested-output prefixes from eligibility', () => {
   const start = contentSource.indexOf('function recordedResponseSnapshot(');
-  const end = contentSource.indexOf('function findDirectCandidate(', start);
+  const end = contentSource.indexOf('function recordedResponseIdentityGap(', start);
   const functionSource = start >= 0 && end > start ? contentSource.slice(start, end) : '';
   assert.match(
     functionSource,
-    /selectLongestProjection\(group\)/,
-    'a message identity must select the longest live text projection'
+    /eligible:\s*freshResponse\s*&&\s*!userEcho\s*&&\s*!promptPrefix\s*&&\s*afterFreshUser/,
+    'diagnostic eligibility must match the completion loop prefix rejection gate',
+  );
+});
+
+test('recorded response regions prefer direct body matches over same-identity scope fallbacks', () => {
+  const start = contentSource.indexOf('function responseRegionElements()');
+  const end = contentSource.indexOf('function elementDepth(', start);
+  const functionSource = start >= 0 && end > start ? contentSource.slice(start, end) : '';
+  assert.match(functionSource, /responseProjectionElements\(\)/);
+  assert.match(functionSource, /mergeRecordedRegionElements\(/);
+});
+
+test('recorded response projections keep the recorded body instead of the longest identity container', () => {
+  const start = contentSource.indexOf('function recordedResponseSnapshot(');
+  const end = contentSource.indexOf('function recordedResponseIdentityGap(', start);
+  const functionSource = start >= 0 && end > start ? contentSource.slice(start, end) : '';
+  assert.match(
+    functionSource,
+    /selectRecordedProjection\(group\)/,
+    'a message identity must select the most specific recorded body projection'
   );
   assert.doesNotMatch(
     functionSource,
-    /const leaves = group\.filter\(/,
-    'an inner short projection must not hide the complete outer message text'
+    /selectLongestProjection\(group\)/,
+    'outer container length must not decide the returned assistant body'
   );
 });
 
@@ -839,11 +1335,18 @@ test('response recording discovers provider-neutral identity without freezing dy
     /name\.startsWith\(['"]data-['"]\)/,
     'recording must inspect actual provider-neutral data attributes instead of naming providers'
   );
-  assert.match(
-    contentSource,
-    /containerSelector\s*=\s*!structuralIdentity\s*&&\s*identity\.element\s*!==\s*responseElement[\s\S]{0,700}generateStableContainerSelector\(identity\.element\)/,
-    'recording must keep the response container structural and reserve identity values for freshness checks'
+  const profileBuilderStart = contentSource.indexOf('function buildRecordedProfile(');
+  const profileBuilderEnd = contentSource.indexOf('function selectorMatchCount(', profileBuilderStart);
+  const profileBuilderSource = contentSource.slice(profileBuilderStart, profileBuilderEnd);
+  const containerDefinition = profileBuilderSource.indexOf('const containerSelector = !structuralIdentity');
+  const scopedGenerator = profileBuilderSource.indexOf(
+    'generateStableContainerSelector(identity.element, identity.attributes)',
+    containerDefinition,
   );
+  assert.ok(containerDefinition >= 0 && scopedGenerator > containerDefinition,
+    'every attribute identity must persist a reusable response scope, including when the clicked body is the identity node');
+  assert.doesNotMatch(profileBuilderSource, /identity\.element\s*!==\s*responseElement/,
+    'identity on the clicked response body still needs a reusable scope');
   assert.doesNotMatch(
     contentSource,
     /identityAttributeSelector\(identity\.element, identity\.attributes\)/,
@@ -903,9 +1406,29 @@ test('response recording discovers provider-neutral identity without freezing dy
   );
   assert.match(
     contentSource,
-    /active\|current\|last\|first\|show\|hide\|loading\|streaming\|busy\|disabled\|selected\|focus\|hover\|open\|close\|transition\|animation\|enter\|leave\|visible\|hidden\|rank/,
+    /active\|current\|last\|first\|show\|hide\|loading\|streaming\|busy\|disabled\|selected\|focus\|focused\|hover\|open\|close\|transition\|animation\|enter\|leave\|visible\|hidden\|blank\|empty\|rank/,
     'provider-neutral selector generation must reject volatile state and ranking classes'
   );
+});
+
+test('response identity scopes use attribute presence without freezing the recorded value', () => {
+  const generateStableContainerSelector = loadNamedFunction(
+    contentSource,
+    'generateStableContainerSelector',
+    {
+      CSS: { escape: value => String(value) },
+      cssPath: () => 'div > div:nth-child(7)',
+      selectorClassTokens: () => [],
+    },
+  );
+  const result = generateStableContainerSelector({
+    tagName: 'DIV',
+    classList: [],
+  }, ['data-message-id', 'data-row-key']);
+
+  assert.equal(result.css, '[data-message-id]');
+  assert.ok(result.alternatives.includes('[data-row-key]'));
+  assert.doesNotMatch(JSON.stringify(result), /recorded-message-value/);
 });
 
 test('response recording separates transient state from message identity', () => {
@@ -941,7 +1464,35 @@ test('caller-facing response qualification rejects unknown-role user echoes', ()
   );
   assert.match(
     contentSource,
-    /return \{ key: chosen\.key, text: chosen\.text, streaming: chosen\.streaming, role: chosen\.role, region: chosen\.region \};/,
+    /key:\s*chosen\.key[\s\S]{0,220}role:\s*chosen\.role[\s\S]{0,220}activityToken:\s*recordedResponseActivityToken\(chosen\)/,
     'recorded snapshots must preserve role through final qualification'
+  );
+  assert.match(
+    contentSource,
+    /activityToken:\s*snapshot\.activityToken/,
+    'completion must receive metadata-only activity from the selected recorded response scope'
+  );
+});
+
+test('selector recording exposes an explicit persistence acknowledgement state', () => {
+  assert.match(
+    contentSource,
+    /const selectorCaptureStatus\s*=\s*\{\s*input:\s*null,\s*send:\s*null,\s*response:\s*null/s,
+    'content runtime must track capture acknowledgement per role',
+  );
+  assert.match(
+    contentSource,
+    /selectorCaptureStatus\[targetRole\]\s*=\s*\{\s*state:\s*['"]pending['"]/,
+    'a local candidate must remain pending until background confirms it',
+  );
+  assert.match(
+    contentSource,
+    /selectorCaptureStatus\[targetRole\]\s*=\s*\{\s*state:\s*['"]accepted['"]/,
+    'the content runtime must record a successful background acknowledgement',
+  );
+  assert.match(
+    contentSource,
+    /sendResponse\(\{\s*selectors,\s*selector_capture_status:\s*selectorCaptureStatus\s*\}\)/,
+    'popup polling must be able to distinguish local candidates from persisted selectors',
   );
 });

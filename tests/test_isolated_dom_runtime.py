@@ -4,7 +4,10 @@ from pathlib import Path
 import pytest
 
 from scripts.run_isolated_dom_case import (
+    DOM_CAPTURE_TIMEOUT_SECONDS,
+    DOM_FIXTURE_RUNTIME_SCRIPTS,
     DOM_NAVIGATION_TIMEOUT_SECONDS,
+    _cdp_key_modifiers,
     build_driver_options,
     build_fixture_profile,
     run_case,
@@ -16,6 +19,38 @@ def test_isolated_dom_driver_uses_bounded_eager_navigation():
 
     assert options.page_load_strategy == "eager"
     assert DOM_NAVIGATION_TIMEOUT_SECONDS == 15
+    assert DOM_CAPTURE_TIMEOUT_SECONDS > 120
+
+
+def test_isolated_dom_runtime_loads_response_qualification_before_content():
+    assert DOM_FIXTURE_RUNTIME_SCRIPTS == (
+        "backend_config.js",
+        "universal_bridge.js",
+        "profile_contract.js",
+        "profile_lifecycle.js",
+        "profile_health.js",
+        "selector_recovery.js",
+        "capture_lock.js",
+        "send_observation.js",
+        "response_observation.js",
+        "content.js",
+    )
+
+
+def test_isolated_runtime_queues_keyboard_bridge_until_cdp_dispatch():
+    profile = build_fixture_profile("http://127.0.0.1:12345", "contenteditable")
+
+    from scripts.run_isolated_dom_case import _chrome_runtime_stub
+
+    source = _chrome_runtime_stub(profile)
+    assert "keyboardRequests" in source
+    assert "resolveKeyboardRequest" in source
+    assert "Input.dispatchKeyEvent" not in source
+
+
+def test_fixture_cdp_modifier_mask_matches_production_bitwise_semantics():
+    assert _cdp_key_modifiers(["Alt", "Control", "Meta", "Shift"]) == 15
+    assert _cdp_key_modifiers(["Control", "Control", "Unknown"]) == 2
 
 
 @pytest.mark.skipif(
@@ -115,6 +150,14 @@ def test_virtualized_streaming_row_keeps_outer_identity_until_stable():
     assert result["user"] == "hello from virtualized fixture"
     assert result["assistant"] == "Echo: hello from virtualized fixture"
     assert result["response_region"] == "attribute:data-row-key=row-assistant-2"
+    assert result["identity_keys"] == [
+        "attribute:data-row-key=row-user-1",
+        "attribute:data-row-key=row-assistant-1",
+        "attribute:data-row-key=row-user-2",
+        "attribute:data-row-key=row-assistant-2",
+    ]
+    assert len(result["identity_keys"]) == len(set(result["identity_keys"]))
+    assert result["identity_keys"].count(result["response_region"]) == 1
     assert "actions" not in result["assistant"]
 
 
@@ -134,6 +177,12 @@ def test_assistant_only_shortcut_case_is_provider_neutral():
     profile = build_fixture_profile("http://127.0.0.1:12345", "assistant_only_shortcut")
     assert profile["send"]["kind"] == "shortcut"
     assert profile["response"]["containerSelector"] == ".assistant-shell"
+    assert profile["response"]["identityVerification"] == {
+        "status": "verified",
+        "method": "dom-unique-at-recording",
+        "identityKind": "unique-per-message",
+        "attributes": ["id"],
+    }
     assert "provider" not in profile
 
 

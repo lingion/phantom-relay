@@ -12,7 +12,9 @@ const manifest = JSON.parse(fs.readFileSync(path.join(root, 'extension', 'manife
 
 test('browser registration preserves verified content readiness between claims', () => {
   assert.match(source, /const readyTabIds = new Set\(\)/);
-  assert.match(source, /const ready = !!activeClaim \|\| readyTabIds\.has\(Number\(tab\?\.id\)\)/);
+  assert.match(source, /const ready = activeClaimMatchesDomain \|\| readyTabIds\.has\(Number\(tab\?\.id\)\)/);
+  assert.match(source, /const currentRuntimeReady = runtime\?\.contentScriptVersion === CONTENT_SCRIPT_VERSION/);
+  assert.match(source, /ready:\s*ready && currentRuntimeReady/);
   assert.match(
     source,
     /function isExecutionInventoryTab\(tab\)[\s\S]{0,320}readyTabIds\.has\(Number\(tab\?\.id\)\)[\s\S]{0,320}isRecordedExecutionTab\(tab\)/,
@@ -30,24 +32,49 @@ test('browser registration preserves verified content readiness between claims',
   assert.match(source, /chrome\.tabs\.onRemoved\.addListener\(\(tabId\) => markTabReady\(tabId, false\)\)/);
 });
 
-test('successful backend registration runs profile reconciliation at most once per worker runtime', () => {
+test('claimed tabs fail closed when navigation changes the execution domain', () => {
+  const registrationStart = source.indexOf('function tabRegistrationRecord(tab)');
+  const registrationEnd = source.indexOf('\nfunction isExecutionInventoryTab', registrationStart);
+  const registration = source.slice(registrationStart, registrationEnd);
+  assert.match(
+    registration,
+    /PhantomRelayClaimRecovery\.claimMatchesTab\(activeClaim, tab\?\.id, domain\)/,
+    'an active claim may advertise readiness only on its exact recorded hostname',
+  );
+
+  const updateStart = source.indexOf('chrome.tabs.onUpdated.addListener');
+  const updateEnd = source.indexOf('chrome.tabs.onRemoved.addListener', updateStart);
+  const updateHandler = source.slice(updateStart, updateEnd);
+  assert.match(
+    updateHandler,
+    /publishReadyHeartbeat\(tab, false\)/,
+    'navigation must revoke server-side readiness immediately instead of waiting for the claim timeout',
+  );
+});
+
+test('successful backend registration schedules profile reconciliation without blocking liveness', () => {
   assert.match(
     source,
     /async function retryPendingProfilesAfterBackendReady\(/,
     'backend recovery must have a bounded pending-profile retry path',
+  );
+  assert.match(
+    source,
+    /function scheduleBackendReconciliation\(/,
+    'backend recovery must have a detached single-flight scheduler',
   );
   const registrationStart = source.indexOf('async function registerBrowserClient(');
   const registrationEnd = source.indexOf('\nfunction syncRoutesToBackend', registrationStart);
   const registration = source.slice(registrationStart, registrationEnd);
   assert.match(
     registration,
-    /if \(!backendReconciliationCompleted\)[\s\S]{0,500}await retryPendingProfilesAfterBackendReady\(\)/,
-    'the first successful browser registration must recover local profiles after backend startup',
+    /scheduleBackendReconciliation\(\)/,
+    'the first successful browser registration must enqueue backend recovery',
   );
-  assert.match(
+  assert.doesNotMatch(
     registration,
-    /backendReconciliationCompleted\s*=\s*true/,
-    'a completed recovery must not run again on every registration heartbeat',
+    /await retryPendingProfilesAfterBackendReady\(\)/,
+    'liveness registration must return before profile replica recovery finishes',
   );
 });
 
@@ -62,7 +89,7 @@ test('successful backend registration repairs active profiles missing from the b
   const registration = source.slice(registrationStart, registrationEnd);
   assert.match(
     registration,
-    /if \(!backendReconciliationCompleted\)[\s\S]{0,500}await retryPendingProfilesAfterBackendReady\(\)/,
+    /scheduleBackendReconciliation\(\)/,
     'the first successful browser registration must enter the backend recovery path',
   );
   const retryStart = source.indexOf('async function retryPendingProfilesAfterBackendReady(');
@@ -236,6 +263,34 @@ test('worker startup has one scheduler entry and no concurrent all-tab preparati
   );
 });
 
+test('startup and registration share one pending-profile recovery owner', () => {
+  assert.match(
+    source,
+    /function runPendingProfileRecoverySingleFlight\(/,
+    'pending-profile recovery must have one single-flight owner',
+  );
+  const initializeStart = source.indexOf('async function initializeStorage()');
+  const initializeEnd = source.indexOf('\nfunction startStorageInitialization', initializeStart);
+  const initialize = source.slice(initializeStart, initializeEnd);
+  assert.match(initialize, /runPendingProfileRecoverySingleFlight\(/);
+  assert.doesNotMatch(initialize, /profileRecoveryPromise\s*=\s*recoverPendingProfiles\(/);
+  assert.match(
+    source,
+    /if \(!storageCriticalAvailable\)[\s\S]{0,240}failed: \['startup_storage_unavailable'\][\s\S]{0,120}skipped: true/,
+    'degraded storage must settle recovery without writing an empty profile store',
+  );
+
+  const retryStart = source.indexOf('async function retryPendingProfilesAfterBackendReady(');
+  const retryEnd = source.indexOf('\nasync function bootstrapRecordedProfileLifecycle', retryStart);
+  const retry = source.slice(retryStart, retryEnd);
+  assert.match(retry, /await runPendingProfileRecoverySingleFlight\(/);
+  assert.match(
+    retry,
+    /return \{ attempted: false, completed: false, reason: 'throttled' \}/,
+    'throttling must remain an incomplete retry result',
+  );
+});
+
 test('repeated page-ready leases reuse validated state instead of reloading selectors every time', () => {
   const start = source.indexOf("if (msg.type === 'page_ready')");
   const end = source.indexOf("if (msg.type === 'page_trace')", start);
@@ -263,22 +318,63 @@ test('active profile recovery skips selector republish when the backend is alrea
   );
   assert.match(
     reconcile,
-    /if \(!needsSelectorRepair\)\s*continue;/,
-    'an already synchronized profile must not enter the selector republish path',
+    /inspectSelectors:[\s\S]{0,1800}applySelectors:/,
+    'background must delegate selector inspection and publication to the behavior-tested recovery orchestrator',
   );
 });
 
-test('selector republish failures cannot be reported as repaired profiles', () => {
+test('active profile recovery repairs only an acknowledged local revision that is ahead', () => {
+  const reconcileStart = source.indexOf('async function reconcileActiveProfilesAfterBackendReady(');
+  const reconcileEnd = source.indexOf('\nfunction buildProfileHealthPayload', reconcileStart);
+  const reconcile = reconcileStart >= 0 && reconcileEnd > reconcileStart
+    ? source.slice(reconcileStart, reconcileEnd)
+    : '';
+
+  assert.match(
+    reconcile,
+    /PhantomRelayProfileRecovery\.recoverActiveProfileReplica\(\{/,
+    'active recovery must use the provider-neutral revision/checksum decision table',
+  );
+  assert.match(
+    reconcile,
+    /result\.action === 'conflict'[\s\S]{0,700}profile_backend_repair_conflict/,
+    'pending, same-revision divergent, and newer-remote profiles must remain explicit conflicts',
+  );
+  assert.doesNotMatch(reconcile, /chrome\.tabs\.(?:create|update)\(/);
+});
+
+test('authoritative active profile recovery applies only the local selector projection', () => {
+  const reconcileStart = source.indexOf('async function reconcileActiveProfilesAfterBackendReady(');
+  const reconcileEnd = source.indexOf('\nfunction buildProfileHealthPayload', reconcileStart);
+  const reconcile = reconcileStart >= 0 && reconcileEnd > reconcileStart
+    ? source.slice(reconcileStart, reconcileEnd)
+    : '';
+  assert.match(
+    reconcile,
+    /applySelectors:\s*envelope\s*=>\s*projectRecoveredProfileLocally\(\{\s*profileId,\s*envelope\s*\}\)/,
+    'authoritative profile repair must not depend on the compatibility selector POST',
+  );
+});
+
+test('compatibility selector publication is best effort after local projection', () => {
+  const publishStart = source.indexOf('async function publishRecoveredSelectorProjection(');
+  const publishEnd = source.indexOf('\nasync function applyRecoveredProfile', publishStart);
+  const publish = publishStart >= 0 && publishEnd > publishStart
+    ? source.slice(publishStart, publishEnd)
+    : '';
   const applyStart = source.indexOf('async function applyRecoveredProfile(');
   const applyEnd = source.indexOf('\nasync function recoverPendingProfiles', applyStart);
   const apply = applyStart >= 0 && applyEnd > applyStart
     ? source.slice(applyStart, applyEnd)
     : '';
+  assert.match(apply, /projectRecoveredProfileLocally\(\{\s*profileId,\s*envelope\s*\}\)/);
+  assert.match(apply, /publishRecoveredSelectorProjection\(\{[\s\S]{0,700}selectorView[\s\S]{0,700}\}\)/);
   assert.match(
-    apply,
-    /catch \(error\) \{[\s\S]{0,500}profile_selector_republish_failed[\s\S]{0,300}throw error;/,
-    'a failed selector POST must propagate so the caller records the profile as failed',
+    publish,
+    /catch \(error\) \{[\s\S]{0,500}profile_selector_republish_failed[\s\S]{0,300}return false;/,
+    'a failed compatibility selector POST must be diagnosed without rejecting the authoritative recovery',
   );
+  assert.doesNotMatch(publish, /throw error/);
 });
 
 test('browser submit maps transport failures to a structured backend-unreachable error', () => {
@@ -286,7 +382,7 @@ test('browser submit maps transport failures to a structured backend-unreachable
   assert.match(popupSource, /后端不可达/);
 });
 
-test('content-script preparation trusts a responsive runtime and takes over an orphaned DOM marker', () => {
+test('content-script preparation trusts a responsive runtime and delegates singleton takeover to content.js', () => {
   assert.match(
     source,
     /for\s*\(let attempt = 0; attempt < 4; attempt\+\+\)[\s\S]{0,900}pingContentRuntime\(\)/,
@@ -296,18 +392,23 @@ test('content-script preparation trusts a responsive runtime and takes over an o
   const preparationEnd = source.indexOf('\nasync function ensureContentScript(', preparationStart);
   const preparation = source.slice(preparationStart, preparationEnd);
   const liveHandshakeIndex = preparation.indexOf('if (acceptLiveContentScriptPing(ping, hostname))');
-  const markerProbeIndex = preparation.indexOf("preparationStage = 'marker_probe'");
+  const injectionIndex = preparation.indexOf("preparationStage = 'dynamic_injection'");
   assert.ok(liveHandshakeIndex >= 0, 'a responsive content runtime must be recognized before fallback injection');
-  assert.ok(markerProbeIndex > liveHandshakeIndex, 'the DOM marker may be inspected only after the message handshake fails');
+  assert.ok(injectionIndex > liveHandshakeIndex, 'fallback injection may run only after the message handshake fails');
   assert.match(
     preparation,
     /if \(acceptLiveContentScriptPing\(ping, hostname\)\) \{[\s\S]{0,320}return ready;/,
     'a working message channel must finish preparation without injecting a second runtime'
   );
-  assert.match(
+  assert.doesNotMatch(
     preparation,
-    /removeAttribute\('data-phantom-relay-content-instance'\)[\s\S]{0,260}removeAttribute\('data-phantom-relay-content-owner'\)/,
-    'an orphaned marker must be cleared after the bounded message handshake fails'
+    /marker_probe|data-phantom-relay-content-instance|data-phantom-relay-content-owner/,
+    'background preparation must not block on or mutate the page singleton marker'
+  );
+  assert.match(
+    contentSource,
+    /heartbeatAfter\s*!==\s*heartbeatBefore[\s\S]{0,240}return[\s\S]{0,240}setAttribute\(INSTANCE_MARKER, CONTENT_SCRIPT_VERSION\)/,
+    'content.js must keep the provider-neutral live-instance handshake and stale-marker takeover'
   );
 });
 
@@ -332,19 +433,25 @@ test('content-script preparation is single-flight and never waits for document i
   );
   assert.equal(
     [...preparation.matchAll(/injectImmediately:\s*true/g)].length,
-    2,
-    'both the marker probe and file injection must run immediately in long-lived SPAs',
+    1,
+    'only the bounded file injection may use executeScript in long-lived SPAs',
   );
   assert.match(
     preparation,
-    /content_ping_timeout/,
+    /setTimeout\(\(\) => finish\(null\), 750\)/,
     'a detached content runtime must not hold a scheduler tick indefinitely',
   );
   assert.match(
     preparation,
-    /data-phantom-relay-content-owner[\s\S]{0,500}content_script_stale_marker_cleared/,
-    'a fresh worker must clear an orphaned DOM heartbeat before reinjection',
+    /chrome\.tabs\.sendMessage\(tab\.id, \{ action: 'ping' \}, \(response\) => \{/,
+    'a missing receiver must settle through the callback API before dynamic injection',
   );
+  assert.match(
+    preparation,
+    /const runtimeError = chrome\.runtime\.lastError;/,
+    'a missing receiver must consume runtime.lastError without leaving a rejected promise',
+  );
+  assert.doesNotMatch(preparation, /content_script_stale_marker_cleared|marker_probe/);
 });
 
 test('Enter recording is persisted through the background selector contract', () => {
@@ -372,12 +479,23 @@ test('legacy selector bundles cannot be treated as executable profiles', () => {
   );
 });
 
-test('background does not expose a CDP keyboard-input execution path', () => {
-  assert.doesNotMatch(source, /cdp_dispatch_key|Input\.dispatchKeyEvent/);
+test('background exposes one claim-bound CDP keyboard-input execution path', () => {
+  assert.match(source, /async function dispatchRecordedKeyboardViaDebugger\(/);
+  assert.match(source, /Input\.dispatchKeyEvent/);
+  assert.match(
+    source,
+    /msg\?\.type === 'dispatch_recorded_keyboard'[\s\S]{0,700}activeClaims\.get\([\s\S]{0,700}keyboard_claim_invalid/,
+    'trusted key dispatch must fail closed unless the content request owns the active job claim',
+  );
+  assert.doesNotMatch(
+    source,
+    /for \([^\n]*Input\.dispatchKeyEvent/,
+    'a recorded keyboard action must not be retried through a CDP loop',
+  );
 });
 
-test('unverified network capture is quarantined outside the installed runtime', () => {
-  assert.ok(!manifest.permissions.includes('debugger'), 'the DOM relay must not request debugger privileges');
+test('unverified network capture stays disabled while debugger permission is limited to recorded input', () => {
+  assert.ok(manifest.permissions.includes('debugger'), 'trusted recorded keyboard replay requires debugger input permission');
   assert.match(source, /const NETWORK_CAPTURE_RUNTIME_ENABLED\s*=\s*false/);
   assert.doesNotMatch(source, /importScripts\('network_(?:capture|candidate|calibration)\.js'\)/);
   assert.match(
@@ -396,7 +514,32 @@ test('background and content script share one handshake version', () => {
   assert.equal(backgroundVersion, contentVersion, 'worker must not reject the content script it is meant to execute');
 });
 
-test('live content-script handshake accepts a valid version drift without blocking execution', () => {
+test('background owns extension reload requests from content-script version recovery', () => {
+  const reloadStart = source.indexOf('function handleExtensionRuntimeReloadRequest(');
+  const reloadEnd = source.indexOf('\n}\n\n// Keep all content/runtime messages', reloadStart);
+  assert.ok(reloadStart >= 0 && reloadEnd > reloadStart, 'worker reload handler must be defined');
+  assert.match(
+    source.slice(reloadStart, reloadEnd),
+    /chrome\.runtime\.reload\(\)/,
+    'only the extension service worker can invoke chrome.runtime.reload',
+  );
+  assert.match(
+    source,
+    /msg\?\.type\s*!==\s*['"]reload_extension_runtime['"]|msg\?\.type === ['"]reload_extension_runtime['"]/
+  );
+  assert.match(
+    source.slice(reloadStart, reloadEnd),
+    /isValidExtensionRuntimeReloadRequest\(msg, sender\)/,
+    'worker reloads only after validating the content-script request',
+  );
+  assert.match(
+    source,
+    /if \(msg\?\.type === ['"]reload_extension_runtime['"]\)[\s\S]{0,180}handleExtensionRuntimeReloadRequest\(msg, sender, sendResponse\)/,
+    'the reload protocol must be handled before storage and claim initialization',
+  );
+});
+
+test('live content-script handshake rejects version drift before execution', () => {
   assert.match(
     source,
     /function acceptLiveContentScriptPing\(ping, hostname = ''\)/,
@@ -404,35 +547,79 @@ test('live content-script handshake accepts a valid version drift without blocki
   );
   assert.match(
     source,
-    /content_script_version_drift[\s\S]{0,320}action:\s*['"]accept_live_handshake['"]|action:\s*['"]accept_live_handshake['"][\s\S]{0,320}content_script_version_drift/,
-    'version drift must remain visible as diagnostics while allowing a live handshake'
+    /content_script_version_drift[\s\S]{0,320}action:\s*['"]reject_stale_handshake['"]|action:\s*['"]reject_stale_handshake['"][\s\S]{0,320}content_script_version_drift/,
+    'version drift must remain visible while failing closed'
   );
   assert.match(
     source,
     /if \(acceptLiveContentScriptPing\(ping, hostname\)\)\s*\{[\s\S]{0,260}const ready = await prime\(\)/,
-    'a valid live ping must proceed to selector priming and readiness'
+    'only an accepted current ping may proceed to selector priming and readiness'
   );
   assert.match(
     source,
     /const injectedPing = await pingContentRuntime\(\)[\s\S]{0,220}acceptLiveContentScriptPing\(injectedPing, hostname\)/,
-    'the dynamically injected runtime must use the same handshake policy'
+    'the dynamically injected runtime must also prove the current content build'
   );
   assert.doesNotMatch(
     source,
-    /if \(injectedVersion !== CONTENT_SCRIPT_VERSION\) throw new Error\(`content_script_version_mismatch:/,
-    'a live version drift must not be converted into an injection failure'
+    /action:\s*['"]accept_live_handshake['"]/,
+    'a stale page must never be accepted as a live handshake'
+  );
+});
+
+test('ready heartbeats publish the page runtime content version, not the worker constant', () => {
+  assert.match(
+    source,
+    /content_script_version:\s*runtime\?\.contentScriptVersion\s*\|\|\s*['"]['"]/,
+    'the server heartbeat must carry the version observed from the actual page runtime',
+  );
+  assert.match(
+    source,
+    /contentScriptVersion:\s*pageContentScriptVersion/,
+    'page_ready must persist the page-provided content version in pageRuntime',
+  );
+  assert.doesNotMatch(
+    source.slice(
+      source.indexOf('async function publishReadyHeartbeat('),
+      source.indexOf('\nfunction tabRegistrationRecord', source.indexOf('async function publishReadyHeartbeat(')),
+    ),
+    /content_script_version:\s*CONTENT_SCRIPT_VERSION/,
+    'the worker constant cannot impersonate the page runtime version',
+  );
+});
+
+test('heartbeat readiness requires the business acknowledgement body and refreshes one stale runtime', () => {
+  assert.match(
+    source,
+    /async function readBrowserHeartbeatAcknowledgement\(response\)/,
+    'heartbeat handling must parse the API business body instead of trusting HTTP status alone',
+  );
+  assert.match(
+    source,
+    /payload\?\.ready !== false[\s\S]{0,180}payload\?\.ignored[\s\S]{0,180}payload\?\.claim_valid !== false/,
+    'ready=false, ignored, and claim_valid=false must all fail closed',
+  );
+  assert.match(
+    source,
+    /async function postBrowserHeartbeat\(body\)[\s\S]{0,1200}registerBrowserClient\(true\)/,
+    'an explicitly stale runtime gets one generic registration refresh before retry',
+  );
+  assert.match(
+    source,
+    /if \(ready\?\.ready && heartbeatResp\?\.accepted\)/,
+    'the page-ready execution wake must require the accepted business acknowledgement',
   );
 });
 
 test('ready page heartbeat directly wakes the browser bridge before delayed fallbacks', () => {
-  const readyBranchStart = source.indexOf('if (ready?.ready && heartbeatResp?.ok) {');
-  const readyBranchEnd = source.indexOf('\n        sendResponse({ ok: true, ready });', readyBranchStart);
+  const readyBranchStart = source.indexOf('if (ready?.ready && heartbeatResp?.accepted) {');
+  const readyBranchEnd = source.indexOf('\n        sendResponse({ ok: !!heartbeatResp?.accepted, ready, heartbeat: heartbeatResp?.payload || {} });', readyBranchStart);
   const readyBranch = readyBranchStart >= 0 && readyBranchEnd > readyBranchStart
     ? source.slice(readyBranchStart, readyBranchEnd)
     : '';
   assert.match(
     readyBranch,
-    /if \(ready\?\.ready && heartbeatResp\?\.ok\) \{[\s\S]{0,600}(?:browserBridgeTick\(\)|scheduleBrowserBridgeTick\(0\))/,
+    /if \(ready\?\.ready && heartbeatResp\?\.accepted\) \{[\s\S]{0,600}(?:browserBridgeTick\(\)|scheduleBrowserBridgeTick\(0\))/,
     'a ready page must wake the claim/execute path while the MV3 worker is still active'
   );
   assert.doesNotMatch(
@@ -485,6 +672,35 @@ test('browser poll carries the selected job conversation without an undeclared i
     /conversation_id:\s*String\(preferredJob\.conversation_id \|\| ''\)/,
     'the poll identity must come from the queued job selected by this tick',
   );
+});
+
+test('manifest worker and every imported startup dependency are present in the extension bundle', () => {
+  const extensionRoot = path.join(root, 'extension');
+  const workerPath = manifest?.background?.service_worker;
+  assert.equal(typeof workerPath, 'string', 'Manifest V3 must declare a service worker path');
+  assert.notEqual(workerPath.trim(), '', 'Manifest V3 service worker path must not be empty');
+  assert.ok(
+    fs.existsSync(path.join(extensionRoot, workerPath)),
+    `declared service worker is missing: ${workerPath}`,
+  );
+
+  const importedFiles = [];
+  for (const match of source.matchAll(/importScripts\(([^)]*)\)/g)) {
+    const args = match[1]
+      .split(',')
+      .map(value => value.trim())
+      .filter(Boolean);
+    for (const value of args) {
+      const imported = value.match(/^['"]([^'"]+)['"]$/)?.[1];
+      assert.ok(imported, `importScripts arguments must be string literals: ${value}`);
+      importedFiles.push(imported);
+      assert.ok(
+        fs.existsSync(path.join(extensionRoot, imported)),
+        `background dependency is missing from the extension bundle: ${imported}`,
+      );
+    }
+  }
+  assert.ok(importedFiles.length > 0, 'background must declare its runtime dependencies explicitly');
 });
 
 console.log('BACKGROUND_REGISTRATION_READINESS_TESTS_DEFINED');

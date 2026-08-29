@@ -6,6 +6,7 @@ from server import api_server as api
 def _reset_browser_state(monkeypatch):
     monkeypatch.setattr(api, "_persist_browser_state_locked", lambda: None)
     api.BROWSER_CLIENTS.clear()
+    api.BROWSER_REGISTRATIONS.clear()
     api.BROWSER_READY.clear()
     api.BROWSER_BINDINGS.clear()
     api.BROWSER_JOBS.clear()
@@ -27,6 +28,7 @@ def _ready_body(job=None):
         "ready": True,
         "input_ready": True,
         "send_ready": True,
+        "content_script_version": "2026-08-13.02",
         "capabilities": {"can_execute": True, "can_observe": True},
     }
 
@@ -87,3 +89,39 @@ def test_capture_heartbeat_rejects_a_stale_claim_token_without_renewing(monkeypa
     assert response.status_code == 200
     assert response.get_json()["claim_valid"] is False
     assert job["lease_expires_at"] == before
+
+
+def test_negative_heartbeat_from_a_new_domain_fails_the_claim_immediately(monkeypatch):
+    _reset_browser_state(monkeypatch)
+    client = api.app.test_client()
+
+    client.post("/browser/heartbeat", json=_ready_body())
+    job = api.new_browser_job(
+        "hello",
+        domain="fixture-capture-heartbeat.test",
+        model="fixture-model",
+        conversation_id="fixture-conversation-domain-change",
+    )
+    claimed = api.claim_browser_job(
+        "fixture-capture-heartbeat.test",
+        701,
+        conversation_id=job["conversation_id"],
+        client_id="client-capture-heartbeat-contract",
+    )
+    assert claimed["id"] == job["id"]
+
+    changed = _ready_body(job)
+    changed.update({
+        "domain": "login.fixture.test",
+        "url": "https://login.fixture.test/session",
+        "ready": False,
+        "input_ready": False,
+        "send_ready": False,
+        "capabilities": {"can_execute": False, "can_observe": False},
+    })
+    response = client.post("/browser/heartbeat", json=changed)
+
+    assert response.status_code == 200
+    assert job["status"] == "failed"
+    assert job["error"] == "execution_domain_changed"
+    assert "701" not in api.BROWSER_READY

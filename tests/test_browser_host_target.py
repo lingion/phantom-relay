@@ -1,6 +1,7 @@
 import importlib.util
 from pathlib import Path
-from pathlib import Path
+
+import pytest
 
 from selenium.common.exceptions import (
     InvalidSessionIdException,
@@ -74,6 +75,36 @@ def test_bidi_harness_rechecks_the_api_owner_after_startup(monkeypatch):
     assert HOST.api_still_grants_bidi_ownership() is True
     monkeypatch.setattr(HOST, "api_activation_owner", lambda _api=None: "api")
     assert HOST.api_still_grants_bidi_ownership() is False
+
+
+def test_host_resolves_exact_browser_driver_and_honors_explicit_override(monkeypatch, tmp_path):
+    exact = tmp_path / ".tools" / "chromedriver-153.0.8010.2" / "chromedriver"
+    exact.parent.mkdir(parents=True)
+    exact.write_text("fixture", encoding="utf-8")
+    exact.chmod(0o700)
+    monkeypatch.delenv("PHANTOM_RELAY_CHROMEDRIVER", raising=False)
+
+    assert HOST.resolve_chromedriver("153.0.8010.2", tmp_path) == exact.resolve()
+
+    override = tmp_path / "override" / "chromedriver"
+    override.parent.mkdir()
+    override.write_text("fixture", encoding="utf-8")
+    override.chmod(0o700)
+    monkeypatch.setenv("PHANTOM_RELAY_CHROMEDRIVER", str(override))
+    assert HOST.resolve_chromedriver("153.0.8010.2", tmp_path) == override.resolve()
+
+
+def test_host_rejects_a_missing_exact_browser_driver(monkeypatch, tmp_path):
+    monkeypatch.delenv("PHANTOM_RELAY_CHROMEDRIVER", raising=False)
+
+    with pytest.raises(RuntimeError, match="matching_chromedriver_missing:153.0.8010.2"):
+        HOST.resolve_chromedriver("153.0.8010.2", tmp_path)
+
+
+def test_host_requires_a_four_part_browser_version():
+    assert HOST.parse_browser_version("Google Chrome 153.0.8010.2 canary") == "153.0.8010.2"
+    with pytest.raises(RuntimeError, match="browser_version_unparseable"):
+        HOST.parse_browser_version("Google Chrome canary")
 
 
 def test_ready_page_is_preserved_only_for_same_domain_navigation():

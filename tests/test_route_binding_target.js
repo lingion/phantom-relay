@@ -64,7 +64,7 @@ test('popup keeps an explicit model when the current domain has no reverse bindi
 
 test('background starts pending profile recovery and waits before reporting state', () => {
   assert.match(backgroundSource, /importScripts\('profile_recovery\.js'\)/);
-  assert.match(backgroundSource, /profileRecoveryPromise = recoverPendingProfiles\(\)/);
+  assert.match(backgroundSource, /profileRecoveryPromise = runPendingProfileRecoverySingleFlight\(\)/);
   assert.match(backgroundSource, /await profileRecoveryPromise/);
   assert.match(backgroundSource, /profile_selector_republish_failed/);
 });

@@ -27,9 +27,224 @@ def _reset_browser_state():
     api.BROWSER_CLIENTS.clear()
     api.BROWSER_READY.clear()
     api.BROWSER_EVENTS.clear()
-    api._BROWSER_WAKE_LAST = 0.0
+    api._BROWSER_WAKE_LAST = {}
     if hasattr(api, "_BROWSER_WAKE_PENDING"):
         api._BROWSER_WAKE_PENDING.clear()
+
+
+def test_wake_cooldown_is_scoped_per_domain(monkeypatch):
+    _reset_browser_state()
+    popen_calls = []
+    monkeypatch.setattr(api, "BROWSER_WAKE_COMMAND", "")
+    monkeypatch.setattr(api, "BROWSER_HOST_CONFIG", str(ROOT / "missing-browser-host.conf"))
+    monkeypatch.setattr(api.sys, "platform", "darwin")
+    monkeypatch.setattr(
+        api.subprocess,
+        "Popen",
+        lambda args, **kwargs: popen_calls.append((args, kwargs)),
+    )
+
+    assert api.wake_browser_host("https://a.example/chat") is True
+    assert api.wake_browser_host("https://b.example/chat") is True
+    assert api.wake_browser_host("https://a.example/other") is False
+    assert [call[0][-1] for call in popen_calls] == [
+        "https://a.example/chat",
+        "https://b.example/chat",
+    ]
+
+
+def test_content_ready_heartbeat_clears_its_domain_pending_wake(monkeypatch):
+    _reset_browser_state()
+    monkeypatch.setattr(api, "_persist_browser_state_locked", lambda: None)
+    api._BROWSER_WAKE_PENDING["a.example"] = {
+        "target_url": "https://a.example/chat",
+        "requested_at": time.time(),
+    }
+
+    assert api.mark_browser_ready(
+        {
+            "domain": "a.example",
+            "tab_id": 7,
+            "client_id": "client-a",
+            "runtime_session_id": "runtime-a",
+            "ready": True,
+            "input_ready": True,
+            "send_ready": True,
+            "content_script_version": "2026-08-13.02",
+            "source": "content-ready",
+            "url": "https://a.example/chat",
+            "capabilities": {"can_execute": True, "can_observe": True},
+        }
+    ) is True
+
+    assert "a.example" not in api._BROWSER_WAKE_PENDING
+
+
+def test_unclaimed_job_watchdog_forces_one_wake_after_recent_ready_lies(monkeypatch):
+    _reset_browser_state()
+    wake_calls = []
+    monkeypatch.setattr(api, "wake_browser_host", lambda target_url="": wake_calls.append(target_url) or True)
+    monkeypatch.setattr(api, "_UNCLAIMED_WAKE_GRACE", 0.01, raising=False)
+    job = api.new_browser_job(
+        "hello",
+        domain="a.example",
+        model="a",
+        target_url="https://a.example/chat",
+    )
+
+    ready_checks = iter((True, False))
+    monkeypatch.setattr(
+        api,
+        "browser_extension_recently_ready",
+        lambda _domain="": next(ready_checks, False),
+    )
+
+    api.schedule_unclaimed_job_wake(job["id"])
+    time.sleep(0.05)
+
+    assert wake_calls == ["https://a.example/chat"]
+    assert api.BROWSER_JOBS[job["id"]]["unclaimed_wake_attempted"] is True
+
+
+def test_unclaimed_job_watchdog_does_not_wake_after_claim(monkeypatch):
+    _reset_browser_state()
+    wake_calls = []
+    monkeypatch.setattr(api, "wake_browser_host", lambda target_url="": wake_calls.append(target_url) or True)
+    monkeypatch.setattr(api, "_UNCLAIMED_WAKE_GRACE", 0.01, raising=False)
+    job = api.new_browser_job(
+        "hello",
+        domain="a.example",
+        model="a",
+        target_url="https://a.example/chat",
+    )
+    job["status"] = "claimed"
+
+    api.schedule_unclaimed_job_wake(job["id"])
+    time.sleep(0.05)
+
+    assert wake_calls == []
+
+
+def test_unclaimed_job_watchdog_does_not_reopen_while_ready_heartbeats_continue(monkeypatch):
+    _reset_browser_state()
+    wake_calls = []
+    monkeypatch.setattr(api, "wake_browser_host", lambda target_url="": wake_calls.append(target_url) or True)
+    monkeypatch.setattr(api, "_UNCLAIMED_WAKE_GRACE", 0.01, raising=False)
+    monkeypatch.setattr(api, "_UNCLAIMED_WAKE_MAX_WAIT", 0.04, raising=False)
+    monkeypatch.setattr(api, "browser_extension_recently_ready", lambda _domain="": True)
+    job = api.new_browser_job(
+        "hello",
+        domain="a.example",
+        model="a",
+        target_url="https://a.example/chat",
+    )
+
+    api.schedule_unclaimed_job_wake(job["id"])
+    time.sleep(0.08)
+
+    assert wake_calls == []
+    assert not api.BROWSER_JOBS[job["id"]].get("unclaimed_wake_attempted")
+
+
+def test_activation_watchdog_is_scheduled_only_when_recent_ready_suppressed_initial_wake(monkeypatch):
+    _reset_browser_state()
+    scheduled = []
+    monkeypatch.setattr(api, "request_browser_wake", lambda **_kwargs: False)
+    monkeypatch.setattr(api, "browser_extension_recently_ready", lambda _domain="": True)
+    monkeypatch.setattr(api, "schedule_unclaimed_job_wake", lambda job_id: scheduled.append(job_id) or True)
+    job = api.new_browser_job(
+        "hello",
+        domain="a.example",
+        model="a",
+        target_url="https://a.example/chat",
+    )
+
+    api.activate_browser_for_job(job)
+
+    assert scheduled == [job["id"]]
+
+
+def test_activation_does_not_schedule_watchdog_after_initial_wake(monkeypatch):
+    _reset_browser_state()
+    scheduled = []
+    monkeypatch.setattr(api, "request_browser_wake", lambda **_kwargs: True)
+    monkeypatch.setattr(api, "browser_extension_recently_ready", lambda _domain="": False)
+    monkeypatch.setattr(api, "schedule_unclaimed_job_wake", lambda job_id: scheduled.append(job_id) or True)
+    job = api.new_browser_job(
+        "hello",
+        domain="a.example",
+        model="a",
+        target_url="https://a.example/chat",
+    )
+
+    api.activate_browser_for_job(job)
+
+    assert scheduled == []
+
+
+def test_initial_wake_schedules_one_stalled_page_recovery(monkeypatch):
+    _reset_browser_state()
+    scheduled = []
+    monkeypatch.setattr(api, "request_browser_wake", lambda **_kwargs: True)
+    monkeypatch.setattr(api, "browser_extension_recently_ready", lambda _domain="": False)
+    monkeypatch.setattr(
+        api,
+        "schedule_stalled_browser_wake",
+        lambda job_id: scheduled.append(job_id) or True,
+        raising=False,
+    )
+    job = api.new_browser_job(
+        "hello",
+        domain="a.example",
+        model="a",
+        target_url="https://a.example/chat",
+    )
+
+    api.activate_browser_for_job(job)
+
+    assert scheduled == [job["id"]]
+
+
+def test_stalled_page_recovery_reopens_once_after_initial_lease(monkeypatch):
+    _reset_browser_state()
+    wake_calls = []
+    monkeypatch.setattr(api, "wake_browser_host", lambda target_url="": wake_calls.append(target_url) or True)
+    monkeypatch.setattr(api, "_BROWSER_WAKE_LEASE_TTL", 0.01, raising=False)
+    monkeypatch.setattr(api, "_BROWSER_WAKE_COOLDOWN", 0.01, raising=False)
+    monkeypatch.setattr(api, "_UNCLAIMED_WAKE_GRACE", 0.005, raising=False)
+    job = api.new_browser_job(
+        "hello",
+        domain="a.example",
+        model="a",
+        target_url="https://a.example/chat",
+    )
+
+    api.schedule_stalled_browser_wake(job["id"])
+    time.sleep(0.06)
+
+    assert wake_calls == ["https://a.example/chat"]
+    assert api.BROWSER_JOBS[job["id"]]["stalled_wake_attempted"] is True
+
+
+def test_stalled_page_recovery_stops_after_job_claim(monkeypatch):
+    _reset_browser_state()
+    wake_calls = []
+    monkeypatch.setattr(api, "wake_browser_host", lambda target_url="": wake_calls.append(target_url) or True)
+    monkeypatch.setattr(api, "_BROWSER_WAKE_LEASE_TTL", 0.02, raising=False)
+    monkeypatch.setattr(api, "_UNCLAIMED_WAKE_GRACE", 0.005, raising=False)
+    job = api.new_browser_job(
+        "hello",
+        domain="a.example",
+        model="a",
+        target_url="https://a.example/chat",
+    )
+    job["status"] = "claimed"
+
+    api.schedule_stalled_browser_wake(job["id"])
+    time.sleep(0.06)
+
+    assert wake_calls == []
+    assert not api.BROWSER_JOBS[job["id"]].get("stalled_wake_attempted")
 
 
 def test_api_wake_is_blocked_when_another_activation_owner_is_selected(monkeypatch):
@@ -163,6 +378,114 @@ def test_reap_expired_queued_job_fails_instead_of_remaining_visible_to_extension
     assert api.BROWSER_QUEUE == []
 
 
+def test_default_queue_timeout_allows_slow_browser_start_within_request_deadline():
+    _reset_browser_state()
+    job = api.new_browser_job(
+        "hello",
+        domain="example.test",
+        model="fixture-model",
+        target_url="https://example.test/chat",
+        request_meta={"capture_timeout_ms": 300_000},
+    )
+    job["queued_at"] = time.time() - 65
+
+    api.reap_expired_browser_jobs()
+
+    assert api.BROWSER_JOBS[job["id"]]["status"] == "queued"
+    assert job["id"] in api.BROWSER_QUEUE
+
+
+def test_browser_job_persists_request_deadline_from_capture_timeout():
+    _reset_browser_state()
+    before = time.time()
+
+    job = api.new_browser_job(
+        "hello",
+        domain="example.test",
+        model="fixture-model",
+        request_meta={"capture_timeout_ms": 12_000},
+    )
+
+    assert before + 12 <= job["request_deadline_at"] <= time.time() + 12
+
+
+def test_claim_and_heartbeat_lease_cannot_outlive_request_deadline(monkeypatch):
+    _reset_browser_state()
+    monkeypatch.setattr(api, "_persist_browser_state_locked", lambda: None)
+    api.BROWSER_CLIENTS["7"] = {
+        "domain": "example.test",
+        "tab_id": 7,
+        "client_id": "client-7",
+        "last_seen": time.time(),
+        "ready": True,
+        "input_ready": True,
+        "send_ready": True,
+        "source": "content-ready",
+        "capabilities": {"can_execute": True, "can_observe": True},
+    }
+    job = api.new_browser_job(
+        "hello",
+        domain="example.test",
+        model="fixture-model",
+        request_meta={"capture_timeout_ms": 30_000},
+    )
+    deadline = job["request_deadline_at"]
+
+    claimed = api.claim_browser_job(
+        "example.test", 7, job["conversation_id"], "client-7"
+    )
+    assert claimed is not None
+    assert claimed["lease_expires_at"] <= deadline
+
+    assert api.renew_browser_claim({
+        "job_id": job["id"],
+        "claim_token": claimed["claim_token"],
+        "tab_id": 7,
+        "client_id": "client-7",
+        "conversation_id": job["conversation_id"],
+        "domain": "example.test",
+    }) is True
+    assert api.BROWSER_JOBS[job["id"]]["lease_expires_at"] <= deadline
+
+
+def test_request_deadline_reaps_claim_even_when_heartbeat_lease_is_still_live(monkeypatch):
+    _reset_browser_state()
+    monkeypatch.setattr(api, "_persist_browser_state_locked", lambda: None)
+    idem, owner, conflict = api.claim_idempotency("deadline-request", "fingerprint")
+    assert owner is True and conflict is False
+    job = api.new_browser_job(
+        "hello",
+        domain="example.test",
+        model="fixture-model",
+        request_meta={
+            "idempotency_key": "deadline-request",
+            "capture_timeout_ms": 30_000,
+        },
+    )
+    api.bind_idempotency_job("deadline-request", job["id"])
+    job.update(
+        status="claimed",
+        state_reason="claimed",
+        tab_id=7,
+        client_id="client-7",
+        request_deadline_at=time.time() - 1,
+        lease_expires_at=time.time() + 300,
+    )
+    waiter = api.BROWSER_EVENTS[job["id"]]
+
+    api.reap_expired_browser_jobs()
+
+    terminal = api.BROWSER_JOBS[job["id"]]
+    assert terminal["status"] == "failed"
+    assert terminal["state_reason"] == "browser_timeout"
+    assert terminal["error"] == "browser_timeout"
+    assert terminal["lease_expires_at"] is None
+    assert job["id"] not in api.BROWSER_QUEUE
+    assert waiter.is_set()
+    assert idem["status"] == "failed"
+    assert idem["event"].is_set()
+
+
 def test_pending_domains_reaps_expired_queued_job(monkeypatch):
     _reset_browser_state()
     monkeypatch.setattr(api, "BROWSER_QUEUE_TIMEOUT", 5.0, raising=False)
@@ -234,6 +557,87 @@ def test_recently_stale_ready_client_is_woken_before_its_long_lease_expires(monk
         "/browser/submit",
         json={
             "message": "wake-stale-client",
+            "domain": "example.test",
+            "target_url": "https://example.test/chat",
+        },
+    )
+
+    assert response.status_code == 202
+    assert wake_calls == ["https://example.test/chat"]
+
+
+def test_bound_ready_client_is_reused_within_recent_heartbeat_window(monkeypatch):
+    _reset_browser_state()
+    api.BROWSER_CLIENTS["9"] = {
+        "client_id": "client-9",
+        "domain": "example.test",
+        "tab_id": 9,
+        "last_seen": time.time() - api._BROWSER_WAKE_RECENT_WINDOW / 2,
+        "ready": True,
+        "input_ready": True,
+        "send_ready": True,
+        "state": "ready",
+        "source": "content-ready",
+        "url": "https://example.test/chat",
+        "capabilities": {"can_execute": True, "can_observe": True},
+    }
+    api.BROWSER_BINDINGS[("default_model_example.test", "example.test")] = {
+        "conversation_id": "default_model_example.test",
+        "domain": "example.test",
+        "tab_id": 9,
+        "profile": "chrome-extension",
+        "last_seen": time.time() - 20,
+    }
+    wake_calls = []
+    monkeypatch.setattr(api, "wake_browser_host", lambda target_url="": wake_calls.append(target_url) or True)
+    monkeypatch.setattr(api, "AUTO_WAKE_BROWSER", True)
+
+    response = api.app.test_client().post(
+        "/browser/submit",
+        json={
+            "message": "reuse-bound-ready",
+            "model": "model",
+            "domain": "example.test",
+            "target_url": "https://example.test/chat",
+        },
+    )
+
+    assert response.status_code == 202
+    assert wake_calls == []
+
+
+def test_bound_ready_client_is_woken_after_recent_heartbeat_expires(monkeypatch):
+    _reset_browser_state()
+    stale_ready_at = time.time() - api._BROWSER_WAKE_RECENT_WINDOW - 1
+    api.BROWSER_CLIENTS["9"] = {
+        "client_id": "client-9",
+        "domain": "example.test",
+        "tab_id": 9,
+        "last_seen": stale_ready_at,
+        "ready": True,
+        "input_ready": True,
+        "send_ready": True,
+        "state": "ready",
+        "source": "content-ready",
+        "url": "https://example.test/chat",
+        "capabilities": {"can_execute": True, "can_observe": True},
+    }
+    api.BROWSER_BINDINGS[("default_model_example.test", "example.test")] = {
+        "conversation_id": "default_model_example.test",
+        "domain": "example.test",
+        "tab_id": 9,
+        "profile": "chrome-extension",
+        "last_seen": stale_ready_at,
+    }
+    wake_calls = []
+    monkeypatch.setattr(api, "wake_browser_host", lambda target_url="": wake_calls.append(target_url) or True)
+    monkeypatch.setattr(api, "AUTO_WAKE_BROWSER", True)
+
+    response = api.app.test_client().post(
+        "/browser/submit",
+        json={
+            "message": "wake-after-stale-bound-ready",
+            "model": "model",
             "domain": "example.test",
             "target_url": "https://example.test/chat",
         },

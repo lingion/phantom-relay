@@ -92,3 +92,63 @@ def test_live_sse_emits_dom_snapshot_before_terminal_browser_result():
     assert '"content":" finished"' in tail
     assert '"finish_reason":"stop"' in tail
     assert "data: [DONE]" in tail
+
+
+def test_live_sse_discards_buffered_content_after_deadline_failure():
+    api.BROWSER_JOBS.clear()
+    api.BROWSER_QUEUE.clear()
+    api.BROWSER_EVENTS.clear()
+    api.BROWSER_DELTAS.clear()
+
+    route = api._build_model_route(
+        {
+            "id": "recorded-model",
+            "name": "Recorded Model",
+            "owned_by": "user",
+            "api": "browser",
+            "capabilities": {"supports_streaming": True},
+        },
+        domain="custom.example",
+        url="https://custom.example/workspace/chat",
+        selectors={},
+    )
+    job = api.new_browser_job(
+        "expire before buffered event",
+        domain=route.domain,
+        model=route.id,
+        conversation_id="deadline-stream-contract",
+        request_meta={"capture_timeout_ms": 30_000},
+    )
+    job.update(
+        status="claimed",
+        tab_id=7,
+        client_id="client-live-stream",
+        lease_expires_at=time.time() + 60,
+    )
+    api.BROWSER_DELTAS[job["id"]].append(
+        {
+            "key": "response-1",
+            "text": "buffered content",
+            "delta": "buffered content",
+            "streaming": True,
+            "completion_reason": "",
+        }
+    )
+
+    stream = api.iter_live_browser_sse(
+        job,
+        route,
+        request_key="",
+        full_prompt=job["message"],
+        tool_choice="none",
+        timeout_sec=2,
+    )
+    role_chunk = next(stream)
+    job["request_deadline_at"] = time.time() - 1
+    api.reap_expired_browser_jobs()
+    tail = "".join(stream)
+
+    assert '"role":"assistant"' in role_chunk
+    assert "buffered content" not in tail
+    assert "browser_timeout" in tail
+    assert "data: [DONE]" in tail

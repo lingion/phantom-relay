@@ -1,0 +1,192 @@
+{
+  "by_model": {
+    "chat.qwen.ai": {
+      "clopper_pearson_lower": 0.012741,
+      "confidence_threshold_met": false,
+      "failure_classes": {
+        "browser_queue_timeout": 1,
+        "response_oracle_failed": 1,
+        "wrong_or_stale_response": 1
+      },
+      "failures": 3,
+      "observed_success_rate": 0.25,
+      "observed_threshold_met": false,
+      "one_sided_confidence": 0.95,
+      "successes": 1,
+      "trials": 4
+    }
+  },
+  "by_model_phase": {
+    "chat.qwen.ai::alias_route": {
+      "clopper_pearson_lower": 0.05,
+      "confidence_threshold_met": false,
+      "failure_classes": {},
+      "failures": 0,
+      "observed_success_rate": 1.0,
+      "observed_threshold_met": true,
+      "one_sided_confidence": 0.95,
+      "successes": 1,
+      "trials": 1
+    },
+    "chat.qwen.ai::cold": {
+      "clopper_pearson_lower": 0.0,
+      "confidence_threshold_met": false,
+      "failure_classes": {
+        "browser_queue_timeout": 1
+      },
+      "failures": 1,
+      "observed_success_rate": 0.0,
+      "observed_threshold_met": false,
+      "one_sided_confidence": 0.95,
+      "successes": 0,
+      "trials": 1
+    },
+    "chat.qwen.ai::crash": {
+      "clopper_pearson_lower": 0.0,
+      "confidence_threshold_met": false,
+      "failure_classes": {
+        "wrong_or_stale_response": 1
+      },
+      "failures": 1,
+      "observed_success_rate": 0.0,
+      "observed_threshold_met": false,
+      "one_sided_confidence": 0.95,
+      "successes": 0,
+      "trials": 1
+    },
+    "chat.qwen.ai::warm": {
+      "clopper_pearson_lower": 0.0,
+      "confidence_threshold_met": false,
+      "failure_classes": {
+        "response_oracle_failed": 1
+      },
+      "failures": 1,
+      "observed_success_rate": 0.0,
+      "observed_threshold_met": false,
+      "one_sided_confidence": 0.95,
+      "successes": 0,
+      "trials": 1
+    }
+  },
+  "by_phase": {
+    "alias_route": {
+      "clopper_pearson_lower": 0.05,
+      "confidence_threshold_met": false,
+      "failure_classes": {},
+      "failures": 0,
+      "observed_success_rate": 1.0,
+      "observed_threshold_met": true,
+      "one_sided_confidence": 0.95,
+      "successes": 1,
+      "trials": 1
+    },
+    "cold": {
+      "clopper_pearson_lower": 0.0,
+      "confidence_threshold_met": false,
+      "failure_classes": {
+        "browser_queue_timeout": 1
+      },
+      "failures": 1,
+      "observed_success_rate": 0.0,
+      "observed_threshold_met": false,
+      "one_sided_confidence": 0.95,
+      "successes": 0,
+      "trials": 1
+    },
+    "crash": {
+      "clopper_pearson_lower": 0.0,
+      "confidence_threshold_met": false,
+      "failure_classes": {
+        "wrong_or_stale_response": 1
+      },
+      "failures": 1,
+      "observed_success_rate": 0.0,
+      "observed_threshold_met": false,
+      "one_sided_confidence": 0.95,
+      "successes": 0,
+      "trials": 1
+    },
+    "warm": {
+      "clopper_pearson_lower": 0.0,
+      "confidence_threshold_met": false,
+      "failure_classes": {
+        "response_oracle_failed": 1
+      },
+      "failures": 1,
+      "observed_success_rate": 0.0,
+      "observed_threshold_met": false,
+      "one_sided_confidence": 0.95,
+      "successes": 0,
+      "trials": 1
+    }
+  },
+  "by_sequence": {
+    "chat.qwen.ai": {
+      "clopper_pearson_lower": 0.0,
+      "confidence_threshold_met": false,
+      "failure_classes": {
+        "browser_queue_timeout": 1,
+        "response_oracle_failed": 1,
+        "wrong_or_stale_response": 1
+      },
+      "failures": 3,
+      "observed_success_rate": 0.0,
+      "observed_threshold_met": false,
+      "one_sided_confidence": 0.95,
+      "successes": 0,
+      "trials": 3
+    },
+    "qwen": {
+      "clopper_pearson_lower": 0.05,
+      "confidence_threshold_met": false,
+      "failure_classes": {},
+      "failures": 0,
+      "observed_success_rate": 1.0,
+      "observed_threshold_met": true,
+      "one_sided_confidence": 0.95,
+      "successes": 1,
+      "trials": 1
+    }
+  },
+  "confidence": 0.95,
+  "context_complete": true,
+  "coverage_complete": false,
+  "critical_failure_count": 1,
+  "generated_at": "2026-08-12T03:24:21.716+00:00",
+  "inventory_blockers": [
+    {
+      "domain": "custom.example",
+      "model_ids": [
+        "temporary-model"
+      ],
+      "reason": "executable_recorded_profile_missing"
+    },
+    {
+      "domain": "tongyi.aliyun.com",
+      "model_ids": [
+        "qwen-turbo"
+      ],
+      "reason": "executable_recorded_profile_missing"
+    }
+  ],
+  "overall": {
+    "clopper_pearson_lower": 0.012741,
+    "confidence_threshold_met": false,
+    "failure_classes": {
+      "browser_queue_timeout": 1,
+      "response_oracle_failed": 1,
+      "wrong_or_stale_response": 1
+    },
+    "failures": 3,
+    "observed_success_rate": 0.25,
+    "observed_threshold_met": false,
+    "one_sided_confidence": 0.95,
+    "successes": 1,
+    "trials": 4
+  },
+  "qualification_complete": false,
+  "release_gate_passed": false,
+  "run_dir": "/Users/lingion_k/Desktop/phantom-relay/tests/live-results/20260812T112218",
+  "run_id": "20260812T112218",
+  "threshold": 0.95
+}

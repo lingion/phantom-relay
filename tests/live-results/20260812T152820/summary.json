@@ -1,0 +1,574 @@
+{
+  "by_model": {
+    "aistudio.xiaomimimo.com": {
+      "clopper_pearson_lower": 0.13535,
+      "confidence_threshold_met": false,
+      "coverage_complete": false,
+      "failure_classes": {
+        "test_environment_or_setup_failed": 1
+      },
+      "failures": 1,
+      "observed_success_rate": 0.666667,
+      "observed_threshold_met": false,
+      "one_sided_confidence": 0.95,
+      "scheduled": 4,
+      "successes": 2,
+      "trials": 3,
+      "unproven": 1
+    },
+    "chat.qwen.ai": {
+      "clopper_pearson_lower": 0.189255,
+      "confidence_threshold_met": false,
+      "coverage_complete": true,
+      "failure_classes": {
+        "test_environment_or_setup_failed": 2
+      },
+      "failures": 2,
+      "observed_success_rate": 0.6,
+      "observed_threshold_met": false,
+      "one_sided_confidence": 0.95,
+      "scheduled": 5,
+      "successes": 3,
+      "trials": 5,
+      "unproven": 0
+    },
+    "wenxin.baidu.com": {
+      "clopper_pearson_lower": 0.153161,
+      "confidence_threshold_met": false,
+      "coverage_complete": true,
+      "failure_classes": {
+        "response_oracle_failed": 3
+      },
+      "failures": 3,
+      "observed_success_rate": 0.5,
+      "observed_threshold_met": false,
+      "one_sided_confidence": 0.95,
+      "scheduled": 6,
+      "successes": 3,
+      "trials": 6,
+      "unproven": 0
+    },
+    "www.doubao.com": {
+      "clopper_pearson_lower": 0.0,
+      "confidence_threshold_met": false,
+      "coverage_complete": false,
+      "failure_classes": {
+        "browser_queue_timeout": 4
+      },
+      "failures": 4,
+      "observed_success_rate": 0.0,
+      "observed_threshold_met": false,
+      "one_sided_confidence": 0.95,
+      "scheduled": 5,
+      "successes": 0,
+      "trials": 4,
+      "unproven": 1
+    },
+    "yuanbao.tencent.com": {
+      "clopper_pearson_lower": 0.0,
+      "confidence_threshold_met": false,
+      "coverage_complete": false,
+      "failure_classes": {
+        "test_environment_or_setup_failed": 3
+      },
+      "failures": 3,
+      "observed_success_rate": 0.0,
+      "observed_threshold_met": false,
+      "one_sided_confidence": 0.95,
+      "scheduled": 4,
+      "successes": 0,
+      "trials": 3,
+      "unproven": 1
+    }
+  },
+  "by_model_phase": {
+    "aistudio.xiaomimimo.com::cold": {
+      "clopper_pearson_lower": 0.05,
+      "confidence_threshold_met": false,
+      "coverage_complete": true,
+      "failure_classes": {},
+      "failures": 0,
+      "observed_success_rate": 1.0,
+      "observed_threshold_met": true,
+      "one_sided_confidence": 0.95,
+      "scheduled": 1,
+      "successes": 1,
+      "trials": 1,
+      "unproven": 0
+    },
+    "aistudio.xiaomimimo.com::crash": {
+      "clopper_pearson_lower": 0.0,
+      "confidence_threshold_met": false,
+      "coverage_complete": false,
+      "failure_classes": {},
+      "failures": 0,
+      "observed_success_rate": 0.0,
+      "observed_threshold_met": false,
+      "one_sided_confidence": 0.95,
+      "scheduled": 1,
+      "successes": 0,
+      "trials": 0,
+      "unproven": 1
+    },
+    "aistudio.xiaomimimo.com::crash_prepare": {
+      "clopper_pearson_lower": 0.0,
+      "confidence_threshold_met": false,
+      "coverage_complete": true,
+      "failure_classes": {
+        "test_environment_or_setup_failed": 1
+      },
+      "failures": 1,
+      "observed_success_rate": 0.0,
+      "observed_threshold_met": false,
+      "one_sided_confidence": 0.95,
+      "scheduled": 1,
+      "successes": 0,
+      "trials": 1,
+      "unproven": 0
+    },
+    "aistudio.xiaomimimo.com::warm": {
+      "clopper_pearson_lower": 0.05,
+      "confidence_threshold_met": false,
+      "coverage_complete": true,
+      "failure_classes": {},
+      "failures": 0,
+      "observed_success_rate": 1.0,
+      "observed_threshold_met": true,
+      "one_sided_confidence": 0.95,
+      "scheduled": 1,
+      "successes": 1,
+      "trials": 1,
+      "unproven": 0
+    },
+    "chat.qwen.ai::alias_route": {
+      "clopper_pearson_lower": 0.0,
+      "confidence_threshold_met": false,
+      "coverage_complete": true,
+      "failure_classes": {
+        "test_environment_or_setup_failed": 1
+      },
+      "failures": 1,
+      "observed_success_rate": 0.0,
+      "observed_threshold_met": false,
+      "one_sided_confidence": 0.95,
+      "scheduled": 1,
+      "successes": 0,
+      "trials": 1,
+      "unproven": 0
+    },
+    "chat.qwen.ai::cold": {
+      "clopper_pearson_lower": 0.0,
+      "confidence_threshold_met": false,
+      "coverage_complete": true,
+      "failure_classes": {
+        "test_environment_or_setup_failed": 1
+      },
+      "failures": 1,
+      "observed_success_rate": 0.0,
+      "observed_threshold_met": false,
+      "one_sided_confidence": 0.95,
+      "scheduled": 1,
+      "successes": 0,
+      "trials": 1,
+      "unproven": 0
+    },
+    "chat.qwen.ai::crash": {
+      "clopper_pearson_lower": 0.05,
+      "confidence_threshold_met": false,
+      "coverage_complete": true,
+      "failure_classes": {},
+      "failures": 0,
+      "observed_success_rate": 1.0,
+      "observed_threshold_met": true,
+      "one_sided_confidence": 0.95,
+      "scheduled": 1,
+      "successes": 1,
+      "trials": 1,
+      "unproven": 0
+    },
+    "chat.qwen.ai::crash_prepare": {
+      "clopper_pearson_lower": 0.05,
+      "confidence_threshold_met": false,
+      "coverage_complete": true,
+      "failure_classes": {},
+      "failures": 0,
+      "observed_success_rate": 1.0,
+      "observed_threshold_met": true,
+      "one_sided_confidence": 0.95,
+      "scheduled": 1,
+      "successes": 1,
+      "trials": 1,
+      "unproven": 0
+    },
+    "chat.qwen.ai::warm": {
+      "clopper_pearson_lower": 0.05,
+      "confidence_threshold_met": false,
+      "coverage_complete": true,
+      "failure_classes": {},
+      "failures": 0,
+      "observed_success_rate": 1.0,
+      "observed_threshold_met": true,
+      "one_sided_confidence": 0.95,
+      "scheduled": 1,
+      "successes": 1,
+      "trials": 1,
+      "unproven": 0
+    },
+    "wenxin.baidu.com::alias_route": {
+      "clopper_pearson_lower": 0.025321,
+      "confidence_threshold_met": false,
+      "coverage_complete": true,
+      "failure_classes": {
+        "response_oracle_failed": 1
+      },
+      "failures": 1,
+      "observed_success_rate": 0.5,
+      "observed_threshold_met": false,
+      "one_sided_confidence": 0.95,
+      "scheduled": 2,
+      "successes": 1,
+      "trials": 2,
+      "unproven": 0
+    },
+    "wenxin.baidu.com::cold": {
+      "clopper_pearson_lower": 0.05,
+      "confidence_threshold_met": false,
+      "coverage_complete": true,
+      "failure_classes": {},
+      "failures": 0,
+      "observed_success_rate": 1.0,
+      "observed_threshold_met": true,
+      "one_sided_confidence": 0.95,
+      "scheduled": 1,
+      "successes": 1,
+      "trials": 1,
+      "unproven": 0
+    },
+    "wenxin.baidu.com::crash": {
+      "clopper_pearson_lower": 0.0,
+      "confidence_threshold_met": false,
+      "coverage_complete": true,
+      "failure_classes": {
+        "response_oracle_failed": 1
+      },
+      "failures": 1,
+      "observed_success_rate": 0.0,
+      "observed_threshold_met": false,
+      "one_sided_confidence": 0.95,
+      "scheduled": 1,
+      "successes": 0,
+      "trials": 1,
+      "unproven": 0
+    },
+    "wenxin.baidu.com::crash_prepare": {
+      "clopper_pearson_lower": 0.05,
+      "confidence_threshold_met": false,
+      "coverage_complete": true,
+      "failure_classes": {},
+      "failures": 0,
+      "observed_success_rate": 1.0,
+      "observed_threshold_met": true,
+      "one_sided_confidence": 0.95,
+      "scheduled": 1,
+      "successes": 1,
+      "trials": 1,
+      "unproven": 0
+    },
+    "wenxin.baidu.com::warm": {
+      "clopper_pearson_lower": 0.0,
+      "confidence_threshold_met": false,
+      "coverage_complete": true,
+      "failure_classes": {
+        "response_oracle_failed": 1
+      },
+      "failures": 1,
+      "observed_success_rate": 0.0,
+      "observed_threshold_met": false,
+      "one_sided_confidence": 0.95,
+      "scheduled": 1,
+      "successes": 0,
+      "trials": 1,
+      "unproven": 0
+    },
+    "www.doubao.com::alias_route": {
+      "clopper_pearson_lower": 0.0,
+      "confidence_threshold_met": false,
+      "coverage_complete": true,
+      "failure_classes": {
+        "browser_queue_timeout": 1
+      },
+      "failures": 1,
+      "observed_success_rate": 0.0,
+      "observed_threshold_met": false,
+      "one_sided_confidence": 0.95,
+      "scheduled": 1,
+      "successes": 0,
+      "trials": 1,
+      "unproven": 0
+    },
+    "www.doubao.com::cold": {
+      "clopper_pearson_lower": 0.0,
+      "confidence_threshold_met": false,
+      "coverage_complete": true,
+      "failure_classes": {
+        "browser_queue_timeout": 1
+      },
+      "failures": 1,
+      "observed_success_rate": 0.0,
+      "observed_threshold_met": false,
+      "one_sided_confidence": 0.95,
+      "scheduled": 1,
+      "successes": 0,
+      "trials": 1,
+      "unproven": 0
+    },
+    "www.doubao.com::crash": {
+      "clopper_pearson_lower": 0.0,
+      "confidence_threshold_met": false,
+      "coverage_complete": false,
+      "failure_classes": {},
+      "failures": 0,
+      "observed_success_rate": 0.0,
+      "observed_threshold_met": false,
+      "one_sided_confidence": 0.95,
+      "scheduled": 1,
+      "successes": 0,
+      "trials": 0,
+      "unproven": 1
+    },
+    "www.doubao.com::crash_prepare": {
+      "clopper_pearson_lower": 0.0,
+      "confidence_threshold_met": false,
+      "coverage_complete": true,
+      "failure_classes": {
+        "browser_queue_timeout": 1
+      },
+      "failures": 1,
+      "observed_success_rate": 0.0,
+      "observed_threshold_met": false,
+      "one_sided_confidence": 0.95,
+      "scheduled": 1,
+      "successes": 0,
+      "trials": 1,
+      "unproven": 0
+    },
+    "www.doubao.com::warm": {
+      "clopper_pearson_lower": 0.0,
+      "confidence_threshold_met": false,
+      "coverage_complete": true,
+      "failure_classes": {
+        "browser_queue_timeout": 1
+      },
+      "failures": 1,
+      "observed_success_rate": 0.0,
+      "observed_threshold_met": false,
+      "one_sided_confidence": 0.95,
+      "scheduled": 1,
+      "successes": 0,
+      "trials": 1,
+      "unproven": 0
+    },
+    "yuanbao.tencent.com::cold": {
+      "clopper_pearson_lower": 0.0,
+      "confidence_threshold_met": false,
+      "coverage_complete": true,
+      "failure_classes": {
+        "test_environment_or_setup_failed": 1
+      },
+      "failures": 1,
+      "observed_success_rate": 0.0,
+      "observed_threshold_met": false,
+      "one_sided_confidence": 0.95,
+      "scheduled": 1,
+      "successes": 0,
+      "trials": 1,
+      "unproven": 0
+    },
+    "yuanbao.tencent.com::crash": {
+      "clopper_pearson_lower": 0.0,
+      "confidence_threshold_met": false,
+      "coverage_complete": false,
+      "failure_classes": {},
+      "failures": 0,
+      "observed_success_rate": 0.0,
+      "observed_threshold_met": false,
+      "one_sided_confidence": 0.95,
+      "scheduled": 1,
+      "successes": 0,
+      "trials": 0,
+      "unproven": 1
+    },
+    "yuanbao.tencent.com::crash_prepare": {
+      "clopper_pearson_lower": 0.0,
+      "confidence_threshold_met": false,
+      "coverage_complete": true,
+      "failure_classes": {
+        "test_environment_or_setup_failed": 1
+      },
+      "failures": 1,
+      "observed_success_rate": 0.0,
+      "observed_threshold_met": false,
+      "one_sided_confidence": 0.95,
+      "scheduled": 1,
+      "successes": 0,
+      "trials": 1,
+      "unproven": 0
+    },
+    "yuanbao.tencent.com::warm": {
+      "clopper_pearson_lower": 0.0,
+      "confidence_threshold_met": false,
+      "coverage_complete": true,
+      "failure_classes": {
+        "test_environment_or_setup_failed": 1
+      },
+      "failures": 1,
+      "observed_success_rate": 0.0,
+      "observed_threshold_met": false,
+      "one_sided_confidence": 0.95,
+      "scheduled": 1,
+      "successes": 0,
+      "trials": 1,
+      "unproven": 0
+    }
+  },
+  "by_path": {},
+  "by_phase": {
+    "alias_route": {
+      "clopper_pearson_lower": 0.012741,
+      "confidence_threshold_met": false,
+      "coverage_complete": true,
+      "failure_classes": {
+        "browser_queue_timeout": 1,
+        "response_oracle_failed": 1,
+        "test_environment_or_setup_failed": 1
+      },
+      "failures": 3,
+      "observed_success_rate": 0.25,
+      "observed_threshold_met": false,
+      "one_sided_confidence": 0.95,
+      "scheduled": 4,
+      "successes": 1,
+      "trials": 4,
+      "unproven": 0
+    },
+    "cold": {
+      "clopper_pearson_lower": 0.07644,
+      "confidence_threshold_met": false,
+      "coverage_complete": true,
+      "failure_classes": {
+        "browser_queue_timeout": 1,
+        "test_environment_or_setup_failed": 2
+      },
+      "failures": 3,
+      "observed_success_rate": 0.4,
+      "observed_threshold_met": false,
+      "one_sided_confidence": 0.95,
+      "scheduled": 5,
+      "successes": 2,
+      "trials": 5,
+      "unproven": 0
+    },
+    "crash": {
+      "clopper_pearson_lower": 0.025321,
+      "confidence_threshold_met": false,
+      "coverage_complete": false,
+      "failure_classes": {
+        "response_oracle_failed": 1
+      },
+      "failures": 1,
+      "observed_success_rate": 0.5,
+      "observed_threshold_met": false,
+      "one_sided_confidence": 0.95,
+      "scheduled": 5,
+      "successes": 1,
+      "trials": 2,
+      "unproven": 3
+    },
+    "crash_prepare": {
+      "clopper_pearson_lower": 0.07644,
+      "confidence_threshold_met": false,
+      "coverage_complete": true,
+      "failure_classes": {
+        "browser_queue_timeout": 1,
+        "test_environment_or_setup_failed": 2
+      },
+      "failures": 3,
+      "observed_success_rate": 0.4,
+      "observed_threshold_met": false,
+      "one_sided_confidence": 0.95,
+      "scheduled": 5,
+      "successes": 2,
+      "trials": 5,
+      "unproven": 0
+    },
+    "warm": {
+      "clopper_pearson_lower": 0.07644,
+      "confidence_threshold_met": false,
+      "coverage_complete": true,
+      "failure_classes": {
+        "browser_queue_timeout": 1,
+        "response_oracle_failed": 1,
+        "test_environment_or_setup_failed": 1
+      },
+      "failures": 3,
+      "observed_success_rate": 0.4,
+      "observed_threshold_met": false,
+      "one_sided_confidence": 0.95,
+      "scheduled": 5,
+      "successes": 2,
+      "trials": 5,
+      "unproven": 0
+    }
+  },
+  "completed_records": 24,
+  "confidence": 0.95,
+  "context_execution_complete": true,
+  "context_passed": true,
+  "coverage_complete": false,
+  "critical_failure_count": 0,
+  "generated_at": "2026-08-12T07:49:56.143+00:00",
+  "interrupted": false,
+  "interruption_reason": null,
+  "inventory_blockers": [
+    {
+      "domain": "custom.example",
+      "model_ids": [
+        "temporary-model"
+      ],
+      "reason": "executable_recorded_profile_missing"
+    },
+    {
+      "domain": "tongyi.aliyun.com",
+      "model_ids": [
+        "qwen-turbo"
+      ],
+      "reason": "executable_recorded_profile_missing"
+    }
+  ],
+  "missing_records": 0,
+  "overall": {
+    "clopper_pearson_lower": 0.20575,
+    "confidence_threshold_met": false,
+    "coverage_complete": false,
+    "failure_classes": {
+      "browser_queue_timeout": 4,
+      "response_oracle_failed": 3,
+      "test_environment_or_setup_failed": 6
+    },
+    "failures": 13,
+    "observed_success_rate": 0.380952,
+    "observed_threshold_met": false,
+    "one_sided_confidence": 0.95,
+    "scheduled": 24,
+    "successes": 8,
+    "trials": 21,
+    "unproven": 3
+  },
+  "planned_requests": 24,
+  "qualification_execution_complete": true,
+  "qualification_passed": false,
+  "release_gate_passed": false,
+  "run_dir": "/Users/lingion_k/Desktop/phantom-relay/tests/live-results/20260812T152820",
+  "run_id": "20260812T152820",
+  "threshold": 0.95
+}

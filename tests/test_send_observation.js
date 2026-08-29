@@ -24,11 +24,25 @@ test('a new generation signal proves that the page started processing', () => {
   });
 });
 
-test('consuming a non-empty recorded input proves one accepted submission', () => {
+test('consuming a non-empty recorded input is weak evidence, not accepted submission proof', () => {
   assert.deepEqual(SendObservation.classify({ inputBefore: 'hello', inputAfter: '' }), {
-    observed: true,
-    reason: 'input_consumed',
+    observed: false,
+    weak: true,
+    reason: 'input_consumed_only',
   });
+});
+
+test('a late fresh assistant boundary upgrades earlier weak input evidence', () => {
+  const early = SendObservation.classify({ inputBefore: 'hello', inputAfter: '' });
+  assert.equal(early.observed, false);
+  assert.equal(early.weak, true);
+
+  const later = SendObservation.classify({
+    assistantObserved: true,
+    inputBefore: 'hello',
+    inputAfter: '',
+  });
+  assert.deepEqual(later, { observed: true, reason: 'assistant_response' });
 });
 
 test('dispatch without a page effect is not send evidence', () => {

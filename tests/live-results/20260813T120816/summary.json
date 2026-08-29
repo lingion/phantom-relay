@@ -1,0 +1,106 @@
+{
+  "by_model": {
+    "wenxin.baidu.com": {
+      "clopper_pearson_lower": 0.0,
+      "confidence_threshold_met": false,
+      "coverage_complete": true,
+      "failure_classes": {
+        "response_oracle_failed": 1
+      },
+      "failures": 1,
+      "observed_success_rate": 0.0,
+      "observed_threshold_met": false,
+      "one_sided_confidence": 0.95,
+      "scheduled": 1,
+      "successes": 0,
+      "trials": 1,
+      "unproven": 0
+    }
+  },
+  "by_model_phase": {
+    "wenxin.baidu.com::warm": {
+      "clopper_pearson_lower": 0.0,
+      "confidence_threshold_met": false,
+      "coverage_complete": true,
+      "failure_classes": {
+        "response_oracle_failed": 1
+      },
+      "failures": 1,
+      "observed_success_rate": 0.0,
+      "observed_threshold_met": false,
+      "one_sided_confidence": 0.95,
+      "scheduled": 1,
+      "successes": 0,
+      "trials": 1,
+      "unproven": 0
+    }
+  },
+  "by_path": {},
+  "by_phase": {
+    "warm": {
+      "clopper_pearson_lower": 0.0,
+      "confidence_threshold_met": false,
+      "coverage_complete": true,
+      "failure_classes": {
+        "response_oracle_failed": 1
+      },
+      "failures": 1,
+      "observed_success_rate": 0.0,
+      "observed_threshold_met": false,
+      "one_sided_confidence": 0.95,
+      "scheduled": 1,
+      "successes": 0,
+      "trials": 1,
+      "unproven": 0
+    }
+  },
+  "completed_records": 1,
+  "confidence": 0.95,
+  "context_execution_complete": true,
+  "context_passed": true,
+  "coverage_complete": false,
+  "critical_failure_count": 0,
+  "generated_at": "2026-08-13T04:08:48.964+00:00",
+  "interrupted": false,
+  "interruption_reason": null,
+  "inventory_blockers": [
+    {
+      "domain": "custom.example",
+      "model_ids": [
+        "temporary-model"
+      ],
+      "reason": "executable_recorded_profile_missing"
+    },
+    {
+      "domain": "tongyi.aliyun.com",
+      "model_ids": [
+        "qwen-turbo"
+      ],
+      "reason": "executable_recorded_profile_missing"
+    }
+  ],
+  "missing_records": 5,
+  "overall": {
+    "clopper_pearson_lower": 0.0,
+    "confidence_threshold_met": false,
+    "coverage_complete": true,
+    "failure_classes": {
+      "response_oracle_failed": 1
+    },
+    "failures": 1,
+    "observed_success_rate": 0.0,
+    "observed_threshold_met": false,
+    "one_sided_confidence": 0.95,
+    "scheduled": 1,
+    "successes": 0,
+    "trials": 1,
+    "unproven": 0
+  },
+  "planned_requests": 6,
+  "qualification_execution_complete": false,
+  "qualification_passed": false,
+  "release_gate_passed": false,
+  "run_dir": "/Users/lingion_k/Desktop/phantom-relay/tests/live-results/20260813T120816",
+  "run_id": "20260813T120816",
+  "threshold": 0.95
+}
