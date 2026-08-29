@@ -220,11 +220,30 @@ class DurableJobStore:
             );
             """
         )
-        connection.execute(
-            "INSERT OR REPLACE INTO metadata(key, value) VALUES (?, ?)",
-            ("schema_version", str(_SCHEMA_VERSION)),
-        )
-        connection.commit()
+        version_row = connection.execute(
+            "SELECT value FROM metadata WHERE key = ?",
+            ("schema_version",),
+        ).fetchone()
+        if version_row is None:
+            connection.execute(
+                "INSERT INTO metadata(key, value) VALUES (?, ?)",
+                ("schema_version", str(_SCHEMA_VERSION)),
+            )
+            connection.commit()
+        else:
+            raw_version = str(version_row["value"])
+            try:
+                version = int(raw_version)
+            except (TypeError, ValueError) as error:
+                connection.close()
+                raise RuntimeError(
+                    f"unsupported durable job store schema version: {raw_version!r}"
+                ) from error
+            if version != _SCHEMA_VERSION:
+                connection.close()
+                raise RuntimeError(
+                    f"unsupported durable job store schema version: {version}"
+                )
         return connection
 
     def save_snapshot(
@@ -304,6 +323,10 @@ class DurableJobStore:
             return JobSnapshot(jobs={}, queue=[], deltas={})
         connection = self._connect()
         try:
+            # Keep every table read on one SQLite snapshot. Without an explicit
+            # read transaction, a concurrent save can replace the tables between
+            # SELECT statements and produce a generation that was never committed.
+            connection.execute("BEGIN")
             jobs: dict[str, dict[str, Any]] = {}
             for row in connection.execute("SELECT job_id, payload FROM jobs"):
                 value = json.loads(row["payload"])
@@ -329,12 +352,17 @@ class DurableJobStore:
                 value = json.loads(row["payload"])
                 if isinstance(value, dict):
                     idempotency[str(row["idempotency_key"])] = value
-            return JobSnapshot(
+            snapshot = JobSnapshot(
                 jobs=jobs,
                 queue=queue,
                 deltas=deltas,
                 bindings=bindings,
                 idempotency=idempotency,
             )
+            connection.commit()
+            return snapshot
+        except Exception:
+            connection.rollback()
+            raise
         finally:
             connection.close()

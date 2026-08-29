@@ -23,8 +23,9 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from scripts.chromedriver_resolution import parse_browser_version, resolve_chromedriver
+
 ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_CHROMEDRIVER = ROOT / ".tools/chromedriver-152.0.7962.0/chromedriver"
 
 
 class HarnessError(ValueError):
@@ -152,6 +153,25 @@ def _check_api(api_url: str) -> dict[str, Any]:
         raise HarnessError(f"api_health_unreachable:{type(exc).__name__}") from exc
 
 
+def _resolve_runtime_chromedriver(
+    chrome_binary: Path,
+    configured: Path | None,
+) -> tuple[Path, str]:
+    """Resolve the driver only after reading the selected browser version."""
+    try:
+        version_output = subprocess.run(
+            [str(chrome_binary), "--version"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout
+        browser_version = parse_browser_version(version_output)
+        env = {"PHANTOM_RELAY_CHROMEDRIVER": str(configured)} if configured else None
+        return resolve_chromedriver(browser_version, ROOT, env=env), browser_version
+    except (OSError, subprocess.SubprocessError, RuntimeError) as exc:
+        raise HarnessError(f"chromedriver_resolution_failed:{type(exc).__name__}:{exc}") from exc
+
+
 def preflight(config: HarnessConfig) -> dict[str, Any]:
     if not str(config.model or "").strip():
         raise HarnessError("model_required")
@@ -169,15 +189,14 @@ def preflight(config: HarnessConfig) -> dict[str, Any]:
         raise HarnessError(f"cdp_port_already_in_use:{cdp_port}")
 
     chrome_binary = Path(config.chrome_binary).expanduser().resolve() if config.chrome_binary else None
-    chromedriver_value = config.chromedriver or os.environ.get("PHANTOM_RELAY_CHROMEDRIVER", str(DEFAULT_CHROMEDRIVER))
-    chromedriver = Path(chromedriver_value).expanduser().resolve() if chromedriver_value else None
+    chromedriver = Path(config.chromedriver).expanduser().resolve() if config.chromedriver else None
+    browser_version = None
     if config.run:
         if chrome_binary is None:
             raise HarnessError("chrome_binary_required")
         if not chrome_binary.is_file() or not os.access(chrome_binary, os.X_OK):
             raise HarnessError("chrome_binary_not_executable")
-        if chromedriver is None or not chromedriver.is_file() or not os.access(chromedriver, os.X_OK):
-            raise HarnessError("chromedriver_not_executable")
+        chromedriver, browser_version = _resolve_runtime_chromedriver(chrome_binary, chromedriver)
 
     api = {"reachable": False, "skipped": True}
     if not config.skip_api_check:
@@ -198,6 +217,7 @@ def preflight(config: HarnessConfig) -> dict[str, Any]:
         "extension_dir": str(extension_dir),
         "chrome_binary": str(chrome_binary) if chrome_binary else None,
         "chromedriver": str(chromedriver) if chromedriver else None,
+        "browser_version": browser_version,
     }
 
 

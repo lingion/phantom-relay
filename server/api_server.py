@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Phantom Relay API v3 — protocol-based gateway, backend drives Chrome, extension executes."""
-import json, time, os, hashlib, threading, uuid, subprocess, sys, dataclasses, shutil, tempfile, webbrowser
+import json, time, os, hashlib, threading, uuid, subprocess, sys, dataclasses, shutil, tempfile, webbrowser, math
 from copy import deepcopy
 from flask import Flask, request, jsonify, send_file, Response
 from urllib.parse import urlparse, unquote
@@ -60,6 +60,7 @@ os.chdir(DIR)  # Ensure we're in server/ for relative imports
 app = Flask(__name__)
 
 BROWSER_LOCK    = threading.RLock()
+PROFILE_REGISTRY_LOCK = threading.RLock()
 BROWSER_JOBS    = {}
 BROWSER_QUEUE   = []
 BROWSER_CLIENTS = {}
@@ -77,8 +78,9 @@ IDEMPOTENCY_TTL = 24 * 60 * 60
 POLL_LAST       = {}
 POLL_MIN_INTERVAL = 0.25
 CLIENT_TTL      = 45.0
+MAX_BROWSER_CAPTURE_TIMEOUT_MS = 900_000.0
 _BROWSER_WAKE_LOCK = threading.Lock()
-_BROWSER_WAKE_LAST = 0.0
+_BROWSER_WAKE_LAST = {}
 _BROWSER_WAKE_PENDING_LOCK = threading.Lock()
 _BROWSER_WAKE_PENDING = {}
 BROWSER_HOST_CONFIG = os.environ.get("PHANTOM_RELAY_BROWSER_CONFIG", os.path.join(os.path.dirname(DIR), "browser-host.conf"))
@@ -101,6 +103,25 @@ BROWSER_ACTIVATION_OWNER = os.environ.get("PHANTOM_RELAY_ACTIVATION_OWNER", "api
 _BROWSER_WAKE_COOLDOWN = 15.0
 _BROWSER_WAKE_RECENT_WINDOW = 8.0
 try:
+    _UNCLAIMED_WAKE_GRACE = max(
+        0.25,
+        float(os.environ.get("PHANTOM_RELAY_UNCLAIMED_WAKE_GRACE", "2")),
+    )
+except (TypeError, ValueError):
+    _UNCLAIMED_WAKE_GRACE = 2.0
+try:
+    _UNCLAIMED_WAKE_MAX_WAIT = max(
+        _UNCLAIMED_WAKE_GRACE,
+        float(
+            os.environ.get(
+                "PHANTOM_RELAY_UNCLAIMED_WAKE_MAX_WAIT",
+                str(_BROWSER_WAKE_RECENT_WINDOW + 2.0),
+            )
+        ),
+    )
+except (TypeError, ValueError):
+    _UNCLAIMED_WAKE_MAX_WAIT = _BROWSER_WAKE_RECENT_WINDOW + 2.0
+try:
     _BROWSER_WAKE_LEASE_TTL = max(
         _BROWSER_WAKE_COOLDOWN,
         float(os.environ.get("PHANTOM_RELAY_BROWSER_WAKE_LEASE_TTL", "45")),
@@ -109,13 +130,17 @@ except (TypeError, ValueError):
     _BROWSER_WAKE_LEASE_TTL = 45.0
 _BROWSER_STREAM_POLL_INTERVAL = 0.1
 _BROWSER_STREAM_HEARTBEAT_INTERVAL = 15.0
+_BROWSER_REAPER_INTERVAL = 0.25
+_BROWSER_REAPER_LOCK = threading.Lock()
+_BROWSER_REAPER_STOP = None
+_BROWSER_REAPER_THREAD = None
 try:
     BROWSER_QUEUE_TIMEOUT = max(
         15.0,
-        float(os.environ.get("PHANTOM_RELAY_BROWSER_QUEUE_TIMEOUT", "60")),
+        float(os.environ.get("PHANTOM_RELAY_BROWSER_QUEUE_TIMEOUT", "120")),
     )
 except (TypeError, ValueError):
-    BROWSER_QUEUE_TIMEOUT = 60.0
+    BROWSER_QUEUE_TIMEOUT = 120.0
 
 
 def runtime_session_allowed(runtime_session_id):
@@ -263,6 +288,7 @@ def configure_browser_job_store(path=None, *, restore=True):
     JOB_STORE = DurableJobStore(selected)
     if restore:
         restore_browser_state()
+    start_browser_job_reaper()
     return JOB_STORE
 
 
@@ -713,20 +739,23 @@ def wake_browser_host(target_url=""):
     if parsed_target.scheme not in {"http", "https"} or not parsed_target.hostname:
         trace_api_event("browser_wake_skipped", {"mode": "invalid_target_url"})
         return False
+    wake_key = str(parsed_target.hostname or "").strip().lower()
     # Reserve the wake slot before spawning the OS opener. The old ordering
     # allowed concurrent request threads to pass the cooldown check together,
     # producing duplicate browser activations and visible about:blank races.
     wake_event_id = f"wake_{int(time.time() * 1000)}_{uuid.uuid4().hex[:8]}"
     with _BROWSER_WAKE_LOCK:
         now = time.time()
-        if now - _BROWSER_WAKE_LAST < _BROWSER_WAKE_COOLDOWN:
+        last_wake = float(_BROWSER_WAKE_LAST.get(wake_key) or 0)
+        if now - last_wake < _BROWSER_WAKE_COOLDOWN:
             trace_api_event("browser_wake_coalesced", {
                 "target_url": target_url,
                 "wake_event_id": wake_event_id,
                 "reason": "cooldown",
+                "domain": wake_key,
             })
             return False
-        _BROWSER_WAKE_LAST = now
+        _BROWSER_WAKE_LAST[wake_key] = now
     command = BROWSER_WAKE_COMMAND.strip() or _browser_host_config_value("wake_command")
     try:
         if command:
@@ -791,7 +820,7 @@ def wake_browser_host(target_url=""):
         return False
     except Exception as exc:
         with _BROWSER_WAKE_LOCK:
-            _BROWSER_WAKE_LAST = 0.0
+            _BROWSER_WAKE_LAST.pop(wake_key, None)
         trace_api_event("browser_wake_failed", {
             "error": type(exc).__name__,
             "target_url": target_url,
@@ -856,6 +885,193 @@ def request_browser_wake(domain="", target_url=""):
                 "requested_at": now,
             }
         return opened
+
+
+def schedule_unclaimed_job_wake(job_id):
+    """Wake once if a freshly queued job remains unclaimed after a short grace."""
+    wanted_job_id = str(job_id or "").strip()
+    if not wanted_job_id:
+        return False
+
+    def recover_unclaimed_job():
+        deadline = time.monotonic() + _UNCLAIMED_WAKE_MAX_WAIT
+        while True:
+            time.sleep(_UNCLAIMED_WAKE_GRACE)
+            with BROWSER_LOCK:
+                job = BROWSER_JOBS.get(wanted_job_id)
+                if not job or job.get("status") != JobState.QUEUED.value:
+                    return
+                if int(job.get("claim_attempt") or 0) != 0:
+                    return
+                if job.get("unclaimed_wake_attempted"):
+                    return
+                domain = str(job.get("domain") or "").strip().lower()
+                target_url = str(job.get("target_url") or "").strip()
+            if browser_extension_recently_ready(domain):
+                if time.monotonic() >= deadline:
+                    trace_api_event(
+                        "browser_unclaimed_job_watchdog_expired",
+                        {
+                            "job_id": wanted_job_id,
+                            "domain": domain,
+                            "reason": "ready_heartbeat_continued",
+                        },
+                    )
+                    return
+                continue
+            with BROWSER_LOCK:
+                job = BROWSER_JOBS.get(wanted_job_id)
+                if not job or job.get("status") != JobState.QUEUED.value:
+                    return
+                if int(job.get("claim_attempt") or 0) != 0 or job.get("unclaimed_wake_attempted"):
+                    return
+                job["unclaimed_wake_attempted"] = True
+                job["updated_at"] = datetime.now().isoformat()
+                _persist_browser_state_locked()
+            break
+        with _BROWSER_WAKE_PENDING_LOCK:
+            _BROWSER_WAKE_PENDING.pop(domain, None)
+        opened = wake_browser_host(target_url)
+        trace_api_event(
+            "browser_unclaimed_job_wake",
+            {
+                "job_id": wanted_job_id,
+                "domain": domain,
+                "target_url": target_url,
+                "opened": bool(opened),
+                "grace_seconds": _UNCLAIMED_WAKE_GRACE,
+            },
+        )
+
+    threading.Thread(
+        target=recover_unclaimed_job,
+        name=f"phantom-unclaimed-wake-{wanted_job_id}",
+        daemon=True,
+    ).start()
+    return True
+
+
+def schedule_stalled_browser_wake(job_id):
+    """Retry one initial wake after its lease if the first tab never becomes executable."""
+    wanted_job_id = str(job_id or "").strip()
+    if not wanted_job_id:
+        return False
+
+    def recover_stalled_job():
+        recovery_deadline = time.monotonic() + max(
+            float(_BROWSER_WAKE_LEASE_TTL),
+            float(_BROWSER_WAKE_COOLDOWN),
+        )
+        while True:
+            with BROWSER_LOCK:
+                job = BROWSER_JOBS.get(wanted_job_id)
+                if not job or job.get("status") != JobState.QUEUED.value:
+                    return
+                if int(job.get("claim_attempt") or 0) != 0:
+                    return
+                if job.get("stalled_wake_attempted"):
+                    return
+                domain = str(job.get("domain") or "").strip().lower()
+                target_url = str(job.get("target_url") or "").strip()
+
+            if browser_extension_recently_ready(domain):
+                return
+
+            remaining = recovery_deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            interval = min(max(float(_UNCLAIMED_WAKE_GRACE), 0.05), remaining)
+            time.sleep(interval)
+
+        with BROWSER_LOCK:
+            job = BROWSER_JOBS.get(wanted_job_id)
+            if not job or job.get("status") != JobState.QUEUED.value:
+                return
+            if int(job.get("claim_attempt") or 0) != 0:
+                return
+            if job.get("stalled_wake_attempted"):
+                return
+            job["stalled_wake_attempted"] = True
+            job["updated_at"] = datetime.now().isoformat()
+            _persist_browser_state_locked()
+
+        opened = request_browser_wake(domain=domain, target_url=target_url)
+        trace_api_event(
+            "browser_stalled_job_wake",
+            {
+                "job_id": wanted_job_id,
+                "domain": domain,
+                "target_url": target_url,
+                "opened": bool(opened),
+                "lease_seconds": round(
+                    max(float(_BROWSER_WAKE_LEASE_TTL), float(_BROWSER_WAKE_COOLDOWN)),
+                    3,
+                ),
+            },
+        )
+
+    threading.Thread(
+        target=recover_stalled_job,
+        name=f"phantom-stalled-wake-{wanted_job_id}",
+        daemon=True,
+    ).start()
+    return True
+
+
+def _bound_browser_client_is_reusable(job):
+    """Return whether this conversation already owns a live executable tab.
+
+    A conversation binding selects the preferred tab, but it does not prove the
+    browser process is still alive. Use the same recent content heartbeat
+    window as the request-path wake guard; the longer client lease is reserved
+    for an already-claimed job and must not suppress cold-start recovery.
+    """
+    if not isinstance(job, dict):
+        return False
+    domain = str(job.get("domain") or "").strip().lower()
+    conversation_id = str(job.get("conversation_id") or "")
+    if not domain or not conversation_id:
+        return False
+    binding = conversation_binding(conversation_id, domain)
+    if not binding or binding.get("tab_id") is None:
+        return False
+    with BROWSER_LOCK:
+        client = BROWSER_CLIENTS.get(str(binding.get("tab_id")))
+        if not isinstance(client, dict):
+            return False
+        return _browser_client_has_execution_readiness(
+            client,
+            domain,
+            max_age=_BROWSER_WAKE_RECENT_WINDOW,
+        )
+
+
+def activate_browser_for_job(job):
+    domain = str((job or {}).get("domain") or "").strip().lower()
+    target_url = str((job or {}).get("target_url") or "").strip()
+    bound_reusable = _bound_browser_client_is_reusable(job)
+    recently_ready = bound_reusable or browser_extension_recently_ready(domain)
+    if bound_reusable:
+        with _BROWSER_WAKE_PENDING_LOCK:
+            _BROWSER_WAKE_PENDING.pop(domain, None)
+        trace_api_event("browser_wake_skipped", {
+            "mode": "bound_ready_extension",
+            "domain": domain,
+            "target_url": target_url,
+            "conversation_id": str((job or {}).get("conversation_id") or ""),
+        })
+        opened = False
+    else:
+        opened = request_browser_wake(domain=domain, target_url=target_url)
+    if bound_reusable:
+        # Keep a bounded recovery path if the bound page never claims the job;
+        # it must not open a second page during the valid client lease.
+        schedule_stalled_browser_wake((job or {}).get("id"))
+    elif recently_ready and not opened:
+        schedule_unclaimed_job_wake((job or {}).get("id"))
+    elif not recently_ready:
+        schedule_stalled_browser_wake((job or {}).get("id"))
+    return opened
 
 def request_fingerprint(model, messages, request_meta):
     payload = json.dumps({"model": model, "messages": messages,
@@ -1565,6 +1781,9 @@ def mark_browser_ready(body):
     incoming_tab_id = body.get("tab_id")
     incoming_ready = bool(body.get("ready") and body.get("input_ready") and body.get("send_ready"))
     incoming_client_id = str(body.get("client_id") or "").strip()
+    incoming_content_script_version = str(body.get("content_script_version") or "").strip()[:64]
+    if incoming_ready and not incoming_content_script_version:
+        incoming_ready = False
     incoming_runtime_session_id = str(body.get("runtime_session_id") or f"legacy:{incoming_client_id}").strip()
     if not runtime_session_allowed(incoming_runtime_session_id):
         trace_api_event("browser_runtime_rejected", {
@@ -1587,6 +1806,14 @@ def mark_browser_ready(body):
                 "domain": incoming_domain,
             })
             return False
+        claim_domain_changed = fail_claimed_tab_domain_change(
+            incoming_tab_id,
+            incoming_domain,
+            incoming_client_id,
+            source="heartbeat",
+        )
+        if claim_domain_changed:
+            incoming_ready = False
         # A Chrome tab id is an allocation detail, not user intent, recency, or
         # recorded-profile identity. Keep every fresh ready tab independently;
         # the extension chooses the exact execution tab after probing response
@@ -1595,7 +1822,10 @@ def mark_browser_ready(body):
         # page to revoke the user's existing recorded page.
         previous = BROWSER_CLIENTS.get(key) or {}
         previous_state = str(previous.get("state") or BrowserClientState.NEW.value)
-        if body.get("ready") and body.get("input_ready") and body.get("send_ready"):
+        ready = bool(body.get("ready")) and bool(incoming_content_script_version) and not claim_domain_changed
+        input_ready = bool(body.get("input_ready")) and ready
+        send_ready = bool(body.get("send_ready")) and ready
+        if ready and input_ready and send_ready:
             client_event = "ready" if previous_state in {
                 BrowserClientState.NEW.value,
                 BrowserClientState.REGISTERED.value,
@@ -1608,14 +1838,22 @@ def mark_browser_ready(body):
             client_state = next_browser_client_state(previous_state, client_event).value
         except InvalidTransition:
             client_state = BrowserClientState.REGISTERED.value
+        capabilities = merge_browser_capabilities(
+            previous.get("capabilities"),
+            normalize_browser_capabilities(body),
+        )
+        if not ready:
+            for field in ("can_observe", "can_execute", "can_snapshot"):
+                capabilities[field] = False
         info=dict(domain=body.get("domain", ""), tab_id=body.get("tab_id"),
                   client_id=incoming_client_id or previous.get("client_id", ""),
                   runtime_session_id=incoming_runtime_session_id,
-                  last_seen=time.time(), ready=bool(body.get("ready")),
-                  input_ready=bool(body.get("input_ready")),
-                  send_ready=bool(body.get("send_ready")),
+                  last_seen=time.time(), ready=ready,
+                  input_ready=input_ready,
+                  send_ready=send_ready,
+                  content_script_version=incoming_content_script_version,
                   state=client_state,
-                  capabilities=merge_browser_capabilities(previous.get("capabilities"), normalize_browser_capabilities(body)),
+                  capabilities=capabilities,
                   url=body.get("url", ""), source=body.get("source", ""),
                   background_version=body.get("background_version", ""))
         BROWSER_CLIENTS[key]=info
@@ -1641,9 +1879,22 @@ def mark_browser_ready(body):
             expected_conversation = str(active_job.get("conversation_id") or "")
             if not conversation_id or conversation_id == expected_conversation:
                 active_job["last_worker_seen"] = time.time()
-                active_job["lease_expires_at"] = time.time() + 300.0
+                active_job["lease_expires_at"] = browser_job_lease_deadline(active_job, time.time())
                 active_job["updated_at"] = datetime.now().isoformat()
         _persist_browser_state_locked()
+    if incoming_ready and incoming_domain:
+        with _BROWSER_WAKE_PENDING_LOCK:
+            released = _BROWSER_WAKE_PENDING.pop(incoming_domain, None)
+        if released:
+            trace_api_event(
+                "browser_wake_lease_released",
+                {
+                    "domain": incoming_domain,
+                    "tab_id": incoming_tab_id,
+                    "target_url": str(released.get("target_url") or ""),
+                    "reason": "content_ready",
+                },
+            )
     return True
 
 
@@ -1809,6 +2060,38 @@ def _active_claim_for_tab(tab_id):
             return job
     return None
 
+
+def fail_claimed_tab_domain_change(tab_id, incoming_domain, client_id="", source=""):
+    """Fail a claimed job when its tab leaves the exact recorded hostname."""
+    observed_domain = str(incoming_domain or "").strip().lower()
+    if tab_id is None or not observed_domain:
+        return False
+    with BROWSER_LOCK:
+        job = _active_claim_for_tab(tab_id)
+        if not job:
+            return False
+        expected_domain = str(job.get("domain") or "").strip().lower()
+        if not expected_domain or observed_domain == expected_domain:
+            return False
+        expected_client = str(job.get("client_id") or "").strip()
+        observed_client = str(client_id or "").strip()
+        if expected_client and observed_client and expected_client != observed_client:
+            return False
+        finished = finish_browser_job(
+            str(job.get("id") or ""),
+            JobState.FAILED.value,
+            error="execution_domain_changed",
+        )
+        BROWSER_READY.pop(str(tab_id), None)
+        trace_api_event("browser_claim_domain_changed", {
+            "job_id": job.get("id"),
+            "tab_id": tab_id,
+            "expected_domain": expected_domain,
+            "observed_domain": observed_domain,
+            "source": str(source or ""),
+        })
+        return bool(finished and finished.get("status") == JobState.FAILED.value)
+
 def invalidate_browser_ready(domain):
     with BROWSER_LOCK:
         for key, info in list(BROWSER_READY.items()):
@@ -1838,7 +2121,7 @@ def browser_status_snapshot():
                     "state", "domain", "tab_id", "last_seen", "ready", "input_ready",
                     "send_ready", "capabilities", "url", "source", "heartbeat",
                     "client_id", "extension_version", "profile_id", "background_version",
-                    "runtime_session_id",
+                    "runtime_session_id", "content_script_version",
                 )
                 if field in value
             }
@@ -1853,7 +2136,8 @@ def browser_status_snapshot():
         terminal_jobs = {
             jid: {"id": job.get("id"), "status": job.get("status"),
                   "domain": job.get("domain"), "conversation_id": job.get("conversation_id"),
-                  "tab_id": job.get("tab_id"), "model": job.get("model"),
+                  "tab_id": job.get("tab_id"), "client_id": job.get("client_id"),
+                  "model": job.get("model"),
                   "target_url": job.get("target_url"),
                   "state_reason": job.get("state_reason"),
                   "error": job.get("error")}
@@ -1873,18 +2157,120 @@ def browser_status_snapshot():
         "queue_depth": len(BROWSER_QUEUE),
     }
 
+def validated_browser_capture_timeout_ms(request_meta):
+    if request_meta is None:
+        return None, None
+    if not isinstance(request_meta, dict):
+        return None, "capture_timeout_invalid"
+    if "capture_timeout_ms" not in request_meta:
+        return None, None
+    raw_timeout = request_meta.get("capture_timeout_ms")
+    if isinstance(raw_timeout, bool):
+        return None, "capture_timeout_invalid"
+    try:
+        timeout_ms = float(raw_timeout)
+    except (TypeError, ValueError, OverflowError):
+        return None, "capture_timeout_invalid"
+    if not math.isfinite(timeout_ms) or not 0 < timeout_ms <= MAX_BROWSER_CAPTURE_TIMEOUT_MS:
+        return None, "capture_timeout_invalid"
+    return timeout_ms, None
+
+
+def browser_job_request_deadline(request_meta, now=None):
+    meta = request_meta if isinstance(request_meta, dict) else {}
+    timeout_ms, error = validated_browser_capture_timeout_ms(meta)
+    if error or timeout_ms is None:
+        return None
+    return float(now if now is not None else time.time()) + timeout_ms / 1000.0
+
+
+def browser_job_lease_deadline(job, now=None):
+    current = float(now if now is not None else time.time())
+    request_deadline = job.get("request_deadline_at") if isinstance(job, dict) else None
+    try:
+        request_deadline = float(request_deadline)
+    except (TypeError, ValueError):
+        request_deadline = 0.0
+    lease_deadline = current + 300.0
+    return min(lease_deadline, request_deadline) if request_deadline > 0 else lease_deadline
+
+
+def request_deadline_expired(job, now=None):
+    if not isinstance(job, dict):
+        return False
+    try:
+        deadline = float(job.get("request_deadline_at") or 0)
+    except (TypeError, ValueError):
+        return False
+    return deadline > 0 and deadline <= float(now if now is not None else time.time())
+
+
+def _fail_browser_job_due_to_request_deadline_locked(job, now=None):
+    """Terminally fail an expired request while BROWSER_LOCK is held."""
+    if not job or job.get("status") in {
+        JobState.COMPLETED.value,
+        JobState.FAILED.value,
+        JobState.CANCELLED.value,
+    }:
+        return False
+    jid = str(job.get("id") or "")
+    if jid in BROWSER_QUEUE:
+        BROWSER_QUEUE.remove(jid)
+    job["status"] = JobState.FAILED.value
+    job["state_reason"] = "browser_timeout"
+    job["error"] = "browser_timeout"
+    job["lease_expires_at"] = None
+    job["updated_at"] = datetime.now().isoformat()
+    event = BROWSER_EVENTS.pop(jid, None)
+    if event:
+        event.set()
+    request_key = str((job.get("request_meta") or {}).get("idempotency_key") or "")
+    if request_key:
+        record = IDEMPOTENCY.get(request_key)
+        if record and record.get("status") not in {"completed", "failed"}:
+            record["status"] = "failed"
+            record["error"] = openai_error(
+                "Request timed out while waiting for browser response",
+                "server_error",
+                code="timeout",
+            )
+            record["updated_at"] = time.time()
+            record["event"].set()
+    trace_api_event("browser_job_request_deadline_expired", {
+        "job_id": jid,
+        "domain": job.get("domain"),
+        "status": JobState.FAILED.value,
+        "reason": "browser_timeout",
+    })
+    return True
+
+
+def _expire_browser_job_if_needed_locked(job, now=None):
+    """Apply the irreversible request deadline transition under BROWSER_LOCK."""
+    if not request_deadline_expired(job, now):
+        return False
+    changed = _fail_browser_job_due_to_request_deadline_locked(job, now)
+    if changed:
+        _persist_browser_state_locked()
+    return changed
+
+
 def new_browser_job(message, domain="", model="", new_tab=False, target_url="", messages=None, request_meta=None, conversation_id=None, tab_id=None):
     jid = f"job_{int(time.time()*1000)}_{uuid.uuid4().hex[:8]}"
     conversation_id = str(conversation_id or f"conv_{uuid.uuid4().hex}")
+    request_meta = request_meta or {}
+    now = time.time()
     job = dict(id=jid, conversation_id=conversation_id, conversation_bound=bool(conversation_id and not conversation_id.startswith("conv_")),
                message=message, messages=messages or [{"role":"user","content":message}],
-               domain=domain, model=model, request_meta=request_meta or {},
+               domain=domain, model=model, request_meta=request_meta,
                new_tab=bool(new_tab), target_url=target_url,
                close_previous=False, status=JobState.QUEUED.value, tab_id=tab_id,
                state_reason="enqueued",
                reservation_tab_id=None, queued_at=time.time(), claimed_at=None,
+               request_deadline_at=browser_job_request_deadline(request_meta, now),
                lease_expires_at=None, last_worker_seen=None,
                claim_token=uuid.uuid4().hex, claim_attempt=0,
+               stalled_wake_attempted=False,
                created_at=datetime.now().isoformat(), updated_at=datetime.now().isoformat(),
                result=None, error=None, stream_snapshot="")
     with BROWSER_LOCK:
@@ -1953,30 +2339,34 @@ def stream_snapshot_delta(previous, incoming):
             return incoming[n:]
     return incoming
 
-def validate_job_actor(body, require_claimed=True):
+def _validate_job_actor_locked(body, require_claimed=True):
     jid = str(body.get("job_id") or "")
+    job = BROWSER_JOBS.get(jid)
+    if not job:
+        return None, "job_not_found"
+    if require_claimed and job.get("status") != "claimed":
+        return None, "job_not_claimed"
+    supplied_token = str(body.get("claim_token") or "")
+    expected_token = str(job.get("claim_token") or "")
+    if not supplied_token or supplied_token != expected_token:
+        return None, "claim_token_invalid"
+    if body.get("tab_id") is None or str(body.get("tab_id")) != str(job.get("tab_id")):
+        return None, "tab_id_mismatch"
+    for field in ("conversation_id", "domain"):
+        expected = str(job.get(field) or "").strip().lower()
+        actual = str(body.get(field) or "").strip().lower()
+        if actual != expected:
+            return None, f"{field}_mismatch"
+    expected_client = str(job.get("client_id") or "")
+    actual_client = str(body.get("client_id") or "")
+    if actual_client and expected_client and actual_client != expected_client:
+        return None, "client_id_mismatch"
+    return dict(job), None
+
+
+def validate_job_actor(body, require_claimed=True):
     with BROWSER_LOCK:
-        job = BROWSER_JOBS.get(jid)
-        if not job:
-            return None, "job_not_found"
-        if require_claimed and job.get("status") != "claimed":
-            return None, "job_not_claimed"
-        supplied_token = str(body.get("claim_token") or "")
-        expected_token = str(job.get("claim_token") or "")
-        if not supplied_token or supplied_token != expected_token:
-            return None, "claim_token_invalid"
-        if body.get("tab_id") is None or str(body.get("tab_id")) != str(job.get("tab_id")):
-            return None, "tab_id_mismatch"
-        for field in ("conversation_id", "domain"):
-            expected = str(job.get(field) or "").strip().lower()
-            actual = str(body.get(field) or "").strip().lower()
-            if actual != expected:
-                return None, f"{field}_mismatch"
-        expected_client = str(job.get("client_id") or "")
-        actual_client = str(body.get("client_id") or "")
-        if actual_client and expected_client and actual_client != expected_client:
-            return None, "client_id_mismatch"
-        return dict(job), None
+        return _validate_job_actor_locked(body, require_claimed=require_claimed)
 
 def terminal_browser_result_replay(job, body):
     """Accept only an exact replay of a previously completed browser result."""
@@ -2001,18 +2391,9 @@ def terminal_browser_result_replay(job, body):
     return True
 
 def append_browser_delta(body):
-    _, error = validate_job_actor(body)
-    if error:
-        trace_api_event("browser_delta_rejected", {
-            "job_id": body.get("job_id"),
-            "error": error,
-            "tab_id": body.get("tab_id"),
-            "domain": body.get("domain", ""),
-        })
-        return False
     jid = str(body.get("job_id") or "")
     text = normalize_stream_snapshot(body.get("text") or "")
-    if not jid or not text:
+    if not jid:
         trace_api_event("browser_delta_ignored", {
             "job_id": jid,
             "reason": "empty_snapshot",
@@ -2020,6 +2401,15 @@ def append_browser_delta(body):
         })
         return False
     with BROWSER_LOCK:
+        _, error = _validate_job_actor_locked(body)
+        if error:
+            trace_api_event("browser_delta_rejected", {
+                "job_id": body.get("job_id"),
+                "error": error,
+                "tab_id": body.get("tab_id"),
+                "domain": body.get("domain", ""),
+            })
+            return False
         job = BROWSER_JOBS.get(jid)
         if not job or job.get("status") not in ("queued", "claimed"):
             trace_api_event("browser_delta_rejected", {
@@ -2028,8 +2418,26 @@ def append_browser_delta(body):
                 "status": (job or {}).get("status") if job else "missing",
             })
             return False
-        job["last_worker_seen"] = time.time()
-        job["lease_expires_at"] = time.time() + 300.0
+        now = time.time()
+        if request_deadline_expired(job, now):
+            _fail_browser_job_due_to_request_deadline_locked(job, now)
+            _persist_browser_state_locked()
+            trace_api_event("browser_delta_rejected", {
+                "job_id": jid,
+                "error": "request_deadline_expired",
+                "tab_id": job.get("tab_id"),
+                "domain": job.get("domain", ""),
+            })
+            return False
+        if not text:
+            trace_api_event("browser_delta_ignored", {
+                "job_id": jid,
+                "reason": "empty_snapshot",
+                "text_length": len(text),
+            })
+            return False
+        job["last_worker_seen"] = now
+        job["lease_expires_at"] = browser_job_lease_deadline(job, now)
         events = BROWSER_DELTAS.setdefault(jid, [])
         previous = str(job.get("stream_snapshot") or "")
         delta = stream_snapshot_delta(previous, text)
@@ -2187,28 +2595,48 @@ def iter_live_browser_sse(job, route, request_key="", full_prompt="", tool_choic
         )
 
         while True:
+            item = None
+            pending_chunk = None
+            pending_snapshot = ""
             with BROWSER_LOCK:
                 current = BROWSER_JOBS.get(job_id)
-                events = list(BROWSER_DELTAS.get(job_id, []))
+                now_wall = time.time()
+                if current:
+                    _expire_browser_job_if_needed_locked(current, now_wall)
+                current = BROWSER_JOBS.get(job_id)
                 status = str(current.get("status") or "") if current else "missing"
                 result = deepcopy(current.get("result") or {}) if current else {}
                 error = str(current.get("error") or "browser_error") if current else "job_not_found"
+                events = BROWSER_DELTAS.get(job_id, [])
+                if status not in {
+                    JobState.FAILED.value,
+                    JobState.CANCELLED.value,
+                    "missing",
+                } and event_index < len(events):
+                    item = deepcopy(events[event_index])
+                    event_index += 1
+                    snapshot = normalize_stream_snapshot(item.get("text") or "")
+                    delta = stream_snapshot_delta(emitted_snapshot, snapshot) if snapshot else ""
+                    if not delta and not emitted_snapshot:
+                        delta = str(item.get("delta") or "")
+                    if delta:
+                        pending_chunk = text_to_sse_chunk(
+                            delta_content=delta,
+                            model=stream_base["model"],
+                            response_id=response_id,
+                            created=stream_base["created"],
+                        )
+                    pending_snapshot = snapshot
 
-            for item in events[event_index:]:
-                event_index += 1
-                snapshot = normalize_stream_snapshot(item.get("text") or "")
-                delta = stream_snapshot_delta(emitted_snapshot, snapshot) if snapshot else ""
-                if not delta and not emitted_snapshot:
-                    delta = str(item.get("delta") or "")
-                if delta:
-                    yield text_to_sse_chunk(
-                        delta_content=delta,
-                        model=stream_base["model"],
-                        response_id=response_id,
-                        created=stream_base["created"],
-                    )
-                if snapshot:
-                    emitted_snapshot = snapshot
+            if item is not None:
+                # The locked decision is the publication linearization point;
+                # a reaper may run after it, but cannot retroactively cancel a
+                # chunk that was already admitted for emission.
+                if pending_snapshot:
+                    emitted_snapshot = pending_snapshot
+                if pending_chunk:
+                    yield pending_chunk
+                continue
 
             if status == JobState.COMPLETED.value:
                 result_text = normalize_stream_snapshot(result.get("assistant") or "")
@@ -2271,6 +2699,9 @@ def reap_expired_browser_jobs():
     now = time.time()
     with BROWSER_LOCK:
         for job in BROWSER_JOBS.values():
+            if request_deadline_expired(job, now):
+                _fail_browser_job_due_to_request_deadline_locked(job, now)
+                continue
             if job.get("status") == JobState.QUEUED.value:
                 queued_at = float(job.get("queued_at") or 0)
                 if queued_at and now - queued_at >= BROWSER_QUEUE_TIMEOUT:
@@ -2293,7 +2724,7 @@ def reap_expired_browser_jobs():
             if job.get("status") != "claimed":
                 continue
             if not job.get("lease_expires_at"):
-                job["lease_expires_at"] = now + 300.0
+                job["lease_expires_at"] = browser_job_lease_deadline(job, now)
                 job["updated_at"] = datetime.now().isoformat()
                 continue
             if job["lease_expires_at"] > now:
@@ -2333,6 +2764,61 @@ def reap_expired_browser_jobs():
                 BROWSER_QUEUE.append(job.get("id"))
 
         _persist_browser_state_locked()
+
+
+def reap_browser_request_deadlines():
+    """Fail only jobs whose caller-owned request deadline has elapsed."""
+    now = time.time()
+    changed = False
+    with BROWSER_LOCK:
+        for job in BROWSER_JOBS.values():
+            if request_deadline_expired(job, now):
+                changed = _fail_browser_job_due_to_request_deadline_locked(job, now) or changed
+        if changed:
+            _persist_browser_state_locked()
+    return changed
+
+
+def start_browser_job_reaper():
+    """Start the process-local deadline catch-up loop exactly once."""
+    global _BROWSER_REAPER_STOP, _BROWSER_REAPER_THREAD
+    with _BROWSER_REAPER_LOCK:
+        if _BROWSER_REAPER_THREAD and _BROWSER_REAPER_THREAD.is_alive():
+            return _BROWSER_REAPER_THREAD
+        stop = threading.Event()
+        _BROWSER_REAPER_STOP = stop
+
+        def run():
+            while not stop.wait(max(0.01, float(_BROWSER_REAPER_INTERVAL))):
+                try:
+                    reap_browser_request_deadlines()
+                except Exception as error:
+                    trace_api_event("browser_job_reaper_failed", {
+                        "error": error.__class__.__name__,
+                    })
+
+        thread = threading.Thread(
+            target=run,
+            name="phantom-relay-browser-job-reaper",
+            daemon=True,
+        )
+        _BROWSER_REAPER_THREAD = thread
+        thread.start()
+        return thread
+
+
+def stop_browser_job_reaper():
+    """Stop the process-local deadline loop, primarily for isolated tests."""
+    global _BROWSER_REAPER_STOP, _BROWSER_REAPER_THREAD
+    with _BROWSER_REAPER_LOCK:
+        stop = _BROWSER_REAPER_STOP
+        thread = _BROWSER_REAPER_THREAD
+        _BROWSER_REAPER_STOP = None
+        _BROWSER_REAPER_THREAD = None
+    if stop:
+        stop.set()
+    if thread and thread is not threading.current_thread():
+        thread.join(timeout=1)
 
 def _fresh_contract_client_for_domain(domain):
     """Return whether a current registration owns the requested domain.
@@ -2381,6 +2867,9 @@ def claim_browser_job(domain=None, tab_id=None, conversation_id=None, client_id=
             if not job or job["status"] != "queued":
                 if jid in BROWSER_QUEUE: BROWSER_QUEUE.remove(jid)
                 continue
+            if request_deadline_expired(job):
+                _fail_browser_job_due_to_request_deadline_locked(job)
+                continue
             if job.get("domain") and domain and job["domain"] != domain: continue
             if job.get("domain") and not domain: continue
             expected_conversation = str(job.get("conversation_id") or "")
@@ -2408,7 +2897,7 @@ def claim_browser_job(domain=None, tab_id=None, conversation_id=None, client_id=
             job["state_reason"] = "claimed"
             job["claimed_at"] = time.time()
             job["last_worker_seen"] = time.time()
-            job["lease_expires_at"] = time.time() + 300.0
+            job["lease_expires_at"] = browser_job_lease_deadline(job, time.time())
             job["claim_token"] = uuid.uuid4().hex
             job["reservation_tab_id"] = tab_id or job.get("reservation_tab_id")
             job["tab_id"] = tab_id or job.get("tab_id")
@@ -2622,89 +3111,126 @@ def _profile_now():
     return datetime.utcnow().isoformat(timespec="milliseconds") + "Z"
 
 
-@app.route('/browser/profiles', methods=['POST'])
+@app.route('/browser/profiles', methods=['POST', 'DELETE'])
 def browser_profiles_upsert():
-    global _registry_profile_registry
+    global _registry_profile_registry, selector_templates
+    if request.method == 'DELETE':
+        domain = str(request.args.get("domain") or "").strip().lower()
+        if not domain:
+            return jsonify(openai_error(
+                "profile reset requires an exact domain",
+                "invalid_request_error",
+                code="profile_domain_missing",
+            )), 400
+        with PROFILE_REGISTRY_LOCK:
+            profiles = deepcopy(_registry_profile_registry.get("profiles", {}))
+            deleted_profile_ids = sorted(
+                profile_id
+                for profile_id, profile in profiles.items()
+                if _profile_domain(profile) == domain
+            )
+            for profile_id in deleted_profile_ids:
+                profiles.pop(profile_id, None)
+            _registry_profile_registry = normalize_profile_registry({
+                "version": _registry_profile_registry.get("version", 1),
+                "profiles": profiles,
+            })
+            selector_templates.pop(domain, None)
+            if REGISTRY_DIR:
+                _write_json_atomic(PROFILE_REGISTRY_FILE, _registry_profile_registry)
+                reload_model_config_globals()
+            else:
+                save_selector_templates(selector_templates)
+        return jsonify({
+            "ok": True,
+            "domain": domain,
+            "deleted_profile_ids": deleted_profile_ids,
+        })
+
     body = request.get_json(force=True) or {}
     incoming_profile = body.get("profile") if isinstance(body, dict) else None
     profile_id = str((incoming_profile or {}).get("profileId") or "").strip()
-    existing = (_registry_profile_registry.get("profiles", {}) or {}).get(profile_id) if profile_id else None
-    expected_domain = _profile_domain(existing) if isinstance(existing, dict) else None
-    try:
-        validated = validate_profile_envelope(body, expected_domain=expected_domain or None)
-    except RegistryContractError as exc:
-        status = 422 if exc.code == "profile_domain_mismatch" else 400
-        return jsonify(openai_error(str(exc), "invalid_request_error", code=exc.code)), status
+    with PROFILE_REGISTRY_LOCK:
+        existing = (_registry_profile_registry.get("profiles", {}) or {}).get(profile_id) if profile_id else None
+        expected_domain = _profile_domain(existing) if isinstance(existing, dict) else None
+        try:
+            validated = validate_profile_envelope(body, expected_domain=expected_domain or None)
+        except RegistryContractError as exc:
+            status = 422 if exc.code == "profile_domain_mismatch" else 400
+            return jsonify(openai_error(str(exc), "invalid_request_error", code=exc.code)), status
 
-    profiles = deepcopy(_registry_profile_registry.get("profiles", {}))
-    current = profiles.get(validated["profile_id"])
-    current_lifecycle = current.get("lifecycle", {}) if isinstance(current, dict) else {}
-    current_revision = int(current_lifecycle.get("revision") or current.get("revision", 0) if isinstance(current, dict) else 0)
-    current_checksum = str(current_lifecycle.get("checksum") or current.get("checksum") or "") if isinstance(current, dict) else ""
-    if current:
-        if validated["revision"] == current_revision and validated["checksum"] != current_checksum:
-            return jsonify(openai_error("same revision has a different checksum", "conflict_error", code="profile_conflict")), 409
-        if validated["revision"] < current_revision:
-            return jsonify(openai_error("profile revision is older than the persisted revision", "conflict_error", code="profile_revision_conflict")), 409
-        if validated["revision"] == current_revision:
-            bindings_updated = _resolve_pending_domain_bindings(current) if REGISTRY_DIR else 0
-            if bindings_updated:
-                reload_model_config_globals()
-            return jsonify({
-                "ok": True,
-                "profile_id": validated["profile_id"],
-                "revision": current_revision,
-                "checksum": current_checksum,
-                "state": "synced",
-                "bindings_updated": bindings_updated,
-            })
+        profiles = deepcopy(_registry_profile_registry.get("profiles", {}))
+        current = profiles.get(validated["profile_id"])
+        current_lifecycle = current.get("lifecycle", {}) if isinstance(current, dict) else {}
+        current_revision = int(current_lifecycle.get("revision") or current.get("revision", 0) if isinstance(current, dict) else 0)
+        current_checksum = str(current_lifecycle.get("checksum") or current.get("checksum") or "") if isinstance(current, dict) else ""
+        if current:
+            if validated["revision"] == current_revision and validated["checksum"] != current_checksum:
+                return jsonify(openai_error("same revision has a different checksum", "conflict_error", code="profile_conflict")), 409
+            if validated["revision"] < current_revision:
+                return jsonify(openai_error("profile revision is older than the persisted revision", "conflict_error", code="profile_revision_conflict")), 409
+            if validated["revision"] == current_revision:
+                bindings_updated = _resolve_pending_domain_bindings(current) if REGISTRY_DIR else 0
+                if bindings_updated:
+                    reload_model_config_globals()
+                return jsonify({
+                    "ok": True,
+                    "profile_id": validated["profile_id"],
+                    "revision": current_revision,
+                    "checksum": current_checksum,
+                    "state": "synced",
+                    "bindings_updated": bindings_updated,
+                })
 
-    now = _profile_now()
-    profile = deepcopy(validated["profile"])
-    old_created = current_lifecycle.get("createdAt") if isinstance(current_lifecycle, dict) else None
-    profile["lifecycle"] = {
-        "schemaVersion": 2,
-        "revision": validated["revision"],
-        "checksum": validated["checksum"],
-        "createdAt": old_created or now,
-        "updatedAt": now,
-        "lastVerifiedAt": None,
-        "source": "user-recorded",
-        "state": "synced",
-    }
-    profile["health"] = None
-    profiles[validated["profile_id"]] = profile
-    _registry_profile_registry = normalize_profile_registry({
-        "version": _registry_profile_registry.get("version", 1),
-        "profiles": profiles,
-    })
-    if REGISTRY_DIR:
-        _write_json_atomic(PROFILE_REGISTRY_FILE, _registry_profile_registry)
-        bindings_updated = _resolve_pending_domain_bindings(profile)
-        reload_model_config_globals()
-    else:
-        bindings_updated = 0
-        domain = _profile_domain(profile)
-        if domain:
-            selector_templates[domain] = _authoritative_selector_template(
-                domain,
-                selector_templates.get(domain, {}),
-            )
-            save_selector_templates(selector_templates)
-    return jsonify({
-        "ok": True,
-        "profile_id": validated["profile_id"],
-        "revision": validated["revision"],
-        "checksum": validated["checksum"],
-        "state": "synced",
-        "bindings_updated": bindings_updated,
-    })
+        now = _profile_now()
+        profile = deepcopy(validated["profile"])
+        old_created = current_lifecycle.get("createdAt") if isinstance(current_lifecycle, dict) else None
+        profile["lifecycle"] = {
+            "schemaVersion": 2,
+            "revision": validated["revision"],
+            "checksum": validated["checksum"],
+            "createdAt": old_created or now,
+            "updatedAt": now,
+            "lastVerifiedAt": None,
+            "source": "user-recorded",
+            "state": "synced",
+        }
+        profile["health"] = None
+        profiles[validated["profile_id"]] = profile
+        _registry_profile_registry = normalize_profile_registry({
+            "version": _registry_profile_registry.get("version", 1),
+            "profiles": profiles,
+        })
+        if REGISTRY_DIR:
+            _write_json_atomic(PROFILE_REGISTRY_FILE, _registry_profile_registry)
+            bindings_updated = _resolve_pending_domain_bindings(profile)
+            reload_model_config_globals()
+        else:
+            bindings_updated = 0
+            domain = _profile_domain(profile)
+            if domain:
+                selector_templates[domain] = _authoritative_selector_template(
+                    domain,
+                    selector_templates.get(domain, {}),
+                )
+                save_selector_templates(selector_templates)
+        return jsonify({
+            "ok": True,
+            "profile_id": validated["profile_id"],
+            "revision": validated["revision"],
+            "checksum": validated["checksum"],
+            "state": "synced",
+            "bindings_updated": bindings_updated,
+        })
 
 
 @app.route('/browser/profiles/<profile_id>', methods=['GET'])
 def browser_profile_get(profile_id):
     profile_key = str(profile_id or "").strip()
-    profile = (_registry_profile_registry.get("profiles", {}) or {}).get(profile_key)
+    with PROFILE_REGISTRY_LOCK:
+        profile = deepcopy(
+            (_registry_profile_registry.get("profiles", {}) or {}).get(profile_key)
+        )
     if not isinstance(profile, dict):
         return jsonify(openai_error("profile was not found", "not_found_error", code="profile_missing")), 404
     payload = deepcopy(profile)
@@ -2726,46 +3252,47 @@ def browser_profile_health():
     global _registry_profile_registry
     body = request.get_json(force=True) or {}
     profile_id = str(body.get("profile_id") or "").strip()
-    profile = (_registry_profile_registry.get("profiles", {}) or {}).get(profile_id)
-    if not isinstance(profile, dict):
-        return jsonify(openai_error("profile was not found", "not_found_error", code="profile_missing")), 404
-    lifecycle = profile.get("lifecycle") if isinstance(profile.get("lifecycle"), dict) else {}
-    revision = int(body.get("revision") or 0)
-    if revision != int(lifecycle.get("revision") or 0):
-        return jsonify(openai_error("health report revision does not match profile", "conflict_error", code="profile_revision_conflict")), 409
-    state = str(body.get("state") or "").strip()
-    if state not in {"verified", "degraded", "invalid"}:
-        return jsonify(openai_error("health state is invalid", "invalid_request_error", code="profile_health_invalid")), 400
-    checks = body.get("checks") if isinstance(body.get("checks"), dict) else {}
-    reason_codes = body.get("reason_codes") if isinstance(body.get("reason_codes"), list) else []
-    if any(not isinstance(key, str) or key not in {"input", "send", "response", "identity", "streaming"} for key in checks):
-        return jsonify(openai_error("health checks contain an unsupported field", "invalid_request_error", code="profile_health_invalid")), 400
-    if any(not isinstance(code, str) or not code.strip() for code in reason_codes):
-        return jsonify(openai_error("reason_codes must contain strings", "invalid_request_error", code="profile_health_invalid")), 400
-    now = _profile_now()
-    updated = deepcopy(profile)
-    updated["health"] = {
-        "profile_id": profile_id,
-        "revision": revision,
-        "state": state,
-        "checks": {key: str(value) for key, value in checks.items()},
-        "reason_codes": list(dict.fromkeys(reason_codes)),
-    }
-    updated["lifecycle"] = {
-        **lifecycle,
-        "updatedAt": now,
-        "state": state,
-        "lastVerifiedAt": now if state == "verified" else lifecycle.get("lastVerifiedAt"),
-    }
-    profiles = deepcopy(_registry_profile_registry.get("profiles", {}))
-    profiles[profile_id] = updated
-    _registry_profile_registry = normalize_profile_registry({
-        "version": _registry_profile_registry.get("version", 1),
-        "profiles": profiles,
-    })
-    if REGISTRY_DIR:
-        _write_json_atomic(PROFILE_REGISTRY_FILE, _registry_profile_registry)
-    return jsonify({"ok": True, "profile_id": profile_id, "revision": revision, "state": state})
+    with PROFILE_REGISTRY_LOCK:
+        profile = (_registry_profile_registry.get("profiles", {}) or {}).get(profile_id)
+        if not isinstance(profile, dict):
+            return jsonify(openai_error("profile was not found", "not_found_error", code="profile_missing")), 404
+        lifecycle = profile.get("lifecycle") if isinstance(profile.get("lifecycle"), dict) else {}
+        revision = int(body.get("revision") or 0)
+        if revision != int(lifecycle.get("revision") or 0):
+            return jsonify(openai_error("health report revision does not match profile", "conflict_error", code="profile_revision_conflict")), 409
+        state = str(body.get("state") or "").strip()
+        if state not in {"verified", "degraded", "invalid"}:
+            return jsonify(openai_error("health state is invalid", "invalid_request_error", code="profile_health_invalid")), 400
+        checks = body.get("checks") if isinstance(body.get("checks"), dict) else {}
+        reason_codes = body.get("reason_codes") if isinstance(body.get("reason_codes"), list) else []
+        if any(not isinstance(key, str) or key not in {"input", "send", "response", "identity", "streaming"} for key in checks):
+            return jsonify(openai_error("health checks contain an unsupported field", "invalid_request_error", code="profile_health_invalid")), 400
+        if any(not isinstance(code, str) or not code.strip() for code in reason_codes):
+            return jsonify(openai_error("reason_codes must contain strings", "invalid_request_error", code="profile_health_invalid")), 400
+        now = _profile_now()
+        updated = deepcopy(profile)
+        updated["health"] = {
+            "profile_id": profile_id,
+            "revision": revision,
+            "state": state,
+            "checks": {key: str(value) for key, value in checks.items()},
+            "reason_codes": list(dict.fromkeys(reason_codes)),
+        }
+        updated["lifecycle"] = {
+            **lifecycle,
+            "updatedAt": now,
+            "state": state,
+            "lastVerifiedAt": now if state == "verified" else lifecycle.get("lastVerifiedAt"),
+        }
+        profiles = deepcopy(_registry_profile_registry.get("profiles", {}))
+        profiles[profile_id] = updated
+        _registry_profile_registry = normalize_profile_registry({
+            "version": _registry_profile_registry.get("version", 1),
+            "profiles": profiles,
+        })
+        if REGISTRY_DIR:
+            _write_json_atomic(PROFILE_REGISTRY_FILE, _registry_profile_registry)
+        return jsonify({"ok": True, "profile_id": profile_id, "revision": revision, "state": state})
 
 
 @app.route('/browser/selectors', methods=['GET', 'POST'])
@@ -2927,6 +3454,26 @@ def browser_register():
                 # copy another registered client's conversation ownership into
                 # this registration when two clients share numeric tab ids.
                 active_job = None
+            if active_job and fail_claimed_tab_domain_change(
+                tab["tab_id"],
+                tab["domain"],
+                registration.client_id,
+                source="browser-register",
+            ):
+                active_job = None
+                tab = dict(tab)
+                tab.update(
+                    ready=False,
+                    input_ready=False,
+                    send_ready=False,
+                    state=BrowserClientState.STALE.value,
+                    capabilities={
+                        **dict(tab.get("capabilities") or {}),
+                        "can_execute": False,
+                        "can_observe": False,
+                        "can_snapshot": False,
+                    },
+                )
             previous_is_fresh_content_ready = bool(
                 previous
                 and str(previous.get("client_id") or "") == registration.client_id
@@ -2935,6 +3482,7 @@ def browser_register():
                 and previous.get("ready") is True
                 and previous.get("input_ready") is True
                 and previous.get("send_ready") is True
+                and str(previous.get("content_script_version") or "").strip()
                 and now - float(previous.get("last_seen", 0) or 0) < CLIENT_TTL
             )
             if previous_is_fresh_content_ready:
@@ -3138,15 +3686,23 @@ def browser_submit():
     except ValueError as exc:
         error_code = "conversation_id_invalid" if str(exc) == "conversation_id_invalid" else str(exc)
         return jsonify(openai_error(str(exc), "invalid_request_error", code=error_code)), 400
+    request_meta = body.get("request_meta")
+    _, timeout_error = validated_browser_capture_timeout_ms(request_meta)
+    if timeout_error:
+        return jsonify(openai_error(
+            "request_meta.capture_timeout_ms must be a finite number between 1 and 900000",
+            "invalid_request_error",
+            code=timeout_error,
+        )), 400
     job = new_browser_job(msg, domain, model=model, new_tab=body.get("new_tab",False),
                           target_url=target_url,
                           conversation_id=conversation_id or None,
-                          messages=body.get("messages"), request_meta=body.get("request_meta"),
+                          messages=body.get("messages"), request_meta=request_meta,
                           tab_id=body.get("tab_id"))
     with BROWSER_LOCK:
         job["close_previous"] = bool(body.get("close_previous",False))
         _persist_browser_state_locked()
-    request_browser_wake(domain=domain, target_url=target_url)
+    activate_browser_for_job(job)
     return jsonify(job), 202
 
 
@@ -3228,7 +3784,19 @@ def browser_poll():
 @app.route('/browser/delta', methods=['POST'])
 def browser_delta():
     body = request.get_json(force=True)
-    return jsonify({"ok":append_browser_delta(body)})
+    accepted = append_browser_delta(body)
+    if not accepted:
+        with BROWSER_LOCK:
+            job = BROWSER_JOBS.get(str(body.get("job_id") or ""))
+            expired = bool(job and job.get("state_reason") == "browser_timeout"
+                           and request_deadline_expired(job))
+        if expired:
+            return jsonify(openai_error(
+                "request_deadline_expired",
+                "invalid_request_error",
+                code="request_deadline_expired",
+            )), 409
+    return jsonify({"ok": accepted})
 
 
 @app.route('/browser/result', methods=['POST'])
@@ -3286,6 +3854,21 @@ def browser_result():
             "job_claim_len": len(str(BROWSER_JOBS.get(str(jid), {}).get("claim_token") or ""))})
         code = 409 if actor_error.endswith("mismatch") or actor_error == "claim_token_invalid" else 404
         return jsonify(openai_error(actor_error, "invalid_request_error")), code
+    with BROWSER_LOCK:
+        current_job = BROWSER_JOBS.get(str(jid))
+        now = time.time()
+        if _expire_browser_job_if_needed_locked(current_job, now):
+            trace_api_event("browser_result_rejected", {
+                "job_id": jid,
+                "error": "request_deadline_expired",
+                "tab_id": current_job.get("tab_id") if current_job else None,
+                "domain": current_job.get("domain", "") if current_job else "",
+            })
+            return jsonify(openai_error(
+                "request_deadline_expired",
+                "invalid_request_error",
+                code="request_deadline_expired",
+            )), 409
     result = {"user": actor_job.get("message", ""), "assistant": body.get("assistant", ""),
               "key": body.get("key"), "tool_call": body.get("tool_call"),
               "conversation_id": actor_job.get("conversation_id"), "tab_id": actor_job.get("tab_id")}
@@ -3296,7 +3879,33 @@ def browser_result():
         return jsonify(openai_error(tool_error, "invalid_request_error")), 400
     if not ok and result.get("tool_call"):
         result["tool_call"] = None
-    job = finish_browser_job(jid, "completed" if ok else "failed", result=result if ok else None, error=body.get("error"))
+    target_status = "completed" if ok else "failed"
+    with BROWSER_LOCK:
+        current_job = BROWSER_JOBS.get(str(jid))
+        now = time.time()
+        if _expire_browser_job_if_needed_locked(current_job, now):
+            trace_api_event("browser_result_rejected", {
+                "job_id": jid,
+                "error": "request_deadline_expired",
+                "tab_id": current_job.get("tab_id") if current_job else None,
+                "domain": current_job.get("domain", "") if current_job else "",
+            })
+            return jsonify(openai_error(
+                "request_deadline_expired",
+                "invalid_request_error",
+                code="request_deadline_expired",
+            )), 409
+        if terminal_browser_result_replay(current_job, body):
+            trace_api_event("browser_result_replay_accepted", {"job_id": jid})
+            return jsonify({"ok": True, "idempotent": True})
+        if not current_job or current_job.get("status") != JobState.CLAIMED.value:
+            return jsonify(openai_error("job_not_claimed", "invalid_request_error")), 409
+        job = finish_browser_job(
+            jid,
+            target_status,
+            result=result if ok else None,
+            error=body.get("error"),
+        )
     if not job:
         return jsonify(openai_error("job not found", "not_found_error")), 404
     if ok:
@@ -3358,8 +3967,12 @@ def renew_browser_claim(body):
             })
             return False
         now = time.time()
+        if request_deadline_expired(job, now):
+            _fail_browser_job_due_to_request_deadline_locked(job, now)
+            _persist_browser_state_locked()
+            return False
         job["last_worker_seen"] = now
-        job["lease_expires_at"] = now + 300.0
+        job["lease_expires_at"] = browser_job_lease_deadline(job, now)
         job["updated_at"] = datetime.now().isoformat()
         _persist_browser_state_locked()
         return True
@@ -3409,6 +4022,12 @@ def browser_heartbeat():
                     "domain": body.get("domain", ""),
                 })
                 return jsonify({"ok": True, "ignored": "stale_runtime_session"})
+            claim_domain_changed = fail_claimed_tab_domain_change(
+                body.get("tab_id"),
+                body.get("domain"),
+                client_id,
+                source="negative-heartbeat",
+            )
             key = str(body.get("tab_id") or body.get("domain") or "unknown")
             previous = BROWSER_CLIENTS.get(key) or {}
             # A negative heartbeat is an explicit revocation of execution
@@ -3434,7 +4053,10 @@ def browser_heartbeat():
                 capabilities=capabilities,
             )
             BROWSER_READY.pop(key, None)
-        return jsonify({"ok":True})
+        response = {"ok": True}
+        if claim_domain_changed:
+            response["claim_terminated"] = "execution_domain_changed"
+        return jsonify(response)
 
 
 @app.route('/browser/ready', methods=['POST'])
@@ -3623,7 +4245,7 @@ def chat_completions():
     # reused; otherwise issue one coalesced OS wake/open for the recorded target
     # so the user's browser can register the page and the extension can claim it.
     # The extension worker itself never creates or navigates provider tabs.
-    request_browser_wake(domain=route.domain, target_url=route.url)
+    activate_browser_for_job(job)
 
     # Start the caller-facing stream immediately. The extension already relays
     # provider-neutral DOM snapshots through /browser/delta while the model is

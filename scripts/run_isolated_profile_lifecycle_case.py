@@ -21,10 +21,13 @@ from typing import Any
 from scripts.run_isolated_dom_case import (
     CHROME,
     CHROMEDRIVER,
+    DOM_CAPTURE_TIMEOUT_SECONDS,
+    DOM_FIXTURE_RUNTIME_SCRIPTS,
     DOM_NAVIGATION_TIMEOUT_SECONDS,
     DOM_CASES,
     IsolatedDomCaseError,
     _FixtureServer,
+    _run_capture_with_cdp_bridge,
     _terminate_profile_processes,
     build_driver_options,
     _inject,
@@ -92,6 +95,10 @@ def _runtime_stub(profile: dict[str, Any]) -> str:
   window.chrome = chromeObject;
   window.__phantomRelayDomTest = {{
     listeners,
+    capturePromise: null,
+    captureResult: null,
+    drainKeyboardRequests() {{ return []; }},
+    resolveKeyboardRequest() {{ return false; }},
     dispatch(message) {{
       return new Promise(resolve => {{
         let settled = false;
@@ -99,6 +106,25 @@ def _runtime_stub(profile: dict[str, Any]) -> str:
         for (const listener of listeners) {{
           const returned = listener(message, {{}}, finish);
           if (returned !== true && returned !== undefined) finish(returned);
+        }}
+        if (message?.action === 'auto_capture') {{
+          finish({{ started: true }});
+          const observeCapture = () => {{
+            const promise = window.__phantomRelayDomTest.capturePromise;
+            if (promise && typeof promise.then === 'function') {{
+              promise.then(value => {{
+                window.__phantomRelayDomTest.captureResult = value;
+              }}, error => {{
+                window.__phantomRelayDomTest.captureResult = {{
+                  success: false,
+                  error: error?.message || String(error),
+                }};
+              }});
+              return;
+            }}
+            setTimeout(observeCapture, 10);
+          }};
+          observeCapture();
         }}
         setTimeout(() => finish({{ error: 'dom_test_message_timeout' }}), 30000);
       }});
@@ -143,7 +169,7 @@ def _dispatch(driver, message: dict[str, Any]) -> dict[str, Any]:
 
 def _inject_runtime(driver, profile: dict[str, Any]) -> None:
     _inject(driver, _runtime_stub(profile))
-    for name in ("profile_contract.js", "profile_lifecycle.js", "profile_health.js", "capture_lock.js", "universal_bridge.js", "content.js"):
+    for name in DOM_FIXTURE_RUNTIME_SCRIPTS:
         _inject(driver, (ROOT / "extension" / name).read_text(encoding="utf-8"))
     deadline = time.time() + 5
     while time.time() < deadline:
@@ -166,14 +192,7 @@ def _wait_health(driver, expected_state: str | None = None) -> dict[str, Any]:
 
 
 def _capture(driver, message: str) -> dict[str, Any]:
-    return _dispatch(driver, {
-        "action": "auto_capture",
-        "message": message,
-        "job_id": "",
-        "conversation_id": "",
-        "tab_id": None,
-        "claim_token": "",
-    })
+    return _run_capture_with_cdp_bridge(driver, message, DOM_CAPTURE_TIMEOUT_SECONDS)
 
 
 def run_profile_lifecycle_case(case_name: str = "interactive") -> dict[str, Any]:

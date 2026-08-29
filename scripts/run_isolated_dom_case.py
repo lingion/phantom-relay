@@ -22,15 +22,31 @@ from pathlib import Path
 from threading import Thread
 from typing import Any
 
+from scripts.chromedriver_resolution import parse_browser_version, resolve_chromedriver
+
 ROOT = Path(__file__).resolve().parents[1]
 CHROME = Path(os.environ.get(
     "PHANTOM_RELAY_CHROME_BINARY",
     "/Applications/Google Chrome Canary.app/Contents/MacOS/Google Chrome Canary",
 ))
-CHROMEDRIVER = Path(os.environ.get(
-    "PHANTOM_RELAY_CHROMEDRIVER",
-    str(ROOT / ".tools/chromedriver-152.0.7962.0/chromedriver"),
-))
+
+
+def _resolve_dom_chromedriver() -> Path:
+    """Resolve the fixture driver against the selected Chromium binary."""
+    try:
+        output = subprocess.run(
+            [str(CHROME), "--version"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout
+        version = parse_browser_version(output)
+        return resolve_chromedriver(version, ROOT)
+    except (OSError, subprocess.SubprocessError, RuntimeError):
+        return Path("/__phantom_relay_chromedriver_missing__")
+
+
+CHROMEDRIVER = _resolve_dom_chromedriver()
 
 
 class IsolatedDomCaseError(RuntimeError):
@@ -38,6 +54,19 @@ class IsolatedDomCaseError(RuntimeError):
 
 
 DOM_NAVIGATION_TIMEOUT_SECONDS = 15
+DOM_CAPTURE_TIMEOUT_SECONDS = 135
+DOM_FIXTURE_RUNTIME_SCRIPTS = (
+    "backend_config.js",
+    "universal_bridge.js",
+    "profile_contract.js",
+    "profile_lifecycle.js",
+    "profile_health.js",
+    "selector_recovery.js",
+    "capture_lock.js",
+    "send_observation.js",
+    "response_observation.js",
+    "content.js",
+)
 
 
 def build_driver_options(profile_dir: Path):
@@ -170,6 +199,10 @@ DOM_CASES: dict[str, dict[str, Any]] = {
         "response_selector": ".assistant-answer",
         "container_selector": ".assistant-shell",
         "identity_attributes": ["id"],
+        "identity_verification": {
+            "method": "dom-unique-at-recording",
+            "identityKind": "unique-per-message",
+        },
     },
     "descendant_identity": {
         "fixture": "descendant-identity-chat.html",
@@ -192,6 +225,12 @@ def build_fixture_profile(origin: str, case_name: str = "interactive") -> dict[s
     except KeyError as exc:
         raise IsolatedDomCaseError(f"unknown_dom_case:{case_name}") from exc
     parsed_origin = origin.rstrip("/")
+    identity_verification = {
+        "status": "verified",
+        "method": "fixture-dom-unique",
+        "attributes": list(case["identity_attributes"]),
+        **(case.get("identity_verification") or {}),
+    }
     return {
         "profileId": case["profile_id"],
         "origin": parsed_origin,
@@ -204,9 +243,7 @@ def build_fixture_profile(origin: str, case_name: str = "interactive") -> dict[s
             **({"elementTag": case["element_tag"]} if case.get("element_tag") else {}),
             "identity": {"attributes": list(case["identity_attributes"])},
             "identityVerification": {
-                "status": "verified",
-                "method": "fixture-dom-unique",
-                "attributes": list(case["identity_attributes"]),
+                **identity_verification,
             },
             "role": {"user": ["user"], "assistant": ["assistant"]},
             "streamingIndicators": [
@@ -232,6 +269,9 @@ def _chrome_runtime_stub(profile: dict[str, Any]) -> str:
 (() => {{
   const recordedSelectors = {encoded};
   const listeners = [];
+  const keyboardRequests = [];
+  const keyboardWaiters = new Map();
+  let nextKeyboardRequestId = 0;
   const storage = {{
     phantomSelectors: {{'127.0.0.1': recordedSelectors}},
     phantomBrowserClientId: 'isolated-dom-client'
@@ -240,6 +280,13 @@ def _chrome_runtime_stub(profile: dict[str, Any]) -> str:
     lastError: null,
     onMessage: {{ addListener(fn) {{ listeners.push(fn); }} }},
       sendMessage(message, callback) {{
+        if (message?.type === 'dispatch_recorded_keyboard') {{
+          const requestId = String(++nextKeyboardRequestId);
+          keyboardRequests.push({{ requestId, message }});
+          return new Promise(resolve => {{
+            keyboardWaiters.set(requestId, {{ resolve, callback }});
+          }});
+        }}
         let value = {{ ok: true }};
         if (message?.type === 'get_server_selectors') value = {{ selectors: recordedSelectors }};
         if (message?.type === 'page_ready') value = {{ ok: true, ready: {{ ready: true, input_ready: true, send_ready: true }} }};
@@ -265,7 +312,40 @@ def _chrome_runtime_stub(profile: dict[str, Any]) -> str:
   window.chrome = chromeObject;
   window.__phantomRelayDomTest = {{
     listeners,
+    keyboardRequests,
     trace: [],
+    capturePromise: null,
+    captureResult: null,
+    drainKeyboardRequests() {{
+      return keyboardRequests.splice(0).map(request => ({{
+        requestId: request.requestId,
+        message: request.message,
+      }}));
+    }},
+    resolveKeyboardRequest(requestId, value) {{
+      const key = String(requestId || '');
+      const waiter = keyboardWaiters.get(key);
+      if (!waiter) return false;
+      keyboardWaiters.delete(key);
+      if (typeof waiter.callback === 'function') setTimeout(() => waiter.callback(value), 0);
+      waiter.resolve(value);
+      return true;
+    }},
+    startCapture(message) {{
+      this.dispatch(message);
+      const observe = () => {{
+        const promise = this.capturePromise;
+        if (promise && typeof promise.then === 'function') {{
+          promise.then(value => {{ this.captureResult = value; }}, error => {{
+            this.captureResult = {{ success: false, error: error?.message || String(error) }};
+          }});
+          return;
+        }}
+        setTimeout(observe, 10);
+      }};
+      observe();
+      return {{ started: true }};
+    }},
     dispatch(message) {{
       return new Promise(resolve => {{
         let settled = false;
@@ -273,6 +353,27 @@ def _chrome_runtime_stub(profile: dict[str, Any]) -> str:
         for (const listener of listeners) {{
           const returned = listener(message, {{}}, finish);
           if (returned !== true && returned !== undefined) finish(returned);
+        }}
+        // auto_capture is intentionally a one-way runtime action. Its result
+        // is exposed through capturePromise below instead of sendResponse.
+        if (message?.action === 'auto_capture') {{
+          finish({{ started: true }});
+          const observeCapture = () => {{
+            const promise = window.__phantomRelayDomTest.capturePromise;
+            if (promise && typeof promise.then === 'function') {{
+              promise.then(value => {{
+                window.__phantomRelayDomTest.captureResult = value;
+              }}, error => {{
+                window.__phantomRelayDomTest.captureResult = {{
+                  success: false,
+                  error: error?.message || String(error),
+                }};
+              }});
+              return;
+            }}
+            setTimeout(observeCapture, 10);
+          }};
+          observeCapture();
         }}
         setTimeout(() => finish({{ error: 'dom_test_message_timeout' }}), 30000);
       }});
@@ -324,6 +425,138 @@ def _inject(driver, source: str) -> None:
     driver.execute_script("(0, eval)(arguments[0]);", source)
 
 
+_CDP_KEY_MODIFIERS = {
+    "Alt": 1,
+    "Control": 2,
+    "Meta": 4,
+    "Shift": 8,
+}
+
+
+def _cdp_key_modifiers(modifiers: Any) -> int:
+    mask = 0
+    for item in modifiers or []:
+        mask |= _CDP_KEY_MODIFIERS.get(str(item), 0)
+    return mask
+
+
+def _cdp_virtual_key_code(key: str) -> int:
+    values = {
+        "Enter": 13,
+        "Tab": 9,
+        "Escape": 27,
+        "Backspace": 8,
+        "Delete": 46,
+    }
+    normalized = str(key or "")
+    if normalized in values:
+        return values[normalized]
+    if len(normalized) == 1 and normalized.isascii() and normalized.isalnum():
+        return ord(normalized.upper())
+    return 0
+
+
+def _cdp_key_text(key: str, modifiers: int) -> str:
+    if modifiers & ~_CDP_KEY_MODIFIERS["Shift"]:
+        return ""
+    normalized = str(key or "")
+    if normalized == "Enter":
+        return "\r"
+    if len(normalized) == 1 and normalized.isascii() and normalized.isalnum():
+        return normalized
+    return ""
+
+
+def _dispatch_fixture_keyboard(driver, request: dict[str, Any]) -> dict[str, Any]:
+    message = request.get("message") or {}
+    key = str(message.get("key") or "Enter")
+    code = str(message.get("code") or key)
+    modifiers = _cdp_key_modifiers(message.get("modifiers"))
+    virtual_key_code = _cdp_virtual_key_code(key)
+    key_text = _cdp_key_text(key, modifiers)
+    base = {
+        "key": key,
+        "code": code,
+        "modifiers": modifiers,
+        "windowsVirtualKeyCode": virtual_key_code,
+        "nativeVirtualKeyCode": virtual_key_code,
+    }
+    driver.execute_cdp_cmd(
+        "Input.dispatchKeyEvent",
+        {
+            **base,
+            "type": "keyDown" if key_text else "rawKeyDown",
+            "text": key_text,
+            "unmodifiedText": key_text,
+        },
+    )
+    driver.execute_cdp_cmd(
+        "Input.dispatchKeyEvent",
+        {**base, "type": "keyUp"},
+    )
+    return {
+        "ok": True,
+        "status": "dispatched",
+        "method": "cdp-input",
+        "trusted": True,
+        "key": key,
+        "code": code,
+        "modifiers": modifiers,
+        "textSemantic": bool(key_text),
+    }
+
+
+def _run_capture_with_cdp_bridge(driver, message: str, timeout_seconds: float) -> dict[str, Any]:
+    driver.execute_script(
+        """
+        window.__phantomRelayDomTest.dispatch({
+          action: 'auto_capture',
+          message: arguments[0],
+          job_id: '',
+          conversation_id: '',
+          tab_id: null,
+          claim_token: '',
+          capture_timeout_ms: 120000
+        });
+        """,
+        message,
+    )
+    deadline = time.monotonic() + timeout_seconds
+    handled: set[str] = set()
+    while time.monotonic() < deadline:
+        requests = driver.execute_script(
+            "return window.__phantomRelayDomTest.drainKeyboardRequests();"
+        ) or []
+        for request in requests:
+            request_id = str(request.get("requestId") or "")
+            if not request_id or request_id in handled:
+                continue
+            handled.add(request_id)
+            try:
+                result = _dispatch_fixture_keyboard(driver, request)
+            except Exception as error:
+                result = {
+                    "ok": False,
+                    "status": "unknown",
+                    "method": "cdp-input",
+                    "trusted": False,
+                    "error": "fixture_keyboard_dispatch_failed",
+                    "detail": f"{type(error).__name__}:{error}",
+                }
+            driver.execute_script(
+                "return window.__phantomRelayDomTest.resolveKeyboardRequest(arguments[0], arguments[1]);",
+                request_id,
+                result,
+            )
+        result = driver.execute_script(
+            "return window.__phantomRelayDomTest.captureResult;"
+        )
+        if isinstance(result, dict):
+            return result
+        time.sleep(0.05)
+    raise IsolatedDomCaseError("dom_capture_poll_timeout")
+
+
 def run_case(case_name: str = "interactive") -> dict[str, Any]:
     try:
         case = DOM_CASES[case_name]
@@ -355,15 +588,18 @@ def run_case(case_name: str = "interactive") -> dict[str, Any]:
             service = Service(str(CHROMEDRIVER))
             driver = webdriver.Chrome(service=service, options=options)
             driver.set_page_load_timeout(DOM_NAVIGATION_TIMEOUT_SECONDS)
+            # auto_capture enforces a 120 s lower bound for real model pages;
+            # the WebDriver script channel must outlive that bound so a slow or
+            # stalled fixture returns its structured result and trace.
+            driver.set_script_timeout(DOM_CAPTURE_TIMEOUT_SECONDS)
             driver.get(f"{fixture.origin}/{case['fixture']}")
 
             _inject(driver, _chrome_runtime_stub(profile))
-            _inject(driver, (ROOT / "extension" / "profile_contract.js").read_text(encoding="utf-8"))
-            _inject(driver, (ROOT / "extension" / "profile_lifecycle.js").read_text(encoding="utf-8"))
-            _inject(driver, (ROOT / "extension" / "profile_health.js").read_text(encoding="utf-8"))
-            _inject(driver, (ROOT / "extension" / "capture_lock.js").read_text(encoding="utf-8"))
-            _inject(driver, (ROOT / "extension" / "universal_bridge.js").read_text(encoding="utf-8"))
-            _inject(driver, (ROOT / "extension" / "content.js").read_text(encoding="utf-8"))
+            # content.js captures helper globals at startup. Keep its
+            # provider-neutral response qualifier in the fixture runtime;
+            # omitting it silently activates the legacy fallback branch.
+            for script_name in DOM_FIXTURE_RUNTIME_SCRIPTS:
+                _inject(driver, (ROOT / "extension" / script_name).read_text(encoding="utf-8"))
 
             deadline = time.time() + 5
             while time.time() < deadline:
@@ -401,32 +637,32 @@ def run_case(case_name: str = "interactive") -> dict[str, Any]:
 
             try:
                 started_at = time.monotonic()
-                result = driver.execute_async_script("""
-                  const message = arguments[0];
-                  const done = arguments[arguments.length - 1];
-                  window.__phantomRelayDomTest.dispatch({
-                    action: 'auto_capture',
-                    message,
-                    job_id: '',
-                    conversation_id: '',
-                    tab_id: null,
-                    claim_token: ''
-                  }).then(done);
-                """, case["message"])
+                result = _run_capture_with_cdp_bridge(
+                    driver,
+                    case["message"],
+                    DOM_CAPTURE_TIMEOUT_SECONDS,
+                )
                 if isinstance(result, dict):
                     result = {**result, "elapsed_ms": round((time.monotonic() - started_at) * 1000)}
             except Exception as exc:
                 diagnostics = driver.execute_script("""
                   return {
                     body: document.body.innerText,
-                    inputText: document.querySelector('[contenteditable="true"]')?.textContent || '',
+                      inputText: document.querySelector('[contenteditable="true"]')?.textContent || '',
+                      textareaValue: document.querySelector('textarea')?.value || '',
+                      inputValue: document.querySelector('input[type="text"], input:not([type])')?.value || '',
+                      sendState: (() => {
+                        const el = document.querySelector('#send, [data-role="send"], button');
+                        return el ? { disabled: !!el.disabled, ariaDisabled: el.getAttribute('aria-disabled'), text: el.innerText || el.textContent || '' } : null;
+                      })(),
                     messages: Array.from(document.querySelectorAll('[data-message-id]')).map(el => ({
                       id: el.getAttribute('data-message-id'),
                       role: el.getAttribute('data-role'),
                       text: el.innerText || el.textContent || '',
                       streaming: el.getAttribute('data-streaming'),
                     })),
-                    listenerCount: window.__phantomRelayDomTest?.listeners?.length || 0,
+                      listenerCount: window.__phantomRelayDomTest?.listeners?.length || 0,
+                      trace: window.__phantomRelayDomTest?.trace || [],
                   };
                 """)
                 raise IsolatedDomCaseError(json.dumps({
@@ -449,7 +685,26 @@ def run_case(case_name: str = "interactive") -> dict[str, Any]:
                         "return window.__phantomRelayDomTest?.trace || [];"
                     ),
                 }
-            return {**result, "profile_health": profile_health["profile_health"]}
+            identity_keys = driver.execute_script(
+                """
+                const attributes = arguments[0];
+                const selectors = attributes.map(name => `[${CSS.escape(name)}]`).join(',');
+                if (!selectors) return [];
+                return Array.from(document.querySelectorAll(selectors)).map(element => {
+                  for (const attribute of attributes) {
+                    const value = String(element.getAttribute(attribute) || '').trim();
+                    if (value) return `attribute:${attribute}=${value}`;
+                  }
+                  return '';
+                }).filter(Boolean);
+                """,
+                case["identity_attributes"],
+            )
+            return {
+                **result,
+                "profile_health": profile_health["profile_health"],
+                "identity_keys": identity_keys,
+            }
     finally:
         if driver is not None:
             try:

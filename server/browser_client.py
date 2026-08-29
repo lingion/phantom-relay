@@ -79,9 +79,20 @@ def _normalize_tab(raw: Any, now: float) -> dict[str, Any]:
     except (TypeError, ValueError) as exc:
         raise BrowserClientContractError("tab_last_seen_invalid") from exc
 
+    content_script_version = str(raw.get("content_script_version") or "").strip()[:64]
     ready = bool(raw.get("ready"))
     input_ready = bool(raw.get("input_ready"))
     send_ready = bool(raw.get("send_ready"))
+    # A registration may still describe an open page when the service worker
+    # has not yet revalidated its content runtime. It must not advertise that
+    # page as executable until the page itself identifies its build.
+    if ready or input_ready or send_ready:
+        if not content_script_version:
+            ready = False
+            input_ready = False
+            send_ready = False
+            normalized_capabilities["can_execute"] = False
+            normalized_capabilities["can_observe"] = False
     state = (
         BrowserClientState.READY.value
         if ready and input_ready and send_ready
@@ -94,6 +105,7 @@ def _normalize_tab(raw: Any, now: float) -> dict[str, Any]:
         "ready": ready,
         "input_ready": input_ready,
         "send_ready": send_ready,
+        "content_script_version": content_script_version,
         "conversation_id": str(raw.get("conversation_id") or ""),
         "capabilities": normalized_capabilities,
         "last_seen": last_seen,
@@ -202,6 +214,7 @@ def client_status_payload(
                 "ready": tab["ready"],
                 "input_ready": tab["input_ready"],
                 "send_ready": tab["send_ready"],
+                "content_script_version": tab["content_script_version"],
                 "capabilities": dict(tab["capabilities"]),
                 "last_seen": tab["last_seen"],
             }

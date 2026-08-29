@@ -19,10 +19,17 @@ from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.chrome.service import Service
 from selenium.common.exceptions import InvalidSessionIdException, NoSuchWindowException, WebDriverException
 
+try:
+    from scripts.chromedriver_resolution import parse_browser_version, resolve_chromedriver
+except ModuleNotFoundError:
+    from chromedriver_resolution import parse_browser_version, resolve_chromedriver
+
 ROOT = Path(__file__).resolve().parents[1]
 EXT = Path(os.environ.get("PHANTOM_RELAY_EXTENSION_DIR", str(ROOT / "extension"))).expanduser().resolve()
-BROWSER = "/Applications/Google Chrome Canary.app/Contents/MacOS/Google Chrome Canary"
-DRIVER = ROOT / ".tools/chromedriver-152.0.7962.0/chromedriver"
+BROWSER = os.environ.get(
+    "PHANTOM_RELAY_BROWSER_BINARY",
+    "/Applications/Google Chrome Canary.app/Contents/MacOS/Google Chrome Canary",
+)
 PROFILE = Path(os.environ.get("PHANTOM_RELAY_BROWSER_PROFILE", "/tmp/phantom-relay-canary-profile-v1"))
 API = os.environ.get("PHANTOM_RELAY_API", "http://127.0.0.1:8765")
 CONFIGURED_TARGET_URL = os.environ.get("PHANTOM_RELAY_BROWSER_TARGET_URL", "").strip()
@@ -383,14 +390,14 @@ def build_chrome_args(profile: Path, debug_port: int, initial_url: str = "") -> 
     return args
 
 
-def attach_webdriver(debug_port: int):
+def attach_webdriver(debug_port: int, driver_path: Path):
     """Attach a fresh WebDriver session to the host-owned Chrome instance."""
     options = Options()
     options.debugger_address = f"127.0.0.1:{debug_port}"
     options.enable_bidi = True
     options.enable_webextensions = True
     options.set_capability("unhandledPromptBehavior", "accept")
-    return webdriver.Chrome(service=Service(str(DRIVER)), options=options)
+    return webdriver.Chrome(service=Service(str(driver_path)), options=options)
 
 
 def browser_process_is_reconnectable(chrome, debug_port: int) -> bool:
@@ -436,8 +443,27 @@ def main() -> int:
             "required": "start the API with PHANTOM_RELAY_ACTIVATION_OWNER=bidi for harness navigation",
         }, ensure_ascii=False), flush=True)
         return 3
-    if not EXT.is_dir() or not DRIVER.is_file() or not Path(BROWSER).is_file():
-        print(json.dumps({"ok": False, "stage": "preflight", "extension": str(EXT), "driver": str(DRIVER)}), flush=True)
+    if not EXT.is_dir() or not Path(BROWSER).is_file():
+        print(json.dumps({"ok": False, "stage": "preflight", "extension": str(EXT), "browser": str(BROWSER)}), flush=True)
+        return 2
+    try:
+        browser_version = parse_browser_version(
+            subprocess.run(
+                [BROWSER, "--version"],
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout
+        )
+        driver_path = resolve_chromedriver(browser_version, ROOT)
+    except (OSError, subprocess.SubprocessError, RuntimeError) as exc:
+        print(json.dumps({
+            "ok": False,
+            "stage": "preflight",
+            "browser": str(BROWSER),
+            "error": type(exc).__name__,
+            "message": str(exc),
+        }, ensure_ascii=False), flush=True)
         return 2
 
     signal.signal(signal.SIGTERM, stop)
@@ -487,7 +513,7 @@ def main() -> int:
                 time.sleep(0.2)
         else:
             raise RuntimeError("chrome_debug_port_not_ready")
-        driver = attach_webdriver(debug_port)
+        driver = attach_webdriver(debug_port, driver_path)
         try:
             alert = driver.switch_to.alert
             alert.accept()
@@ -615,7 +641,7 @@ def main() -> int:
                     if browser_process_is_reconnectable(chrome, debug_port):
                         old_driver = driver
                         try:
-                            driver = attach_webdriver(debug_port)
+                            driver = attach_webdriver(debug_port, driver_path)
                             try:
                                 old_driver.quit()
                             except Exception:
